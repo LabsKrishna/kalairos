@@ -1,5 +1,7 @@
 # Database X
 
+> Your AI agent forgot what it knew yesterday. That's not a bug — your database just doesn't care about time.
+
 **Vector databases store embeddings. Database X remembers.**
 
 Your agent stores a fact. Updates it. Then asks "what was true last week?" Your vector database returns nothing — the old embedding is gone. Database X returns the right answer, with a full version trail showing when and why it changed.
@@ -329,6 +331,14 @@ npx dbx-memory          # starts on localhost:3000
 - Persisted locally to `data.dbx` (configurable via `dataFile`)
 - Atomic writes to reduce corruption risk
 - Pass `dataFile: ":memory:"` for in-memory-only mode
+
+---
+
+## Feedback
+
+We'd love to hear how you're using Database X — what works, what's missing, what you'd build on top of it.
+
+Reach us at **main@krishnalabs.ai**
 
 ---
 

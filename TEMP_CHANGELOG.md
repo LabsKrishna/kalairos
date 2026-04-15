@@ -283,3 +283,23 @@ Is it truly helping with the constitution goals (time-aware recall, provenance, 
 ### Files touched
 
 - `README.md`
+
+## 2026-04-13 — Dual CJS/ESM package exports (OpenClaw compatibility fix)
+
+### Added
+
+- **`index.mjs`** — ESM wrapper for the core engine. Re-exports all 25 named exports (`init`, `ingest`, `query`, `createAgent`, etc.) plus a default export. Uses `createRequire()` to bridge the CJS module into ESM.
+- **`server.mjs`** — ESM wrapper for the HTTP server entry point.
+- **`remote.mjs`** — ESM wrapper for the remote client. Re-exports `connect` as a named export.
+
+### Updated
+
+- **`package.json`** — `exports` field now uses conditional exports with `"import"` (→ `.mjs`), `"require"` (→ `.js`), and `"default"` (→ `.js`) conditions for all three entry points (`.`, `./server`, `./remote`). Added `index.mjs`, `server.mjs`, `remote.mjs` to the `files` array for npm publish.
+
+### Why
+
+OpenClaw's plugin loader uses ESM `import()` to load memory plugins. The `dbx-memory` package declared `"type": "commonjs"`, causing `ERR_REQUIRE_ASYNC_MODULE` or silent load failures when OpenClaw tried to import it. The dual export map lets Node.js resolve to the `.mjs` wrapper for ESM callers and the original `.js` for CJS callers — no breaking changes.
+
+### Files touched
+
+- `index.mjs` (new), `server.mjs` (new), `remote.mjs` (new), `package.json`

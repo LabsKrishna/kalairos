@@ -1,12 +1,24 @@
 {
   "name": "dbx-memory",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Durable, private, time-aware memory engine for long-running AI agents",
   "main": "./index.js",
   "exports": {
-    ".": "./index.js",
-    "./server": "./server.js",
-    "./remote": "./remote.js"
+    ".": {
+      "import": "./index.mjs",
+      "require": "./index.js",
+      "default": "./index.js"
+    },
+    "./server": {
+      "import": "./server.mjs",
+      "require": "./server.js",
+      "default": "./server.js"
+    },
+    "./remote": {
+      "import": "./remote.mjs",
+      "require": "./remote.js",
+      "default": "./remote.js"
+    }
   },
   "bin": {
     "dbx": "bin/cli.js"
@@ -14,7 +26,37 @@
   "scripts": {
     "start": "node server.js"
   },
-  "keywords": "ai-agent-memory,temporal-memory,local-first,versioned-recall",
+  "keywords": [
+    "ai-memory",
+    "agent-memory",
+    "llm-memory",
+    "vector-memory",
+    "long-term-memory",
+    "semantic-memory",
+    "temporal-memory",
+    "ai-agent",
+    "ai",
+    "agent",
+    "memory",
+    "llm",
+    "rag",
+    "embeddings",
+    "vector-database",
+    "vector-store",
+    "knowledge-graph",
+    "retrieval",
+    "versioned-memory",
+    "local-first",
+    "private-ai",
+    "memory-engine",
+    "chatbot-memory",
+    "conversational-memory",
+    "context-window",
+    "recall",
+    "openai",
+    "langchain",
+    "autonomous-agent"
+  ],
   "author": "KrishnaLabsLLC <main@krishnalabs.ai>",
   "license": "MIT",
   "repository": {
@@ -35,8 +77,11 @@
   },
   "files": [
     "index.js",
+    "index.mjs",
     "server.js",
+    "server.mjs",
     "remote.js",
+    "remote.mjs",
     "kernel.js",
     "versioning.js",
     "worker-pool.js",

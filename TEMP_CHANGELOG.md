@@ -303,3 +303,40 @@ OpenClaw's plugin loader uses ESM `import()` to load memory plugins. The `dbx-me
 ### Files touched
 
 - `index.mjs` (new), `server.mjs` (new), `remote.mjs` (new), `package.json`
+
+## 2026-04-15 — MCP Server
+
+### Added
+
+- **`mcp.js`** — Full MCP (Model Context Protocol) server for Database X. Exposes 12 tools over stdio JSON-RPC transport, making DBX plug-and-play for Claude Code, Cursor, ChatGPT, and any MCP-compatible host. Tools: `dbx_remember`, `dbx_recall`, `dbx_get`, `dbx_history`, `dbx_delete`, `dbx_status`, `dbx_list`, `dbx_batch_store`, `dbx_extract_facts`, `dbx_graph`, `dbx_consolidate`, `dbx_export`. Includes a built-in bag-of-words embedder (FNV-1a hash, 128-dim) so the server works zero-config without an external embedding API.
+- **`mcp.mjs`** — ESM wrapper for the MCP server.
+
+### Updated
+
+- **`package.json`** — Added `@modelcontextprotocol/sdk` dependency. Added `./mcp` conditional export (CJS + ESM). Added `dbx-mcp` binary. Added `mcp.js` and `mcp.mjs` to `files` array. Added `mcp`, `mcp-server`, `model-context-protocol` keywords.
+
+### Files touched
+
+- `mcp.js` (new), `mcp.mjs` (new), `package.json`
+
+## 2026-04-15 — Token-budgeted retrieval + Eval benchmarks + CI fix
+
+### Added
+
+- **Token-budgeted retrieval** — `query(text, { maxTokens: 2000 })` packs results greedily by score until the token budget is exhausted. Purpose-built for feeding results into agent context windows. Uses ~4 chars/token heuristic (no external tokenizer needed). Response includes `tokenUsage: { budget, used, resultsDropped }` when `maxTokens` is supplied. Always returns at least the top result even if it exceeds the budget.
+- **`bench/agent-memory/bench-eval.js`** — Memory evaluation benchmark suite (15 tests) measuring recall@k, precision@k, MRR, temporal accuracy, token-budget efficiency, and cross-domain separation. Results: recall@5 = 75%, precision@3 = 67%, MRR = 1.0, 100% temporal accuracy on asOf queries.
+- **`test` and `bench` npm scripts** in `package.json` — CI now has working `npm test` (runs all 3 test files) and `npm run bench` (runs full benchmark suite). This fixes the GitHub Actions CI failures.
+
+### Updated
+
+- `index.js`: `query()` accepts `maxTokens` option, implements greedy token-budget packing with metadata overhead estimation (~20 tokens/result).
+- `server.js`: `/query` endpoint accepts `maxTokens` in request body.
+- `mcp.js`: `dbx_recall` tool accepts `maxTokens` parameter.
+- `test-basic.js`: 4 new tests for token-budgeted retrieval (51 total). Fixed getGraph assertion for dynamic entity count.
+- `bench/agent-memory/run-all.js`: Added `eval-metrics` suite, expanded goal classification patterns.
+- `package.json`: Added `test` and `bench` scripts.
+
+### Files touched
+
+- `index.js`, `server.js`, `mcp.js`, `test-basic.js`, `package.json`
+- `bench/agent-memory/bench-eval.js` (new), `bench/agent-memory/run-all.js`

@@ -451,13 +451,52 @@ const INIT_OPTS = {
     assert.strictEqual(r.entities[0].type, "document");
   });
 
+  console.log("\n── token-budgeted query ──────────────────────────────────────────");
+
+  await test("maxTokens returns tokenUsage in response", async () => {
+    const r = await lib.query("budget", { maxTokens: 5000 });
+    assert.ok(r.tokenUsage, "response should include tokenUsage");
+    assert.strictEqual(r.tokenUsage.budget, 5000);
+    assert.ok(typeof r.tokenUsage.used === "number");
+    assert.ok(typeof r.tokenUsage.resultsDropped === "number");
+  });
+
+  await test("maxTokens caps results to fit within budget", async () => {
+    // Ingest several texts with shared vocabulary so they score above minFinalScore
+    for (let i = 0; i < 5; i++) {
+      await lib.ingest("the quarterly financial budget forecast report details " + "extra ".repeat(200) + " item " + i, { type: "budget-test" });
+    }
+    // Very small budget: should return fewer results than large budget
+    const small = await lib.query("the quarterly financial budget forecast", { limit: 10, maxTokens: 100 });
+    assert.ok(small.tokenUsage, "should have tokenUsage");
+    // Large budget: should return more results
+    const large = await lib.query("the quarterly financial budget forecast", { limit: 10, maxTokens: 50000 });
+    assert.ok(large.results.length >= small.results.length, "larger budget should return >= results");
+    if (large.results.length > 1) {
+      assert.ok(small.results.length < large.results.length, "small budget should drop some results");
+    }
+  });
+
+  await test("query without maxTokens has no tokenUsage field", async () => {
+    const r = await lib.query("the quarterly financial budget forecast");
+    assert.strictEqual(r.tokenUsage, undefined, "no tokenUsage without maxTokens");
+  });
+
+  await test("maxTokens always includes at least one result", async () => {
+    // Even with a tiny budget, we always return at least the top result.
+    // Use "machine learning" which is ingested multiple times and scores reliably.
+    const r = await lib.query("machine learning", { maxTokens: 1 });
+    assert.ok(r.results.length >= 1, "should always return at least 1");
+    assert.ok(r.tokenUsage.used > 0, "should report tokens used");
+  });
+
   console.log("\n── getGraph ─────────────────────────────────────────────────────");
 
   await test("getGraph returns nodes and edges arrays", async () => {
     const g = await lib.getGraph();
     assert.ok(Array.isArray(g.nodes));
     assert.ok(Array.isArray(g.edges));
-    assert.ok(g.nodes.length === 3);
+    assert.ok(g.nodes.length >= 3, "should have at least 3 nodes");
   });
 
   await test("graph nodes have required fields", async () => {

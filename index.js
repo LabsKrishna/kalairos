@@ -774,11 +774,17 @@ async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), 
  * exist at asOf are skipped. Recency boost is disabled in asOf mode since
  * "now" has no meaning for a historical snapshot.
  *
+ * When `maxTokens` is supplied, results are packed greedily by score until the
+ * token budget is exhausted — purpose-built for feeding results into agent
+ * context windows. The `limit` parameter still caps the absolute number of
+ * results but `maxTokens` may return fewer if the budget runs out first.
+ * Token estimation uses ~4 characters per token (no external tokenizer needed).
+ *
  * @param {string} text
- * @param {{ limit?, filter?: { type?, since?, until?, tags?, memoryType?, workspaceId? }, asOf?: number }} opts
- * @returns {{ count, results, filter, asOf, config }}
+ * @param {{ limit?, maxTokens?, filter?: { type?, since?, until?, tags?, memoryType?, workspaceId? }, asOf?: number }} opts
+ * @returns {{ count, results, filter, asOf, config, tokenUsage? }}
  */
-async function query(text, { limit = 10, filter = {}, asOf = null, allowedWorkspaces } = {}) {
+async function query(text, { limit = 10, maxTokens = null, filter = {}, asOf = null, allowedWorkspaces } = {}) {
   _assertInit();
 
   const safeLimit   = Math.max(1, Math.min(100, Number(limit) || 10));
@@ -829,7 +835,7 @@ async function query(text, { limit = 10, filter = {}, asOf = null, allowedWorksp
   });
   console.timeEnd("[dbx] query");
 
-  const results = raw
+  const sorted = raw
     .sort((a, b) => b.score - a.score)
     .slice(0, safeLimit)
     .map(r => {
@@ -845,8 +851,29 @@ async function query(text, { limit = 10, filter = {}, asOf = null, allowedWorksp
       };
     });
 
-  return {
-    count:   Math.min(raw.length, safeLimit),
+  // Token-budgeted packing: greedily include highest-scored results until
+  // the budget is exhausted. ~4 chars ≈ 1 token (GPT/Claude heuristic).
+  let results, tokenUsage;
+  const safeMaxTokens = maxTokens != null ? Math.max(1, Math.floor(Number(maxTokens) || 0)) : null;
+
+  if (safeMaxTokens !== null) {
+    results = [];
+    let tokensUsed = 0;
+    for (const r of sorted) {
+      const textTokens = Math.ceil((r.text || "").length / 4);
+      // Metadata overhead: id, type, score line ≈ 20 tokens per result
+      const itemTokens = textTokens + 20;
+      if (results.length > 0 && tokensUsed + itemTokens > safeMaxTokens) break;
+      tokensUsed += itemTokens;
+      results.push(r);
+    }
+    tokenUsage = { budget: safeMaxTokens, used: tokensUsed, resultsDropped: sorted.length - results.length };
+  } else {
+    results = sorted;
+  }
+
+  const response = {
+    count:   results.length,
     results,
     filter:  merged,
     asOf,
@@ -857,6 +884,8 @@ async function query(text, { limit = 10, filter = {}, asOf = null, allowedWorksp
       recencyWeight: asOf === null ? CFG.recencyWeight : 0,
     },
   };
+  if (tokenUsage) response.tokenUsage = tokenUsage;
+  return response;
 }
 
 // ─── Get Entity ───────────────────────────────────────────────────────────────

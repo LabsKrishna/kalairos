@@ -18,13 +18,21 @@
       "import": "./remote.mjs",
       "require": "./remote.js",
       "default": "./remote.js"
+    },
+    "./mcp": {
+      "import": "./mcp.mjs",
+      "require": "./mcp.js",
+      "default": "./mcp.js"
     }
   },
   "bin": {
-    "dbx": "bin/cli.js"
+    "dbx": "bin/cli.js",
+    "dbx-mcp": "mcp.js"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test-basic.js && node test-versioning.js && node test-agent-simulation.js",
+    "bench": "node bench/agent-memory/run-all.js"
   },
   "keywords": [
     "ai-memory",
@@ -55,7 +63,10 @@
     "recall",
     "openai",
     "langchain",
-    "autonomous-agent"
+    "autonomous-agent",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol"
   ],
   "author": "KrishnaLabsLLC <main@krishnalabs.ai>",
   "license": "MIT",
@@ -72,6 +83,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "axios": "^1.15.0",
     "express": "^5.2.1"
   },
@@ -90,6 +102,8 @@
     "errors.js",
     "agent.js",
     "auth.js",
+    "mcp.js",
+    "mcp.mjs",
     "examples/demo.js"
   ]
 }

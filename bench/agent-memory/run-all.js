@@ -8,6 +8,7 @@ const budgetDrift      = require("./bench-budget-drift");
 const contradictions   = require("./bench-contradictions");
 const crossSession     = require("./bench-cross-session");
 const metadataEvol     = require("./bench-metadata-evolution");
+const evalBench        = require("./bench-eval");
 
 // ─── Constitution Goal Mapping ──────────────────────────────────────────────
 // Each assertion maps to a CLAUDE.md goal. The scorecard tracks coverage.
@@ -27,16 +28,16 @@ const GOALS = {
 
 // Maps test names (substrings) → goal keys
 const TEST_GOAL_MAP = [
-  [/time.travel|asOf|day \d/i,                      "time-aware-recall"],
+  [/time.travel|asOf|day \d|temporal|historical/i,   "time-aware-recall"],
   [/provenance|source|actor/i,                       "provenance"],
   [/contradict/i,                                    "contradiction"],
   [/classif|confidential|compliance/i,               "classification"],
   [/cross.session|planner|across.*agent|both.*agent/i, "cross-session"],
-  [/stable.identity|remember|agent|recall|latest/i,  "agent-memory"],
+  [/stable.identity|remember|agent|recall|latest|MRR|precision|token.budget/i, "agent-memory"],
   [/workspace|isolat/i,                              "workspace-isolation"],
   [/soft.delet|purg|double.delete|gone/i,            "soft-delete"],
   [/signal|error.*type|getSignal/i,                  "error-signals"],
-  [/tag|retention|metadata|status/i,                 "metadata-evolution"],
+  [/tag|retention|metadata|status|cross.domain|noise|version.history/i, "metadata-evolution"],
 ];
 
 function classifyResults(suiteResults) {
@@ -62,6 +63,7 @@ function classifyResults(suiteResults) {
     { name: "contradictions",     fn: contradictions.run },
     { name: "cross-session",      fn: crossSession.run },
     { name: "metadata-evolution", fn: metadataEvol.run },
+    { name: "eval-metrics",       fn: evalBench },
   ];
 
   const summaries = [];

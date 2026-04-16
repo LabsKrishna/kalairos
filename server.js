@@ -147,9 +147,9 @@ app.post("/ingest/file", _requireAuth("write"), _wrap(async (req) => {
 }));
 
 app.post("/query", _requireAuth("read"), _wrap(async (req) => {
-  const { text, limit = 10, filter = {}, asOf = null } = req.body;
+  const { text, limit = 10, maxTokens = null, filter = {}, asOf = null } = req.body;
   if (!text) throw { code: Codes.VALIDATION, message: "text is required" };
-  return await lib.query(text, { limit, filter, asOf, allowedWorkspaces: req.allowedWorkspaces });
+  return await lib.query(text, { limit, maxTokens, filter, asOf, allowedWorkspaces: req.allowedWorkspaces });
 }));
 
 app.post("/entities/batch", _requireAuth("read"), _wrap(async (req) => {

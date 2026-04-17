@@ -18,6 +18,56 @@ app.use((req, res, next) => {
   next();
 });
 
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+// Simple in-memory sliding-window limiter (per IP, single process).
+// Set SMRITI_RATE_LIMIT=0 to disable.
+
+const _RATE_LIMIT  = Number(process.env.SMRITI_RATE_LIMIT  ?? 120); // requests/window
+const _RATE_WINDOW = Number(process.env.SMRITI_RATE_WINDOW ?? 60_000); // ms (default 1 min)
+
+if (_RATE_LIMIT > 0) {
+  const _buckets = new Map(); // ip → { count, resetAt }
+
+  // Purge stale buckets every 5 minutes to prevent unbounded memory growth.
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, b] of _buckets) if (now >= b.resetAt) _buckets.delete(ip);
+  }, 5 * 60_000).unref();
+
+  app.use((req, res, next) => {
+    const ip  = req.ip || req.socket?.remoteAddress || "unknown";
+    const now = Date.now();
+    let b = _buckets.get(ip);
+    if (!b || now >= b.resetAt) {
+      b = { count: 0, resetAt: now + _RATE_WINDOW };
+      _buckets.set(ip, b);
+    }
+    b.count++;
+    if (b.count > _RATE_LIMIT) {
+      const retryAfter = Math.ceil((b.resetAt - now) / 1000);
+      res.setHeader("Retry-After", retryAfter);
+      return res.status(429).json({
+        error:       "rate_limit_exceeded",
+        detail:      `Too many requests. Limit: ${_RATE_LIMIT} per ${_RATE_WINDOW / 1000}s.`,
+        retryAfter,
+        recoverable: true,
+      });
+    }
+    next();
+  });
+}
+
+// ─── Input validation helpers ─────────────────────────────────────────────────
+
+const _MAX_TEXT_LEN = Number(process.env.SMRITI_MAX_TEXT_LEN ?? 50_000); // 50 KB
+
+function _validateText(text) {
+  if (!text || typeof text !== "string") return "text must be a non-empty string";
+  if (text.trim().length === 0)          return "text must not be empty";
+  if (text.length > _MAX_TEXT_LEN)       return `text exceeds ${_MAX_TEXT_LEN} character limit`;
+  return null;
+}
+
 // ─── Route wrapper — kills 23 catch blocks ──────────────────────────────────
 // Maps typed error codes to HTTP status codes. Untyped errors default to 500.
 
@@ -29,6 +79,7 @@ const _CODE_TO_HTTP = {
   [Codes.NOT_INITIALIZED]:  503,
   [Codes.AUTH_FAILED]:      401,
   [Codes.FORBIDDEN]:        403,
+  [Codes.WRITE_QUEUE_FULL]: 429,
 };
 
 function _wrap(fn) {
@@ -51,9 +102,10 @@ function _wrap(fn) {
 // ─── Shared body extraction for ingest-like endpoints ────────────────────────
 
 function _ingestParams(body) {
-  const { text, type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM, importance } = body || {};
+  const { text, type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM, importance, trustScore } = body || {};
   const p = { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM: !!useLLM };
-  if (importance != null) p.importance = Number(importance);
+  if (importance  != null) p.importance  = Number(importance);
+  if (trustScore  != null) p.trustScore  = Number(trustScore);
   return p;
 }
 
@@ -112,16 +164,18 @@ function _requireAuth(requiredPermission) {
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.post("/ingest", _requireAuth("write"), _wrap(async (req) => {
-  const p = _ingestParams(req.body);
-  if (!p.text) throw { code: Codes.VALIDATION, message: "text is required" };
+  const p   = _ingestParams(req.body);
+  const err = _validateText(p.text);
+  if (err) throw { code: Codes.VALIDATION, message: err };
   const id = await lib.ingest(p.text, { ...p, allowedWorkspaces: req.allowedWorkspaces });
   auth.audit("ingest", { principal: req.principal, workspaceId: p.workspaceId || "default", entityId: id });
   return { success: true, id };
 }));
 
 app.post("/remember", _requireAuth("write"), _wrap(async (req) => {
-  const p = _ingestParams(req.body);
-  if (!p.text) throw { code: Codes.VALIDATION, message: "text is required" };
+  const p   = _ingestParams(req.body);
+  const err = _validateText(p.text);
+  if (err) throw { code: Codes.VALIDATION, message: err };
   const id = await lib.remember(p.text, { ...p, allowedWorkspaces: req.allowedWorkspaces });
   auth.audit("remember", { principal: req.principal, workspaceId: p.workspaceId || "default", entityId: id });
   return { success: true, id };
@@ -129,7 +183,14 @@ app.post("/remember", _requireAuth("write"), _wrap(async (req) => {
 
 app.post("/ingest/batch", _requireAuth("write"), _wrap(async (req) => {
   const { items } = req.body;
-  if (!Array.isArray(items) || !items.length) throw { code: Codes.VALIDATION, message: "items must be a non-empty array" };
+  if (!Array.isArray(items) || !items.length)
+    throw { code: Codes.VALIDATION, message: "items must be a non-empty array" };
+  if (items.length > 500)
+    throw { code: Codes.VALIDATION, message: "batch size exceeds limit of 500 items" };
+  for (let i = 0; i < items.length; i++) {
+    const e = _validateText(items[i]?.text);
+    if (e) throw { code: Codes.VALIDATION, message: `items[${i}].text: ${e}` };
+  }
   const ids = await lib.ingestBatch(items, { allowedWorkspaces: req.allowedWorkspaces });
   auth.audit("ingest_batch", { principal: req.principal, detail: `${ids.length} items` });
   return { success: true, ids, count: ids.length };
@@ -150,8 +211,10 @@ app.post("/ingest/file", _requireAuth("write"), _wrap(async (req) => {
 
 app.post("/query", _requireAuth("read"), _wrap(async (req) => {
   const { text, limit = 10, maxTokens = null, filter = {}, asOf = null } = req.body;
-  if (!text) throw { code: Codes.VALIDATION, message: "text is required" };
-  return await lib.query(text, { limit, maxTokens, filter, asOf, allowedWorkspaces: req.allowedWorkspaces });
+  const err = _validateText(text);
+  if (err) throw { code: Codes.VALIDATION, message: err };
+  const safeLimit = Math.min(Math.max(1, Math.floor(Number(limit) || 10)), 200);
+  return await lib.query(text, { limit: safeLimit, maxTokens, filter, asOf, allowedWorkspaces: req.allowedWorkspaces });
 }));
 
 app.post("/entities/batch", _requireAuth("read"), _wrap(async (req) => {
@@ -204,6 +267,50 @@ app.post("/extract-facts", _requireAuth("write"), _wrap(async (req) => {
 app.post("/consolidate", _requireAuth("write"), _wrap(async (req) => {
   const { threshold, dryRun, type } = req.body || {};
   return lib.consolidate({ threshold, dryRun: !!dryRun, type, allowedWorkspaces: req.allowedWorkspaces });
+}));
+
+// ─── Time-aware Retrieval ────────────────────────────────────────────────────
+
+// GET /changes?since=<ms>[&type=&workspaceId=&limit=]
+// Returns all entities that changed after `since` with their deltas.
+app.get("/changes", _requireAuth("read"), _wrap(async (req) => {
+  const { since, type, workspaceId, limit } = req.query;
+  if (!since) throw { code: Codes.VALIDATION, message: "since query param is required (Unix ms timestamp)" };
+  return lib.getChangeSince(Number(since), {
+    type,
+    workspaceId,
+    limit:             limit ? Number(limit) : undefined,
+    allowedWorkspaces: req.allowedWorkspaces,
+  });
+}));
+
+// ─── Version Semantics ───────────────────────────────────────────────────────
+
+// GET /contradictions/:id — versions of entity that contradict a prior version
+app.get("/contradictions/:id", _requireAuth("read"), _wrap(async (req) =>
+  lib.getContradictions(req.params.id, { allowedWorkspaces: req.allowedWorkspaces })
+));
+
+// GET /drift/:id — semantic drift analysis across version history
+app.get("/drift/:id", _requireAuth("read"), _wrap(async (req) =>
+  lib.getDrift(req.params.id, { allowedWorkspaces: req.allowedWorkspaces })
+));
+
+// ─── Provenance & Trust ───────────────────────────────────────────────────────
+
+// POST /annotate/:id { trustScore?, verified?, notes?, memoryType? }
+// Metadata-only update — does not create a new version.
+app.post("/annotate/:id", _requireAuth("write"), _wrap(async (req) => {
+  const { trustScore, verified, notes, memoryType } = req.body || {};
+  const result = await lib.annotate(req.params.id, {
+    trustScore: trustScore != null ? Number(trustScore) : undefined,
+    verified,
+    notes,
+    memoryType,
+    allowedWorkspaces: req.allowedWorkspaces,
+  });
+  auth.audit("annotate", { principal: req.principal, entityId: req.params.id });
+  return result;
 }));
 
 // ─── Markdown Adapter ────────────────────────────────────────────────────────
@@ -278,6 +385,56 @@ app.post("/agent/:agentId/learn-from", _resolveAgent, _requireAuth("write"), _wr
   const { text, ...opts } = req.body;
   if (!text) throw { code: Codes.VALIDATION, message: "text is required" };
   return req.agent.learnFrom(text, { ...opts, allowedWorkspaces: req.allowedWorkspaces });
+}));
+
+// Agent: promote short-term/working memory to long-term
+app.post("/agent/:agentId/promote", _resolveAgent, _requireAuth("write"), _wrap(async (req) => {
+  const { id } = req.body;
+  if (!id) throw { code: Codes.VALIDATION, message: "id is required" };
+  return req.agent.promote(id, { allowedWorkspaces: req.allowedWorkspaces });
+}));
+
+// Agent: explicitly forget (soft-delete) a memory
+app.post("/agent/:agentId/forget", _resolveAgent, _requireAuth("admin"), _wrap(async (req) => {
+  const { id, reason } = req.body;
+  if (!id) throw { code: Codes.VALIDATION, message: "id is required" };
+  await req.agent.forget(id, reason, { allowedWorkspaces: req.allowedWorkspaces });
+  auth.audit("agent_forget", { principal: req.principal, entityId: id });
+  return { success: true, id: Number(id) || id, forgotten: true };
+}));
+
+// Agent: consolidate duplicate/near-duplicate memories at session end
+app.post("/agent/:agentId/consolidate-session", _resolveAgent, _requireAuth("write"), _wrap(async (req) => {
+  const { threshold, dryRun } = req.body || {};
+  return req.agent.consolidateSession({ threshold, dryRun: !!dryRun, allowedWorkspaces: req.allowedWorkspaces });
+}));
+
+// Agent: get current working memory
+app.get("/agent/:agentId/working-memory", _resolveAgent, _requireAuth("read"), _wrap(async (req) => {
+  const { limit, workspaceId } = req.query;
+  return req.agent.getWorkingMemory({
+    limit:             limit ? Number(limit) : undefined,
+    workspaceId,
+    allowedWorkspaces: req.allowedWorkspaces,
+  });
+}));
+
+// Agent: semantic drift analysis for an entity
+app.get("/agent/:agentId/drift/:entityId", _resolveAgent, _requireAuth("read"), _wrap(async (req) => {
+  return req.agent.getDrift(req.params.entityId);
+}));
+
+// Agent: annotate entity with trust/verification signals
+app.post("/agent/:agentId/annotate", _resolveAgent, _requireAuth("write"), _wrap(async (req) => {
+  const { id, trustScore, verified, notes, memoryType } = req.body || {};
+  if (!id) throw { code: Codes.VALIDATION, message: "id is required" };
+  return req.agent.annotate(id, {
+    trustScore: trustScore != null ? Number(trustScore) : undefined,
+    verified,
+    notes,
+    memoryType,
+    allowedWorkspaces: req.allowedWorkspaces,
+  });
 }));
 
 // ─── Auth Management ─────────────────────────────────────────────────────────

@@ -21,6 +21,16 @@ const PERMISSIONS = Object.freeze({
   owner: 4,   // grant/revoke workspace access
 });
 
+// ─── Token hashing ────────────────────────────────────────────────────────────
+// Tokens are stored as SHA-256 hashes so the backing map never holds plaintext
+// credentials. The plaintext token is returned to the caller once (at creation)
+// and is never persisted or re-exposed. A timing-safe compare is not needed
+// here because we use the hash as a Map key (exact lookup, not string compare).
+
+function _hashToken(token) {
+  return crypto.createHash("sha256").update(String(token)).digest("hex");
+}
+
 // ─── AuthStore ───────────────────────────────────────────────────────────────
 
 class AuthStore {
@@ -54,16 +64,16 @@ class AuthStore {
     const tok = token || crypto.randomBytes(32).toString("hex");
     const principal = { id, name, workspaces: { ...workspaces }, createdAt: Date.now() };
     this._principals.set(id, principal);
-    this._tokens.set(tok, id);
-    return { ...principal, token: tok };
+    this._tokens.set(_hashToken(tok), id); // store hash, never plaintext
+    return { ...principal, token: tok };   // plaintext returned once to caller
   }
 
   /**
    * Remove a principal and all its tokens.
    */
   removePrincipal(principalId) {
-    for (const [tok, pid] of this._tokens) {
-      if (pid === principalId) this._tokens.delete(tok);
+    for (const [hash, pid] of this._tokens) {
+      if (pid === principalId) this._tokens.delete(hash);
     }
     this._principals.delete(principalId);
   }
@@ -91,7 +101,7 @@ class AuthStore {
   authenticate(token) {
     if (!this._enabled) return null;
     if (!token) return null;
-    const pid = this._tokens.get(token);
+    const pid = this._tokens.get(_hashToken(token));
     if (!pid) return null;
     return this._principals.get(pid) || null;
   }
@@ -191,7 +201,8 @@ class AuthStore {
   toJSON() {
     return {
       principals: Array.from(this._principals.values()),
-      tokens: Array.from(this._tokens.entries()).map(([token, pid]) => ({ token, principalId: pid })),
+      // Persist the already-hashed values — plaintext tokens are never stored.
+      tokens: Array.from(this._tokens.entries()).map(([hash, pid]) => ({ hash, principalId: pid })),
     };
   }
 
@@ -203,8 +214,13 @@ class AuthStore {
       }
     }
     if (Array.isArray(data.tokens)) {
-      for (const { token, principalId } of data.tokens) {
-        if (token && principalId) this._tokens.set(token, principalId);
+      for (const entry of data.tokens) {
+        const { principalId } = entry;
+        // Support both new format { hash } and legacy format { token }.
+        // Legacy plaintext tokens are re-hashed on load.
+        const raw  = entry.hash || entry.token;
+        const hash = /^[0-9a-f]{64}$/.test(raw) ? raw : _hashToken(raw);
+        if (hash && principalId) this._tokens.set(hash, principalId);
       }
     }
   }

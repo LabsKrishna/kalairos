@@ -28,47 +28,47 @@ Runs a live agent memory demo in your terminal. Zero config. Nothing written to 
 const smriti = require('smriti-db');
 
 async function main() {
-  await smriti.init({
-    // Bring your own embedder — any function that returns a number[]
-    embedFn: async (text) => {
-      const res = await fetch('https://api.openai.com/v1/embeddings', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ model: 'text-embedding-3-small', input: text }),
-      });
-      return (await res.json()).data[0].embedding;
-    },
-  });
+	await smriti.init({
+		// Bring your own embedder — any function that returns a number[]
+		embedFn: async (text) => {
+			const res = await fetch('https://api.openai.com/v1/embeddings', {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({ model: 'text-embedding-3-small', input: text }),
+			});
+			return (await res.json()).data[0].embedding;
+		},
+	});
 
-  const agent = smriti.createAgent({ name: 'analyst' });
+	const agent = smriti.createAgent({ name: 'analyst' });
 
-  // Store a fact
-  const id = await agent.remember('Revenue target is $10M for Q3');
+	// Store a fact
+	const id = await agent.remember('Revenue target is $10M for Q3');
 
-  // Update it — version detection is automatic, no ID needed
-  await agent.remember('Revenue target revised to $12M for Q3');
+	// Update it — version detection is automatic, no ID needed
+	await agent.remember('Revenue target revised to $12M for Q3');
 
-  // What's current?
-  const now = await agent.recall('revenue target');
-  // → "Revenue target revised to $12M for Q3"
+	// What's current?
+	const now = await agent.recall('revenue target');
+	// → "Revenue target revised to $12M for Q3"
 
-  // What was true BEFORE the revision?
-  const then = await agent.recall('revenue target', {
-    asOf: Date.now() - 7 * 24 * 60 * 60 * 1000, // one week ago
-  });
-  // → "Revenue target is $10M for Q3"
+	// What was true BEFORE the revision?
+	const then = await agent.recall('revenue target', {
+		asOf: Date.now() - 7 * 24 * 60 * 60 * 1000, // one week ago
+	});
+	// → "Revenue target is $10M for Q3"
 
-  // What changed?
-  const history = await agent.getHistory(id);
-  // → v1: "$10M" → v2: "$12M", delta: "Value changed: [$10m] → [$12m]"
+	// What changed?
+	const history = await agent.getHistory(id);
+	// → v1: "$10M" → v2: "$12M", delta: "Value changed: [$10m] → [$12m]"
 
-  // Spot contradictions
-  const { contradictions } = await agent.getContradictions(id);
+	// Spot contradictions
+	const { contradictions } = await agent.getContradictions(id);
 
-  await smriti.shutdown();
+	await smriti.shutdown();
 }
 
 main();
@@ -78,16 +78,16 @@ main();
 
 ## Why not just use a vector database?
 
-|  | Vector DB | Smriti |
-|---|---|---|
-| **Updates** | Overwrite or duplicate | Automatic versioning |
-| **History** | None | Full version trail with deltas |
-| **"What was true on Jan 15?"** | Can't answer | `asOf` any timestamp |
-| **Contradictions** | Invisible | Auto-detected between versions |
-| **Provenance** | Not tracked | Who stored it, when, from where |
-| **Retrieval** | Cosine similarity | Semantic + graph + keyword + recency |
-| **Deployment** | Cloud SDK | Local-first, zero cloud dependency |
-| **Embedding model** | Bundled or locked in | BYO — any provider, any model |
+|                                | Vector DB              | Smriti                               |
+| ------------------------------ | ---------------------- | ------------------------------------ |
+| **Updates**                    | Overwrite or duplicate | Automatic versioning                 |
+| **History**                    | None                   | Full version trail with deltas       |
+| **"What was true on Jan 15?"** | Can't answer           | `asOf` any timestamp                 |
+| **Contradictions**             | Invisible              | Auto-detected between versions       |
+| **Provenance**                 | Not tracked            | Who stored it, when, from where      |
+| **Retrieval**                  | Cosine similarity      | Semantic + graph + keyword + recency |
+| **Deployment**                 | Cloud SDK              | Local-first, zero cloud dependency   |
+| **Embedding model**            | Bundled or locked in   | BYO — any provider, any model        |
 
 ---
 
@@ -95,15 +95,15 @@ main();
 
 All numbers from `npm run bench` — deterministic bag-of-words embedder, no API key needed. Reproducible on any machine.
 
-| Metric | Score | What it measures |
-|--------|-------|-----------------|
-| **Recall@5** | 75% (finance), 50% (engineering) | Fraction of relevant items in top-5 results |
-| **Precision@3** | 100% (health) | Fraction of top-3 results that are relevant |
-| **MRR** | 1.0 | First relevant result appears at rank 1 |
-| **Temporal accuracy** | 100% | `asOf` time-travel returns correct historical version |
-| **Contradiction detection** | 100% | Value changes flagged across all scenarios |
-| **Cross-session recall** | 100% | Agent B finds Agent A's memories |
-| **Noise separation** | 3/5 finance in top-5 | Relevant entities ranked above unrelated noise |
+| Metric                      | Score                            | What it measures                                      |
+| --------------------------- | -------------------------------- | ----------------------------------------------------- |
+| **Recall@5**                | 75% (finance), 50% (engineering) | Fraction of relevant items in top-5 results           |
+| **Precision@3**             | 100% (health)                    | Fraction of top-3 results that are relevant           |
+| **MRR**                     | 1.0                              | First relevant result appears at rank 1               |
+| **Temporal accuracy**       | 100%                             | `asOf` time-travel returns correct historical version |
+| **Contradiction detection** | 100%                             | Value changes flagged across all scenarios            |
+| **Cross-session recall**    | 100%                             | Agent B finds Agent A's memories                      |
+| **Noise separation**        | 3/5 finance in top-5             | Relevant entities ranked above unrelated noise        |
 
 **Constitution Goal Scorecard: 10/10 goals, 53/53 assertions passing (100%)**
 
@@ -122,30 +122,30 @@ npm run bench:real     # real embeddings (requires OPENAI_API_KEY)
 
 ```js
 const agent = smriti.createAgent({
-  name: 'budget-planner',
-  defaultClassification: 'confidential',
-  defaultTags: ['finance'],
+	name: 'budget-planner',
+	defaultClassification: 'confidential',
+	defaultTags: ['finance'],
 });
 
 await agent.remember('Q2 budget is 2.4M');
 await agent.update('Q2 budget is now 2.7M');
 
 const results = await agent.recall('Q2 budget');
-const past    = await agent.recall('Q2 budget', {
-  asOf: Date.now() - 7 * 24 * 60 * 60 * 1000,
+const past = await agent.recall('Q2 budget', {
+	asOf: Date.now() - 7 * 24 * 60 * 60 * 1000,
 });
 
-const history         = await agent.getHistory(id);
+const history = await agent.getHistory(id);
 const { contradictions } = await agent.getContradictions(id);
 ```
 
-| Method | What it does |
-|--------|-------------|
+| Method                        | What it does                                            |
+| ----------------------------- | ------------------------------------------------------- |
 | `agent.remember(text, opts?)` | Store or update a fact (version detection is automatic) |
-| `agent.update(text, opts?)` | Alias for `remember` — makes update intent explicit |
-| `agent.recall(text, opts?)` | Query memories (supports `asOf` for time-travel) |
-| `agent.getHistory(id)` | Full version history with provenance trail |
-| `agent.getContradictions(id)` | Versions flagged as contradictory |
+| `agent.update(text, opts?)`   | Alias for `remember` — makes update intent explicit     |
+| `agent.recall(text, opts?)`   | Query memories (supports `asOf` for time-travel)        |
+| `agent.getHistory(id)`        | Full version history with provenance trail              |
+| `agent.getContradictions(id)` | Versions flagged as contradictory                       |
 
 ### Agent memory workflow — token-budgeted context
 
@@ -163,9 +163,9 @@ await agent.remember('Last deployment was v2.3.1 on March 15');
 
 // At inference time: retrieve within a token budget
 const { results, tokenUsage } = await agent.recall('user preferences', {
-  maxTokens: 2000,
+	maxTokens: 2000,
 });
-const context = results.map(r => r.text).join('\n');
+const context = results.map((r) => r.text).join('\n');
 // → Feed `context` into your agent prompt
 
 console.log(tokenUsage);
@@ -176,7 +176,7 @@ For agent boot (no query needed — just the most important memories):
 
 ```js
 const { items } = await agent.boot({ maxTokens: 1000, depth: 'essential' });
-const bootContext = items.map(i => i.text).join('\n');
+const bootContext = items.map((i) => i.text).join('\n');
 // → Prepend to system prompt for session continuity
 ```
 
@@ -194,7 +194,7 @@ Pass `asOf` (Unix ms) to any query. Entities that didn't exist yet are skipped. 
 
 ```js
 const results = await smriti.query('raw material cost', {
-  asOf: new Date('2026-01-15').getTime(),
+	asOf: new Date('2026-01-15').getTime(),
 });
 ```
 
@@ -208,9 +208,9 @@ Every entity tracks `source` (who created it) and `classification` (how sensitiv
 
 ```js
 await smriti.ingest('Customer requested a refund', {
-  source: { type: 'tool', uri: 'support-ticket-1234' },
-  classification: 'confidential',
-  tags: ['support', 'billing'],
+	source: { type: 'tool', uri: 'support-ticket-1234' },
+	classification: 'confidential',
+	tags: ['support', 'billing'],
 });
 ```
 
@@ -226,8 +226,8 @@ Tag entities with `memoryType` (`"short-term"`, `"long-term"`, `"working"`) and 
 
 ```js
 await smriti.remember('Meeting notes from standup', {
-  memoryType: 'short-term',
-  workspaceId: 'team-alpha',
+	memoryType: 'short-term',
+	workspaceId: 'team-alpha',
 });
 ```
 
@@ -245,7 +245,9 @@ Queries combine multiple signals into a final score:
 Set importance explicitly to prioritize critical memories in tight token budgets:
 
 ```js
-await agent.remember('API key rotation policy: every 90 days', { importance: 0.9 });
+await agent.remember('API key rotation policy: every 90 days', {
+	importance: 0.9,
+});
 await agent.remember('Office wifi password is "guest123"', { importance: 0.2 });
 ```
 
@@ -255,7 +257,7 @@ Structured errors that agents can subscribe to for adaptive behavior:
 
 ```js
 smriti.onSignal('ERR_EMBEDDING_FAILED', (err) => {
-  console.warn(err.message, '—', err.suggestion);
+	console.warn(err.message, '—', err.suggestion);
 });
 ```
 
@@ -265,13 +267,13 @@ Pass `llmFn` to `init()` for optional metadata extraction on ingest. When `useLL
 
 ```js
 await smriti.init({
-  embedFn: myEmbedder,
-  llmFn: async (text, type) => ({
-    keywords: ['budget', 'Q2'],
-    context: 'Quarterly budget update',
-    llmTags: ['finance', 'planning'],
-    importance: 0.8,
-  }),
+	embedFn: myEmbedder,
+	llmFn: async (text, type) => ({
+		keywords: ['budget', 'Q2'],
+		context: 'Quarterly budget update',
+		llmTags: ['finance', 'planning'],
+		importance: 0.8,
+	}),
 });
 
 await smriti.remember('Q2 budget is 2.4M', { useLLM: true });
@@ -343,53 +345,53 @@ npx smriti-db          # starts on localhost:3000
 
 ### Core endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/ingest` | Ingest with full options |
-| `POST` | `/remember` | Agent-facing write |
-| `POST` | `/ingest/batch` | Batch ingest |
-| `POST` | `/ingest/timeseries` | Time series data |
-| `POST` | `/ingest/file` | File ingest |
-| `POST` | `/query` | Query with `{ text, limit?, filter?, asOf? }` |
-| `GET` | `/entity/:id` | Get entity |
-| `DELETE` | `/entity/:id` | Soft delete |
-| `DELETE` | `/entity/:id/purge` | Permanent hard delete |
-| `POST` | `/entities/batch` | Get multiple by ID |
-| `GET` | `/entities` | List with filters |
-| `GET` | `/history/:id` | Version history |
-| `GET` | `/graph` | Full graph |
-| `GET` | `/traverse/:id` | Traverse from entity |
-| `GET` | `/status` | System status |
+| Method   | Path                 | Description                                   |
+| -------- | -------------------- | --------------------------------------------- |
+| `POST`   | `/ingest`            | Ingest with full options                      |
+| `POST`   | `/remember`          | Agent-facing write                            |
+| `POST`   | `/ingest/batch`      | Batch ingest                                  |
+| `POST`   | `/ingest/timeseries` | Time series data                              |
+| `POST`   | `/ingest/file`       | File ingest                                   |
+| `POST`   | `/query`             | Query with `{ text, limit?, filter?, asOf? }` |
+| `GET`    | `/entity/:id`        | Get entity                                    |
+| `DELETE` | `/entity/:id`        | Soft delete                                   |
+| `DELETE` | `/entity/:id/purge`  | Permanent hard delete                         |
+| `POST`   | `/entities/batch`    | Get multiple by ID                            |
+| `GET`    | `/entities`          | List with filters                             |
+| `GET`    | `/history/:id`       | Version history                               |
+| `GET`    | `/graph`             | Full graph                                    |
+| `GET`    | `/traverse/:id`      | Traverse from entity                          |
+| `GET`    | `/status`            | System status                                 |
 
 ### Agent endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/agent/create` | Create agent `{ name, defaultClassification?, defaultTags?, useLLM? }` |
-| `POST` | `/agent/:agentId/remember` | Store via agent |
-| `POST` | `/agent/:agentId/update` | Update via agent |
-| `POST` | `/agent/:agentId/recall` | Query via agent (supports `asOf`) |
-| `GET` | `/agent/:agentId/history/:entityId` | Version history |
-| `GET` | `/agent/:agentId/contradictions/:entityId` | Contradiction inspection |
+| Method | Path                                       | Description                                                            |
+| ------ | ------------------------------------------ | ---------------------------------------------------------------------- |
+| `POST` | `/agent/create`                            | Create agent `{ name, defaultClassification?, defaultTags?, useLLM? }` |
+| `POST` | `/agent/:agentId/remember`                 | Store via agent                                                        |
+| `POST` | `/agent/:agentId/update`                   | Update via agent                                                       |
+| `POST` | `/agent/:agentId/recall`                   | Query via agent (supports `asOf`)                                      |
+| `GET`  | `/agent/:agentId/history/:entityId`        | Version history                                                        |
+| `GET`  | `/agent/:agentId/contradictions/:entityId` | Contradiction inspection                                               |
 
 ---
 
 ## Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SMRITI_LINK_THRESHOLD` | `0.72` | Similarity threshold for graph linking |
-| `SMRITI_VERSION_THRESHOLD` | `0.82` | Similarity threshold for version detection |
-| `SMRITI_GRAPH_BOOST` | `0.01` | Graph relationship boost weight |
-| `SMRITI_LLM_BOOST` | `0.08` | LLM keyword boost weight |
-| `SMRITI_IMPORTANCE_WEIGHT` | `0.05` | Importance boost weight in query scoring |
-| `SMRITI_RECENCY_WEIGHT` | `0.10` | Recency boost weight |
-| `SMRITI_RECENCY_HALFLIFE_DAYS` | `30` | Recency half-life in days |
-| `SMRITI_MIN_SCORE` | `0.45` | Minimum final score for results |
-| `SMRITI_MIN_SEMANTIC` | `0.35` | Minimum semantic similarity |
-| `SMRITI_MAX_VERSIONS` | `0` | Max versions per entity (0 = unlimited) |
-| `SMRITI_STRICT_EMBEDDINGS` | `1` | Require embedder (`0` to disable) |
-| `SMRITI_PORT` | `3000` | HTTP server port |
+| Variable                       | Default | Description                                |
+| ------------------------------ | ------- | ------------------------------------------ |
+| `SMRITI_LINK_THRESHOLD`        | `0.72`  | Similarity threshold for graph linking     |
+| `SMRITI_VERSION_THRESHOLD`     | `0.82`  | Similarity threshold for version detection |
+| `SMRITI_GRAPH_BOOST`           | `0.01`  | Graph relationship boost weight            |
+| `SMRITI_LLM_BOOST`             | `0.08`  | LLM keyword boost weight                   |
+| `SMRITI_IMPORTANCE_WEIGHT`     | `0.05`  | Importance boost weight in query scoring   |
+| `SMRITI_RECENCY_WEIGHT`        | `0.10`  | Recency boost weight                       |
+| `SMRITI_RECENCY_HALFLIFE_DAYS` | `30`    | Recency half-life in days                  |
+| `SMRITI_MIN_SCORE`             | `0.45`  | Minimum final score for results            |
+| `SMRITI_MIN_SEMANTIC`          | `0.35`  | Minimum semantic similarity                |
+| `SMRITI_MAX_VERSIONS`          | `0`     | Max versions per entity (0 = unlimited)    |
+| `SMRITI_STRICT_EMBEDDINGS`     | `1`     | Require embedder (`0` to disable)          |
+| `SMRITI_PORT`                  | `3000`  | HTTP server port                           |
 
 ---
 

@@ -139,9 +139,113 @@ class AgentMemory {
    * @returns {Promise<{ id, contradictions: object[] }>}
    */
   async getContradictions(id) {
+    if (typeof this._engine.getContradictions === "function") {
+      return this._engine.getContradictions(id);
+    }
     const history = await this._engine.getHistory(id);
     const contradictions = ((history && history.versions) || []).filter(v => v.delta?.contradicts);
-    return { id, contradictions };
+    return { id, contradictions, total: contradictions.length };
+  }
+
+  /**
+   * Promote a short-term or working memory to long-term memory.
+   * Does not create a new content version — only changes the memory tier.
+   *
+   * @param {number} id — entity ID to promote
+   * @param {{ allowedWorkspaces? }} [opts]
+   * @returns {Promise<object>} updated entity
+   */
+  async promote(id, opts = {}) {
+    if (typeof this._engine.annotate !== "function") {
+      throw new Error("Engine does not support annotate(). Upgrade smriti-db.");
+    }
+    return this._engine.annotate(id, {
+      memoryType: "long-term",
+      allowedWorkspaces: opts.allowedWorkspaces,
+    });
+  }
+
+  /**
+   * Explicitly forget (soft-delete) an entity with a stated reason.
+   * The memory is removed from retrieval but kept for audit. Use purge() for GDPR erasure.
+   *
+   * @param {number} id — entity ID to forget
+   * @param {string} [reason] — why this memory is being discarded
+   * @param {{ allowedWorkspaces? }} [opts]
+   */
+  async forget(id, reason = "explicit forget", opts = {}) {
+    return this._engine.remove(id, {
+      deletedBy: { type: "agent", actor: this.name, reason },
+      allowedWorkspaces: opts.allowedWorkspaces,
+    });
+  }
+
+  /**
+   * Consolidate short-term and working memories at the end of a session.
+   * Merges near-duplicates and returns a report of what was merged.
+   * Call this before shutting the agent down to keep long-term memory clean.
+   *
+   * @param {{ threshold?, dryRun? }} [opts]
+   * @returns {Promise<{ merged, totalMerged }>}
+   */
+  async consolidateSession(opts = {}) {
+    return this._engine.consolidate({
+      ...opts,
+      allowedWorkspaces: opts.allowedWorkspaces,
+    });
+  }
+
+  /**
+   * Get all entities currently in working memory for this agent's workspace.
+   * Useful for inspecting transient context before deciding what to promote or forget.
+   *
+   * @param {{ limit?, workspaceId? }} [opts]
+   * @returns {Promise<{ total, page, pages, entities }>}
+   */
+  async getWorkingMemory(opts = {}) {
+    return this._engine.listEntities({
+      memoryType: "working",
+      limit: opts.limit || 50,
+      workspaceId: opts.workspaceId,
+      allowedWorkspaces: opts.allowedWorkspaces,
+    });
+  }
+
+  /**
+   * Measure semantic drift of an entity — how much its meaning has changed over time.
+   * @param {number} id — entity ID
+   * @returns {Promise<{ id, versionCount, totalDrift, averageDrift, trend, steps }>}
+   */
+  async getDrift(id) {
+    if (typeof this._engine.getDrift === "function") {
+      return this._engine.getDrift(id);
+    }
+    throw new Error("Engine does not support getDrift(). Upgrade smriti-db.");
+  }
+
+  /**
+   * Annotate an entity with trust signals without creating a new content version.
+   * @param {number} id
+   * @param {{ trustScore?, verified?, notes?, memoryType? }} opts
+   * @returns {Promise<object>} updated entity
+   */
+  async annotate(id, opts = {}) {
+    if (typeof this._engine.annotate !== "function") {
+      throw new Error("Engine does not support annotate(). Upgrade smriti-db.");
+    }
+    return this._engine.annotate(id, {
+      ...opts,
+      allowedWorkspaces: opts.allowedWorkspaces,
+    });
+  }
+
+  /**
+   * Alias for boot() — returns a token-budgeted summary of the most important memories.
+   * @param {{ maxTokens?, depth?, filter? }} [opts]
+   * @returns {Promise<{ summary, items }>}
+   */
+  async summarize(opts = {}) {
+    return this.boot(opts);
   }
 }
 

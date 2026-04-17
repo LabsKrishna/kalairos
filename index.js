@@ -5,11 +5,27 @@ const os     = require("os");
 const fs     = require("fs");
 const path   = require("path");
 const { cosine } = require("./kernel");
-const { buildDelta }               = require("./versioning");
+const { buildDelta, buildChangelog, measureDrift } = require("./versioning");
 const { WorkerPool } = require("./worker-pool");
 const { AgentMemory } = require("./agent");
 const { Err, emitError, resetSignals } = require("./errors");
 const { AuthStore } = require("./auth");
+
+// ─── Trust Score Defaults ─────────────────────────────────────────────────────
+// Default trust scores by provenance type. Explicit annotations override these.
+// The hierarchy reflects information quality: users and verified tools score
+// higher than automated agents; raw files and system-generated content score lowest.
+const _SOURCE_TRUST_DEFAULTS = {
+  user:   0.90,  // human input — highest default trust
+  agent:  0.75,  // automated agent write — moderate trust
+  tool:   0.80,  // tool-assisted write — trusted but not user-confirmed
+  file:   0.70,  // file ingest — content may be stale or external
+  system: 0.60,  // system-generated — lowest default trust
+};
+
+function _defaultTrustScore(sourceType) {
+  return _SOURCE_TRUST_DEFAULTS[sourceType] ?? 0.70;
+}
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -31,20 +47,98 @@ const DEFAULTS = {
   // llmFn(text, type) — inject your own: `async (text, type) => { keywords, context, llmTags, importance?, suggestedType? }`.
   // factExtractFn(text, type) — inject your own: `async (text, type) => string[]` (array of discrete fact strings).
   consolidationThreshold: Number(process.env.SMRITI_CONSOLIDATION_THRESHOLD || 0.78),
+  // Maximum number of mutations that may be pending in the write queue at once.
+  // Excess writes are rejected with ERR_WRITE_QUEUE_FULL (HTTP 429) so callers
+  // get a clear backpressure signal instead of unbounded memory growth.
+  writeQueueMax: Number(process.env.SMRITI_WRITE_QUEUE_MAX || 500),
 };
 
 // ─── Module state ─────────────────────────────────────────────────────────────
 
 let CFG         = { ...DEFAULTS };
-let store       = new Map();   // id → entity
+let store       = null;        // StoreAdapter (FileStore or PgStore)
 let _pool       = null;        // persistent WorkerPool
 let _initialized = false;
-let _skipIO      = false;      // suppresses per-item I/O during batch operations
-const _auth      = new AuthStore();
+let _skipIO        = 0;    // ref-counted; > 0 suppresses per-item I/O during batch ops
+let _pendingWrites = [];   // { fn, resolve, reject } — drain-based write queue
+let _draining      = false;// true while _drainWrites() is scheduled or running
+const _auth        = new AuthStore();
 
 // Monotonically increasing ID — guarantees uniqueness even within the same ms.
 let _nextId = Date.now();
 function _newId() { return _nextId++; }
+
+// ─── Write queue (drain-based coalescing mutex) ───────────────────────────────
+// All store mutations run inside _withWriteLock so callers are serialised.
+// The compute phase (embedding, LLM) runs outside the lock and stays parallel.
+//
+// Design — two properties beyond a plain serial queue:
+//
+//  1. Coalescing: _drainWrites() uses setImmediate so writes that arrive while
+//     embeddings are in flight accumulate before the drain runs. When ≥ 2 writes
+//     are pending, _skipIO is bumped for the batch and _persistAll() is called
+//     once at the end instead of once per write. Under sustained load (100s–1000s
+//     of concurrent ingests) this collapses N file-syncs into 1 per event-loop
+//     tick, the dominant throughput bottleneck.
+//
+//  2. Backpressure: if _pendingWrites already holds writeQueueMax entries, new
+//     writes are rejected immediately with ERR_WRITE_QUEUE_FULL (HTTP 429).
+//     This bounds memory and gives callers a signal to back off rather than
+//     silently queuing forever.
+//
+// All fn bodies must be synchronous (no await inside the lock). This keeps the
+// critical section fast and avoids nested lock acquisition.
+
+function _withWriteLock(fn) {
+  const max = CFG.writeQueueMax;
+  if (_pendingWrites.length >= max) {
+    return Promise.reject(emitError(Err.writeQueueFull(_pendingWrites.length, max)));
+  }
+  return new Promise((resolve, reject) => {
+    _pendingWrites.push({ fn, resolve, reject });
+    if (!_draining) {
+      _draining = true;
+      // Defer so writes that arrive in the same tick can accumulate first.
+      setImmediate(_drainWrites);
+    }
+  });
+}
+
+function _drainWrites() {
+  // Loop: after each batch, check if new items arrived while we were settling.
+  while (_pendingWrites.length > 0) {
+    const batch   = _pendingWrites.splice(0); // grab everything pending right now
+    const isMulti = batch.length > 1;
+
+    // Suppress per-item I/O for multi-write batches; one flush covers them all.
+    if (isMulti) _skipIO++;
+
+    const settled = [];
+    for (const item of batch) {
+      try {
+        settled.push({ ok: true,  resolve: item.resolve, value: item.fn() });
+      } catch (err) {
+        settled.push({ ok: false, reject:  item.reject,  error: err });
+      }
+    }
+
+    if (isMulti) {
+      _skipIO--;
+      // _persistAll() honours the outer _skipIO counter: if we are nested inside
+      // an ingestBatch/_extractFacts call (skipIO > 0), this is a no-op — the
+      // caller's own _persistAll() will flush at the end of its loop. Otherwise
+      // this is the single flush for the entire micro-batch.
+      _persistAll();
+    }
+
+    // Settle all promises after the flush so callers receive confirmed IDs.
+    for (const s of settled) {
+      if (s.ok) s.resolve(s.value);
+      else      s.reject(s.error);
+    }
+  }
+  _draining = false;
+}
 
 // Canonicalizes provenance input. Accepts a string shorthand ("user", "agent", ...)
 // or an object { type, uri? }. Unknown types are preserved so callers can extend.
@@ -113,6 +207,7 @@ function _serializeEntity(e, { truncateText } = {}) {
     metadata:       e.metadata || {},
     tags:           e.tags || [],
     importance:     e.importance != null ? e.importance : null,
+    trustScore:     e.trustScore != null ? e.trustScore : _defaultTrustScore(e.source?.type || "user"),
     linkCount:      e.links?.size || 0,
     versionCount:   e.versions?.length || 1,
     createdAt:      e.createdAt,
@@ -157,9 +252,22 @@ async function init(overrides = {}) {
   // Tear down existing worker pool before creating a new one
   if (_pool) { await _pool.stop(); _pool = null; }
 
-  CFG   = { ...DEFAULTS, ...overrides };
-  store = new Map();
-  _loadData();
+  CFG            = { ...DEFAULTS, ...overrides };
+  _skipIO        = 0;      // reset batch-suppress counter
+  _pendingWrites = [];     // drop any queued mutations from previous session
+  _draining      = false;  // drain state reset
+
+  // ── Choose backing store ───────────────────────────────────────────────────
+  const storeType = (overrides.store || process.env.SMRITI_STORE || "file").toLowerCase();
+  if (storeType === "pg") {
+    throw new Error(
+      "[smriti] PostgreSQL/pgvector backing store is available in Smriti Enterprise.\n" +
+      "  See https://github.com/LabsKrishna/smriti-db#enterprise for more information."
+    );
+  }
+  const { FileStore } = require("./store/file-store");
+  store = new FileStore();
+  await _loadStore();
 
   _pool = new WorkerPool(os.cpus().length);
   _pool.start();
@@ -176,88 +284,106 @@ function _safeConfig() {
 
 // ─── Persistence ──────────────────────────────────────────────────────────────
 
-function _dataFile() { return CFG.dataFile || null; }
+// Normalise a raw entity object (from JSONL or DB row) into a live entity.
+// Mutates `raw` in-place (same as the old _loadData loop) and returns it.
+function _normalizeRaw(raw) {
+  raw.links    = new Set(raw.links   || []);
+  raw.versions = raw.versions || [];
+  raw.type     = raw.type     || "text";
+  raw.metadata = raw.metadata || {};
+  raw.tags     = raw.tags     || [];
 
-function _loadData() {
-  const file = _dataFile();
-  if (!file || file === ":memory:" || !fs.existsSync(file)) return;
+  const versionSource         = raw.versions.find(v => v?.source)?.source;
+  const versionClassification = raw.versions.find(v => v?.classification)?.classification;
+  raw.source         = raw.source || versionSource || { type: "user" };
+  raw.classification = _normalizeClassification(raw.classification || versionClassification);
+  raw.retention      = _normalizeRetention(raw.retention);
 
-  const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
-  for (const line of lines) {
+  // Preserve soft-delete fields; default to not-deleted
+  if (raw.deletedAt !== undefined && raw.deletedAt !== null) {
+    raw.deletedAt = Number(raw.deletedAt);
+    raw.deletedBy = raw.deletedBy || null;
+  } else {
+    raw.deletedAt = null;
+    raw.deletedBy = null;
+  }
+
+  // Backfill fields added in later schema versions
+  raw.memoryType  = _normalizeMemoryType(raw.memoryType);
+  raw.workspaceId = _normalizeWorkspaceId(raw.workspaceId);
+  if (!Array.isArray(raw.llmKeywords)) raw.llmKeywords = raw.metadata?.llm?.keywords || [];
+  if (raw.importance === undefined)    raw.importance  = null;
+  if (raw.trustScore === undefined)    raw.trustScore  = _defaultTrustScore(raw.source?.type || "user");
+
+  // Backfill per-version metadata
+  for (const v of raw.versions) if (!v.source) v.source = raw.source;
+  for (const v of raw.versions) {
+    v.classification = _normalizeClassification(v.classification || raw.classification);
+    if (!Array.isArray(v.linkIds)) v.linkIds = [];
+  }
+
+  // Migrate old data: if versions are oldest-first, reverse to newest-first
+  if (raw.versions.length > 1 &&
+      raw.versions[0].timestamp < raw.versions[raw.versions.length - 1].timestamp) {
+    raw.versions.reverse();
+  }
+
+  return raw;
+}
+
+// Load raw rows from the backing store, normalise them, and populate the
+// in-memory hot-cache. Works for both sync (FileStore) and async (PgStore).
+async function _loadStore() {
+  const rawItems = await store.loadRaw(CFG);
+  for (const raw of rawItems) {
     try {
-      const raw = JSON.parse(line);
-      raw.links    = new Set(raw.links   || []);
-      raw.versions = raw.versions || [];
-      raw.type     = raw.type     || "text";
-      raw.metadata = raw.metadata || {};
-      raw.tags     = raw.tags     || [];
-      const versionSource = raw.versions.find(v => v?.source)?.source;
-      const versionClassification = raw.versions.find(v => v?.classification)?.classification;
-      raw.source   = raw.source || versionSource || { type: "user" };
-      raw.classification = _normalizeClassification(raw.classification || versionClassification);
-      raw.retention  = _normalizeRetention(raw.retention);
-      // Preserve soft-delete fields; default to not-deleted
-      if (raw.deletedAt !== undefined && raw.deletedAt !== null) {
-        raw.deletedAt = Number(raw.deletedAt);
-        raw.deletedBy = raw.deletedBy || null;
-      } else {
-        raw.deletedAt = null;
-        raw.deletedBy = null;
-      }
-      // Backfill memoryType, workspaceId (added v2 schema), llmKeywords, and importance
-      raw.memoryType   = _normalizeMemoryType(raw.memoryType);
-      raw.workspaceId  = _normalizeWorkspaceId(raw.workspaceId);
-      if (!Array.isArray(raw.llmKeywords)) raw.llmKeywords = raw.metadata?.llm?.keywords || [];
-      if (raw.importance === undefined) raw.importance = null; // null = use heuristic at query time
-
-      // Backfill missing per-version source (older data files)
-      for (const v of raw.versions) if (!v.source) v.source = raw.source;
-      for (const v of raw.versions) {
-        v.classification = _normalizeClassification(v.classification || raw.classification);
-        // Backfill per-version linkIds snapshot (older data won't have it)
-        if (!Array.isArray(v.linkIds)) v.linkIds = [];
-      }
-
-      // Migrate old data: if versions are oldest-first, reverse to newest-first
-      if (raw.versions.length > 1 &&
-          raw.versions[0].timestamp < raw.versions[raw.versions.length - 1].timestamp) {
-        raw.versions.reverse();
-      }
-
-      store.set(raw.id, raw);
+      const entity = _normalizeRaw(raw);
+      store.set(entity.id, entity);
     } catch (err) {
-      emitError(Err.loadFailed(err.message, line.slice(0, 80)));
-      console.warn("[smriti] Skipping malformed line in data file");
+      emitError(Err.loadFailed(err.message, String(raw?.id || "").slice(0, 80)));
+      console.warn("[smriti] Skipping malformed entity during load");
     }
   }
   console.log(`[smriti] Loaded ${store.size} entities`);
 }
 
+// Serialise entity for backing store I/O (links Set → Array).
+function _serializeForIO(entity) {
+  return { ...entity, links: Array.from(entity.links) };
+}
+
 function _persistAll() {
-  if (_skipIO) return;
-  const file = _dataFile();
-  if (!file || file === ":memory:") return;
-  const tmp = file + ".tmp";
+  if (_skipIO > 0) return;
+  const rows = Array.from(store.values()).map(_serializeForIO);
   try {
-    const lines = [];
-    for (const entity of store.values()) {
-      lines.push(JSON.stringify({ ...entity, links: Array.from(entity.links) }));
+    const result = store.persistAll(rows, CFG);
+    if (result && typeof result.catch === "function") {
+      result.catch(err => {
+        emitError(Err.persistFailed(err.message, err));
+        console.error(`[smriti] PersistAll failed: ${err.message}`);
+      });
     }
-    fs.writeFileSync(tmp, lines.join("\n") + "\n");
-    fs.renameSync(tmp, file); // atomic on POSIX — prevents corrupt writes on crash
   } catch (err) {
-    // Clean up temp file if rename failed
-    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* best effort */ }
     emitError(Err.persistFailed(err.message, err));
     console.error(`[smriti] Persistence failed: ${err.message}`);
   }
 }
 
 function _appendEntity(entity) {
-  if (_skipIO) return;
-  const file = _dataFile();
-  if (!file || file === ":memory:") return;
-  fs.appendFileSync(file, JSON.stringify({ ...entity, links: Array.from(entity.links) }) + "\n");
+  if (_skipIO > 0) return;
+  const row = _serializeForIO(entity);
+  try {
+    const result = store.appendEntity(row, CFG);
+    if (result && typeof result.catch === "function") {
+      result.catch(err => {
+        emitError(Err.persistFailed(err.message, err));
+        console.error(`[smriti] AppendEntity failed: ${err.message}`);
+      });
+    }
+  } catch (err) {
+    emitError(Err.persistFailed(err.message, err));
+    console.error(`[smriti] Append entity failed: ${err.message}`);
+  }
 }
 
 // ─── Embedding ────────────────────────────────────────────────────────────────
@@ -384,7 +510,7 @@ function _relinkEntity(entity) {
  * @param {{ type?, timestamp?, metadata?, tags?, source?, classification? }} opts
  * @returns {number} stable entity ID (never changes across updates)
  */
-async function ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, allowedWorkspaces } = {}) {
+async function ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces } = {}) {
   _assertInit();
 
   const ts       = timestamp || Date.now();
@@ -402,6 +528,9 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
   }
 
   // ── Optional LLM enrichment (off by default for speed/privacy) ────────────
+  // Phase 1 ends here — everything above is pure compute with no store reads.
+  // Multiple concurrent ingest() calls may reach this point in parallel, which
+  // is safe: embeddings are deterministic and no shared state is touched.
   let llmEnrichment = null;
   if (useLLM) {
     llmEnrichment = await _enrichWithLLM(safeText, type);
@@ -411,96 +540,106 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     }
   }
 
-  // ── Find closest existing entity of the same type ─────────────────────────
-  // Two tiers: versionThreshold for direct updates, consolidationThreshold for
-  // near-duplicate detection so the same fact expressed differently merges
-  // instead of creating a separate entity.
-  let bestMatch = null, bestSim = 0;
-  let consolidateMatch = null, consolidateSim = 0;
-  for (const entity of store.values()) {
-    if (!_isAlive(entity)) continue;
-    if (entity.type !== type) continue;
-    const sim = cosine(vector, entity.vector);
-    if (sim >= CFG.versionThreshold && sim > bestSim) {
-      bestSim   = sim;
-      bestMatch = entity;
-    } else if (sim >= CFG.consolidationThreshold && sim > consolidateSim) {
-      consolidateSim   = sim;
-      consolidateMatch = entity;
-    }
-  }
-
-  // Consolidation: if no direct version match but a near-duplicate exists,
-  // treat it as a version update (same fact, different expression).
-  const mergeTarget = bestMatch || consolidateMatch;
-  const isConsolidation = !bestMatch && !!consolidateMatch;
-
-  // ── Update / Consolidation path: merge into existing entity ───────────────
-  if (mergeTarget) {
-    const delta = buildDelta(mergeTarget.text, mergeTarget.vector, safeText, vector);
-    if (isConsolidation) delta.type = "consolidation";
-
-    // Snapshot current linkIds before relink so the version captures the graph at this point
-    const linkSnapshot = Array.from(mergeTarget.links);
-    mergeTarget.versions.unshift({ text: safeText, vector, timestamp: ts, delta, source: src, classification: cls, linkIds: linkSnapshot });
-
-    if (CFG.maxVersions > 0 && mergeTarget.versions.length > CFG.maxVersions) {
-      mergeTarget.versions.length = CFG.maxVersions;
+  // ── Phase 2: critical section (serialised via write lock) ─────────────────
+  // All store reads, mutations, graph relinking, and persistence happen here.
+  // The body is synchronous so the lock is held for the minimum possible time.
+  return _withWriteLock(() => {
+    // ── Find closest existing entity of the same type ───────────────────────
+    // Two tiers: versionThreshold for direct updates, consolidationThreshold for
+    // near-duplicate detection so the same fact expressed differently merges
+    // instead of creating a separate entity.
+    let bestMatch = null, bestSim = 0;
+    let consolidateMatch = null, consolidateSim = 0;
+    for (const entity of store.values()) {
+      if (!_isAlive(entity)) continue;
+      if (entity.type !== type) continue;
+      const sim = cosine(vector, entity.vector);
+      if (sim >= CFG.versionThreshold && sim > bestSim) {
+        bestSim   = sim;
+        bestMatch = entity;
+      } else if (sim >= CFG.consolidationThreshold && sim > consolidateSim) {
+        consolidateSim   = sim;
+        consolidateMatch = entity;
+      }
     }
 
-    mergeTarget.text      = safeText;
-    mergeTarget.vector    = vector;
-    mergeTarget.updatedAt = ts;
-    mergeTarget.source    = src;
-    mergeTarget.classification = cls;
-    mergeTarget.retention = retention ? ret : mergeTarget.retention || _normalizeRetention();
-    mergeTarget.memoryType  = memoryType ? mt : mergeTarget.memoryType || _normalizeMemoryType();
-    mergeTarget.workspaceId = workspaceId ? ws : mergeTarget.workspaceId || _normalizeWorkspaceId();
-    mergeTarget.metadata  = { ...mergeTarget.metadata, ...metadata };
-    if (llmEnrichment) mergeTarget.metadata.llm = llmEnrichment;
-    mergeTarget.tags      = Array.from(new Set([...(mergeTarget.tags || []), ...tags]));
-    if (llmEnrichment) mergeTarget.llmKeywords = llmEnrichment.keywords;
-    if (Number.isFinite(importance)) mergeTarget.importance = Math.max(0, Math.min(1, importance));
-    else if (llmEnrichment && Number.isFinite(llmEnrichment.importance)) mergeTarget.importance = llmEnrichment.importance;
+    // Consolidation: if no direct version match but a near-duplicate exists,
+    // treat it as a version update (same fact, different expression).
+    const mergeTarget = bestMatch || consolidateMatch;
+    const isConsolidation = !bestMatch && !!consolidateMatch;
 
-    _relinkEntity(mergeTarget);
-    _persistAll();
-    const flag = delta.contradicts ? " ⚠ CONTRADICTS prior version" : "";
-    const verb = isConsolidation ? "Consolidated into" : "Updated";
-    console.log(`[smriti] ${verb} entity ${mergeTarget.id} → v${mergeTarget.versions.length} [${delta.type}]${flag} ${delta.summary}`);
-    return mergeTarget.id;
-  }
+    // ── Update / Consolidation path: merge into existing entity ─────────────
+    if (mergeTarget) {
+      const delta = buildDelta(mergeTarget.text, mergeTarget.vector, safeText, vector);
+      if (isConsolidation) delta.type = "consolidation";
 
-  // ── Create path: brand new entity ─────────────────────────────────────────
-  const id     = _newId();
-  const enrichedMeta = llmEnrichment ? { ...metadata, llm: llmEnrichment } : metadata;
-  const entity = {
-    id, type,
-    text:      safeText,
-    vector,
-    source:    src,
-    classification: cls,
-    retention: ret,
-    memoryType:  mt,
-    workspaceId: ws,
-    deletedAt: null,
-    deletedBy: null,
-    metadata:  enrichedMeta,
-    tags:      Array.isArray(tags) ? [...tags] : [],
-    importance:  Number.isFinite(importance) ? Math.max(0, Math.min(1, importance))
-                 : llmEnrichment ? (llmEnrichment.importance || 0.5) : null,
-    llmKeywords: llmEnrichment ? llmEnrichment.keywords : [],
-    links:     new Set(),
-    createdAt: ts,
-    updatedAt: ts,
-    versions:  [{ text: safeText, vector, timestamp: ts, delta: null, source: src, classification: cls, linkIds: [] }],
-  };
+      // Snapshot current linkIds before relink so the version captures the graph at this point
+      const linkSnapshot = Array.from(mergeTarget.links);
+      mergeTarget.versions.unshift({ text: safeText, vector, timestamp: ts, delta, source: src, classification: cls, linkIds: linkSnapshot });
 
-  store.set(id, entity);
-  _relinkEntity(entity);
-  _appendEntity(entity);
-  console.log(`[smriti] Created entity ${id} [${type}]`);
-  return id;
+      if (CFG.maxVersions > 0 && mergeTarget.versions.length > CFG.maxVersions) {
+        mergeTarget.versions.length = CFG.maxVersions;
+      }
+
+      mergeTarget.text      = safeText;
+      mergeTarget.vector    = vector;
+      mergeTarget.updatedAt = ts;
+      mergeTarget.source    = src;
+      mergeTarget.classification = cls;
+      mergeTarget.retention = retention ? ret : mergeTarget.retention || _normalizeRetention();
+      mergeTarget.memoryType  = memoryType ? mt : mergeTarget.memoryType || _normalizeMemoryType();
+      mergeTarget.workspaceId = workspaceId ? ws : mergeTarget.workspaceId || _normalizeWorkspaceId();
+      mergeTarget.metadata  = { ...mergeTarget.metadata, ...metadata };
+      if (llmEnrichment) mergeTarget.metadata.llm = llmEnrichment;
+      mergeTarget.tags      = Array.from(new Set([...(mergeTarget.tags || []), ...tags]));
+      if (llmEnrichment) mergeTarget.llmKeywords = llmEnrichment.keywords;
+      if (Number.isFinite(importance)) mergeTarget.importance = Math.max(0, Math.min(1, importance));
+      else if (llmEnrichment && Number.isFinite(llmEnrichment.importance)) mergeTarget.importance = llmEnrichment.importance;
+      // Update trust score when explicitly provided; otherwise preserve existing
+      if (Number.isFinite(trustScore)) mergeTarget.trustScore = Math.max(0, Math.min(1, trustScore));
+      else if (!Number.isFinite(mergeTarget.trustScore)) mergeTarget.trustScore = _defaultTrustScore(src.type);
+
+      _relinkEntity(mergeTarget);
+      _persistAll();
+      const flag = delta.contradicts ? " ⚠ CONTRADICTS prior version" : "";
+      const verb = isConsolidation ? "Consolidated into" : "Updated";
+      console.log(`[smriti] ${verb} entity ${mergeTarget.id} → v${mergeTarget.versions.length} [${delta.type}]${flag} ${delta.summary}`);
+      return mergeTarget.id;
+    }
+
+    // ── Create path: brand new entity ───────────────────────────────────────
+    const id     = _newId();
+    const enrichedMeta = llmEnrichment ? { ...metadata, llm: llmEnrichment } : metadata;
+    const entity = {
+      id, type,
+      text:      safeText,
+      vector,
+      source:    src,
+      classification: cls,
+      retention: ret,
+      memoryType:  mt,
+      workspaceId: ws,
+      deletedAt: null,
+      deletedBy: null,
+      metadata:  enrichedMeta,
+      tags:      Array.isArray(tags) ? [...tags] : [],
+      importance:  Number.isFinite(importance) ? Math.max(0, Math.min(1, importance))
+                   : llmEnrichment ? (llmEnrichment.importance || 0.5) : null,
+      trustScore:  Number.isFinite(trustScore) ? Math.max(0, Math.min(1, trustScore))
+                   : _defaultTrustScore(src.type),
+      llmKeywords: llmEnrichment ? llmEnrichment.keywords : [],
+      links:     new Set(),
+      createdAt: ts,
+      updatedAt: ts,
+      versions:  [{ text: safeText, vector, timestamp: ts, delta: null, source: src, classification: cls, linkIds: [] }],
+    };
+
+    store.set(id, entity);
+    _relinkEntity(entity);
+    _appendEntity(entity);
+    console.log(`[smriti] Created entity ${id} [${type}]`);
+    return id;
+  });
 }
 
 /**
@@ -517,7 +656,8 @@ async function remember(text, opts = {}) {
     ...opts,
     source,
     classification: opts.classification || "internal",
-    importance: opts.importance,
+    importance:     opts.importance,
+    trustScore:     opts.trustScore,
     allowedWorkspaces: opts.allowedWorkspaces,
   });
 }
@@ -535,15 +675,15 @@ async function ingestBatch(items, { allowedWorkspaces } = {}) {
     throw emitError(Err.validation("items must be a non-empty array"));
   }
 
-  _skipIO = true;
+  _skipIO++;
   const ids = [];
   try {
     for (const item of items) {
-      const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM } = item || {};
-      ids.push(await ingest(text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, allowedWorkspaces }));
+      const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore } = item || {};
+      ids.push(await ingest(text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, allowedWorkspaces }));
     }
   } finally {
-    _skipIO = false;
+    _skipIO--;
   }
   _persistAll(); // single write for the entire batch
   return ids;
@@ -570,7 +710,7 @@ async function extractFacts(text, opts = {}) {
   if (!facts.length) return { facts: [], ids: [] };
 
   // Ingest each fact as its own entity, batched for single persist
-  _skipIO = true;
+  _skipIO++;
   const ids = [];
   try {
     for (const fact of facts) {
@@ -581,7 +721,7 @@ async function extractFacts(text, opts = {}) {
       }));
     }
   } finally {
-    _skipIO = false;
+    _skipIO--;
   }
   _persistAll();
 
@@ -877,6 +1017,9 @@ async function query(text, { limit = 10, maxTokens = null, filter = {}, asOf = n
         retention:      entity?.retention || { policy: "keep", expiresAt: null },
         memoryType:     entity?.memoryType || "long-term",
         workspaceId:    entity?.workspaceId || "default",
+        trustScore:     entity?.trustScore != null
+                          ? entity.trustScore
+                          : _defaultTrustScore(entity?.source?.type || "user"),
         delta:          entity?.delta || null,
       };
     });
@@ -963,18 +1106,20 @@ async function getMany(ids, { allowedWorkspaces } = {}) {
  */
 async function remove(id, { deletedBy, allowedWorkspaces } = {}) {
   _assertInit();
-  const numId = Number(id) || id;
-  const e = store.get(numId);
-  if (!e) throw emitError(Err.notFound(id));
-  if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No admin access to workspace "${e.workspaceId || "default"}".`));
-  if (e.deletedAt) throw emitError(Err.alreadyDeleted(id));
+  return _withWriteLock(() => {
+    const numId = Number(id) || id;
+    const e = store.get(numId);
+    if (!e) throw emitError(Err.notFound(id));
+    if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No admin access to workspace "${e.workspaceId || "default"}".`));
+    if (e.deletedAt) throw emitError(Err.alreadyDeleted(id));
 
-  _unlinkEntity(e, numId);
-  e.deletedAt = Date.now();
-  e.deletedBy = deletedBy ? _normalizeSource(deletedBy) : null;
+    _unlinkEntity(e, numId);
+    e.deletedAt = Date.now();
+    e.deletedBy = deletedBy ? _normalizeSource(deletedBy) : null;
 
-  _persistAll();
-  console.log(`[smriti] Soft-deleted entity ${numId}`);
+    _persistAll();
+    console.log(`[smriti] Soft-deleted entity ${numId}`);
+  });
 }
 
 // ─── Purge Entity (Hard Delete) ──────────────────────────────────────────────
@@ -987,15 +1132,17 @@ async function remove(id, { deletedBy, allowedWorkspaces } = {}) {
  */
 async function purge(id, { allowedWorkspaces } = {}) {
   _assertInit();
-  const numId = Number(id) || id;
-  const e = store.get(numId);
-  if (!e) throw emitError(Err.notFound(id));
-  if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No admin access to workspace "${e.workspaceId || "default"}".`));
+  return _withWriteLock(() => {
+    const numId = Number(id) || id;
+    const e = store.get(numId);
+    if (!e) throw emitError(Err.notFound(id));
+    if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No admin access to workspace "${e.workspaceId || "default"}".`));
 
-  _unlinkEntity(e, numId);
-  store.delete(numId);
-  _persistAll();
-  console.log(`[smriti] Purged entity ${numId} (permanent)`);
+    _unlinkEntity(e, numId);
+    store.delete(numId);
+    _persistAll();
+    console.log(`[smriti] Purged entity ${numId} (permanent)`);
+  });
 }
 
 // ─── Memory Consolidation ────────────────────────────────────────────────────
@@ -1013,77 +1160,81 @@ async function purge(id, { allowedWorkspaces } = {}) {
  */
 async function consolidate({ threshold, dryRun = false, type, allowedWorkspaces } = {}) {
   _assertInit();
-  const thresh = Number.isFinite(threshold) ? threshold : CFG.consolidationThreshold;
-  let alive  = _getAllAlive().filter(e => !type || e.type === type);
-  if (allowedWorkspaces) alive = alive.filter(e => _wsAllowed(e, allowedWorkspaces));
+  // consolidate holds the lock for its full duration because both the similarity
+  // scan and the mutation loop must see a consistent store snapshot.
+  return _withWriteLock(() => {
+    const thresh = Number.isFinite(threshold) ? threshold : CFG.consolidationThreshold;
+    let alive  = _getAllAlive().filter(e => !type || e.type === type);
+    if (allowedWorkspaces) alive = alive.filter(e => _wsAllowed(e, allowedWorkspaces));
 
-  // Build clusters: union-find by similarity
-  const parent = new Map();
-  function find(id) {
-    while (parent.get(id) !== id) { parent.set(id, parent.get(parent.get(id))); id = parent.get(id); }
-    return id;
-  }
-  function union(a, b) {
-    const ra = find(a), rb = find(b);
-    if (ra !== rb) parent.set(ra, rb);
-  }
+    // Build clusters: union-find by similarity
+    const parent = new Map();
+    function find(id) {
+      while (parent.get(id) !== id) { parent.set(id, parent.get(parent.get(id))); id = parent.get(id); }
+      return id;
+    }
+    function union(a, b) {
+      const ra = find(a), rb = find(b);
+      if (ra !== rb) parent.set(ra, rb);
+    }
 
-  for (const e of alive) parent.set(e.id, e.id);
+    for (const e of alive) parent.set(e.id, e.id);
 
-  const pairs = [];
-  for (let i = 0; i < alive.length; i++) {
-    for (let j = i + 1; j < alive.length; j++) {
-      if (alive[i].type !== alive[j].type) continue;
-      const sim = cosine(alive[i].vector, alive[j].vector);
-      if (sim >= thresh) {
-        union(alive[i].id, alive[j].id);
-        pairs.push({ a: alive[i], b: alive[j], sim });
+    const pairs = [];
+    for (let i = 0; i < alive.length; i++) {
+      for (let j = i + 1; j < alive.length; j++) {
+        if (alive[i].type !== alive[j].type) continue;
+        const sim = cosine(alive[i].vector, alive[j].vector);
+        if (sim >= thresh) {
+          union(alive[i].id, alive[j].id);
+          pairs.push({ a: alive[i], b: alive[j], sim });
+        }
       }
     }
-  }
 
-  // Group by cluster root
-  const clusters = new Map();
-  for (const e of alive) {
-    const root = find(e.id);
-    if (!clusters.has(root)) clusters.set(root, []);
-    clusters.get(root).push(e);
-  }
+    // Group by cluster root
+    const clusters = new Map();
+    for (const e of alive) {
+      const root = find(e.id);
+      if (!clusters.has(root)) clusters.set(root, []);
+      clusters.get(root).push(e);
+    }
 
-  const merged = [];
-  for (const [, members] of clusters) {
-    if (members.length < 2) continue;
-    // Keep the most recently updated entity
-    members.sort((a, b) => b.updatedAt - a.updatedAt);
-    const keeper = members[0];
-    const absorbed = members.slice(1);
+    const merged = [];
+    for (const [, members] of clusters) {
+      if (members.length < 2) continue;
+      // Keep the most recently updated entity
+      members.sort((a, b) => b.updatedAt - a.updatedAt);
+      const keeper = members[0];
+      const absorbed = members.slice(1);
 
-    for (const dup of absorbed) {
-      const sim = cosine(keeper.vector, dup.vector);
-      merged.push({
-        kept:     { id: keeper.id, text: keeper.text.slice(0, 80) },
-        absorbed: { id: dup.id,    text: dup.text.slice(0, 80) },
-        similarity: +sim.toFixed(4),
-      });
+      for (const dup of absorbed) {
+        const sim = cosine(keeper.vector, dup.vector);
+        merged.push({
+          kept:     { id: keeper.id, text: keeper.text.slice(0, 80) },
+          absorbed: { id: dup.id,    text: dup.text.slice(0, 80) },
+          similarity: +sim.toFixed(4),
+        });
 
-      if (!dryRun) {
-        // Merge tags and metadata from duplicate into keeper
-        keeper.tags = Array.from(new Set([...(keeper.tags || []), ...(dup.tags || [])]));
-        keeper.metadata = { ...dup.metadata, ...keeper.metadata };
+        if (!dryRun) {
+          // Merge tags and metadata from duplicate into keeper
+          keeper.tags = Array.from(new Set([...(keeper.tags || []), ...(dup.tags || [])]));
+          keeper.metadata = { ...dup.metadata, ...keeper.metadata };
 
-        // Soft-delete the duplicate
-        _unlinkEntity(dup, dup.id);
-        dup.deletedAt = Date.now();
-        dup.deletedBy = { type: "system", actor: "consolidate" };
+          // Soft-delete the duplicate
+          _unlinkEntity(dup, dup.id);
+          dup.deletedAt = Date.now();
+          dup.deletedBy = { type: "system", actor: "consolidate" };
+        }
       }
     }
-  }
 
-  if (!dryRun && merged.length) _persistAll();
+    if (!dryRun && merged.length) _persistAll();
 
-  const verb = dryRun ? "Would merge" : "Merged";
-  console.log(`[smriti] ${verb} ${merged.length} duplicate(s) across ${clusters.size} cluster(s)`);
-  return { merged, totalMerged: merged.length };
+    const verb = dryRun ? "Would merge" : "Merged";
+    console.log(`[smriti] ${verb} ${merged.length} duplicate(s) across ${clusters.size} cluster(s)`);
+    return { merged, totalMerged: merged.length };
+  });
 }
 
 // ─── Graph ────────────────────────────────────────────────────────────────────
@@ -1259,6 +1410,7 @@ async function getStatus({ allowedWorkspaces } = {}) {
     byType,
     byMemoryType,
     byWorkspace,
+    writeQueue: { pending: _pendingWrites.length, max: CFG.writeQueueMax },
     runningSince:  new Date().toISOString(),
   };
 }
@@ -1364,7 +1516,7 @@ async function importMarkdown(mdText, defaults = {}) {
 
   // If we found structured sections, ingest each
   if (sections.length > 0) {
-    _skipIO = true;
+    _skipIO++;
     const ids = [];
     try {
       for (const sec of sections) {
@@ -1374,7 +1526,7 @@ async function importMarkdown(mdText, defaults = {}) {
         ids.push(await ingest(factText, { ...defaults, type, allowedWorkspaces }));
       }
     } finally {
-      _skipIO = false;
+      _skipIO--;
     }
     _persistAll();
     console.log(`[smriti] Imported ${ids.length} entities from structured markdown`);
@@ -1388,18 +1540,143 @@ async function importMarkdown(mdText, defaults = {}) {
 
   if (!bullets.length) return { imported: 0, ids: [] };
 
-  _skipIO = true;
+  _skipIO++;
   const ids = [];
   try {
     for (const fact of bullets) {
       ids.push(await ingest(fact, { ...defaults, allowedWorkspaces }));
     }
   } finally {
-    _skipIO = false;
+    _skipIO--;
   }
   _persistAll();
   console.log(`[smriti] Imported ${ids.length} entities from markdown bullets`);
   return { imported: ids.length, ids };
+}
+
+// ─── Time-aware Change Retrieval ─────────────────────────────────────────────
+
+/**
+ * Return all entities that changed (created or updated) after a given timestamp.
+ * Each result includes the delta of the most recent change since `since`, so callers
+ * can ask "what changed in the last hour?" and get structured diffs back.
+ *
+ * @param {number} since — Unix ms timestamp; entities touched after this are returned
+ * @param {{ type?, workspaceId?, limit?, allowedWorkspaces? }} opts
+ * @returns {{ since, count, changes: Array<{ id, type, text, changedAt, delta, source, trustScore, changeCount }> }}
+ */
+async function getChangeSince(since, { type, workspaceId, limit = 100, allowedWorkspaces } = {}) {
+  _assertInit();
+  const sinceMs = Number(since);
+  if (!Number.isFinite(sinceMs)) throw emitError(Err.validation("since must be a valid timestamp (Unix ms)"));
+
+  let entities = _getAllAlive();
+  if (allowedWorkspaces) entities = entities.filter(e => _wsAllowed(e, allowedWorkspaces));
+  if (type)        entities = entities.filter(e => e.type === type);
+  if (workspaceId) entities = entities.filter(e => (e.workspaceId || "default") === workspaceId);
+
+  const safeLimit = Math.max(1, Math.min(1000, Number(limit) || 100));
+  const changes   = [];
+
+  for (const e of entities) {
+    // All versions with timestamp > sinceMs (versions are newest-first)
+    const newVersions = (e.versions || []).filter(v => v.timestamp > sinceMs);
+    if (newVersions.length === 0) continue;
+
+    // Oldest of the new versions gives us the delta _into_ this change window
+    const firstNewVersion = newVersions[newVersions.length - 1];
+    changes.push({
+      id:          e.id,
+      type:        e.type || "text",
+      text:        e.text,
+      changedAt:   newVersions[0].timestamp, // most recent change
+      delta:       firstNewVersion.delta || null,
+      source:      newVersions[0].source || e.source || { type: "user" },
+      trustScore:  e.trustScore != null ? e.trustScore : _defaultTrustScore(e.source?.type || "user"),
+      changeCount: newVersions.length,
+    });
+  }
+
+  changes.sort((a, b) => b.changedAt - a.changedAt);
+
+  return {
+    since,
+    count:   Math.min(changes.length, safeLimit),
+    changes: changes.slice(0, safeLimit),
+  };
+}
+
+// ─── Contradiction Access ─────────────────────────────────────────────────────
+
+/**
+ * Return all versions of an entity that have been flagged as contradicting a
+ * prior version. This is a convenience wrapper over getHistory().
+ *
+ * @param {number|string} id
+ * @param {{ allowedWorkspaces? }} opts
+ * @returns {{ id, contradictions: object[], total: number }}
+ */
+async function getContradictions(id, { allowedWorkspaces } = {}) {
+  _assertInit();
+  const history = await getHistory(id, { allowedWorkspaces });
+  const contradictions = (history.versions || []).filter(v => v.delta?.contradicts);
+  return { id: history.id, contradictions, total: contradictions.length };
+}
+
+// ─── Semantic Drift Analysis ──────────────────────────────────────────────────
+
+/**
+ * Measure how much an entity's meaning has drifted across its version history.
+ * Returns total drift, per-step breakdown, and a trend label.
+ *
+ * @param {number|string} id
+ * @param {{ allowedWorkspaces? }} opts
+ * @returns {{ id, versionCount, totalDrift, averageDrift, trend, steps }}
+ */
+async function getDrift(id, { allowedWorkspaces } = {}) {
+  _assertInit();
+  const history = await getHistory(id, { allowedWorkspaces });
+  const drift   = measureDrift(history.versions || []);
+  return { id: history.id, versionCount: history.versionCount, ...drift };
+}
+
+// ─── Annotation (trust + metadata, no new version) ───────────────────────────
+
+/**
+ * Update trust signals and metadata for an existing entity without creating a
+ * new version. This is the right tool for human review, verification, and
+ * manual trust scoring — operations that describe the _reliability_ of a memory
+ * rather than a change in its content.
+ *
+ * Updatable fields:
+ *   - trustScore  (0-1): how much to trust this memory
+ *   - verified    (bool): human-confirmed correct
+ *   - notes       (string): free-form annotation up to 500 chars
+ *   - memoryType  (string): change the memory tier without a content update
+ *
+ * @param {number|string} id
+ * @param {{ trustScore?, verified?, notes?, memoryType?, allowedWorkspaces? }} opts
+ * @returns {object} updated serialized entity
+ */
+async function annotate(id, { trustScore, verified, notes, memoryType, allowedWorkspaces } = {}) {
+  _assertInit();
+  return _withWriteLock(() => {
+    const numId = Number(id) || id;
+    const e = store.get(numId);
+    if (!e) throw emitError(Err.notFound(id));
+    if (!_isAlive(e)) throw emitError(Err.alreadyDeleted(id));
+    if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No access to workspace "${e.workspaceId || "default"}".`));
+
+    if (Number.isFinite(trustScore)) e.trustScore = Math.max(0, Math.min(1, trustScore));
+    if (notes !== undefined)         e.metadata = { ...e.metadata, notes: String(notes).slice(0, 500) };
+    if (verified !== undefined)      e.metadata = { ...e.metadata, verified: !!verified, verifiedAt: Date.now() };
+    if (memoryType)                  e.memoryType = _normalizeMemoryType(memoryType);
+    // updatedAt intentionally not changed — this is metadata, not a content update
+
+    _persistAll();
+    console.log(`[smriti] Annotated entity ${numId} (trust=${e.trustScore?.toFixed(2)}, verified=${e.metadata?.verified ?? "–"})`);
+    return _serializeEntity(e);
+  });
 }
 
 // ─── Progressive Context Loading ─────────────────────────────────────────────
@@ -1524,8 +1801,9 @@ async function getStartupSummary({
  */
 async function shutdown() {
   if (!_initialized) return; // safe to call even if init() was never called
-  _persistAll();
+  _persistAll(); // final flush to backing store
   if (_pool) { await _pool.stop(); _pool = null; }
+  if (store?.shutdown) await store.shutdown();
   _initialized = false;
   console.log("[smriti] Shutdown complete");
 }
@@ -1575,6 +1853,13 @@ module.exports = {
   getStartupSummary,
   exportMarkdown,
   importMarkdown,
+  // Time-aware retrieval
+  getChangeSince,
+  // Version semantics
+  getContradictions,
+  getDrift,
+  // Provenance & trust
+  annotate,
   shutdown,
   createAgent,
   // Auth & Workspace ACL

@@ -1,6 +1,6 @@
 # CLAUDE.md - Product Direction and Engineering Constitution
 
-**Last Updated:** 2026-04-09  
+**Last Updated:** 2026-04-17  
 **Project:** Smriti
 
 This file defines the product direction, engineering goals, and transformation path for Smriti. All major decisions should support this document.
@@ -296,3 +296,66 @@ Before adding a feature, ask:
 5. Does this help us differentiate from a generic vector database?
 
 If the answer is no to most of these, do not prioritize it.
+
+## 14. Product Tiers
+
+Smriti is open-core. Two editions exist with a clear boundary in the codebase.
+
+### Free Edition (`main` branch — published to npm as `smriti-db`)
+
+The free edition is the complete, production-usable memory engine. It is the product we lead with publicly.
+
+| Capability | Free |
+|---|---|
+| Core memory API (`ingest`, `query`, `remember`, `getHistory`, etc.) | yes |
+| JSONL file-based persistence (`store/file-store.js`) | yes |
+| Versioning, delta detection, contradiction tracking | yes |
+| Graph linking and traversal | yes |
+| Agent memory layer (`AgentMemory`, `createAgent`) | yes |
+| MCP server | yes |
+| Token-based workspace auth | yes |
+| Rate limiting and input validation | yes |
+| All benchmarks and eval tooling | yes |
+| PostgreSQL / pgvector backing store | **no — Enterprise** |
+| `smriti migrate` (JSONL → PostgreSQL) | **no — Enterprise** |
+| `docker-compose.yml` with pgvector | **no — Enterprise** |
+| `sql/init.sql` schema | **no — Enterprise** |
+| Multi-tenant workspace isolation (production-grade) | **no — Enterprise** |
+
+### Enterprise Edition (`enterprise` branch — private, distributed separately)
+
+The enterprise edition extends the free edition with PostgreSQL infrastructure and team-scale features. It is never published to npm and never pushed to the public GitHub repo.
+
+Enterprise-only files (must not be committed to `main`):
+
+- `store/pg-store.js` — PgStore adapter (PostgreSQL + pgvector, hot-cache)
+- `sql/init.sql` — reference schema with IVFFlat ANN index
+- `docker-compose.yml` — self-hosted pgvector stack
+- `bin/cli.js` → full `smriti migrate` implementation
+- `index.js` → `SMRITI_STORE=pg` routing to PgStore
+- `package.json` → `pg` optional dependency, `start:pg` / `migrate` scripts
+
+Future enterprise-only additions (do not ship in free):
+
+- Audit log export endpoint
+- SSO / SAML authentication
+- Encryption-at-rest option
+- Retention policy enforcement
+- GDPR deletion workflows (export + purge by principal)
+- Cross-workspace admin API
+- Role management UI
+
+### Branch discipline
+
+- **Never commit enterprise-only files or code paths to `main`.**
+- Any commit to `enterprise` that touches shared files (`index.js`, `server.js`, etc.) must be reviewed before cherry-picking to `main` — strip all pg-specific additions first.
+- The `main` branch is the source of truth for the npm package. The `enterprise` branch is the source of truth for customer deployments.
+- If `init()` receives `store: "pg"` on the free edition, it throws a clear upgrade error — this is intentional behaviour, not a bug.
+
+### Tier decision rule
+
+Before adding any feature, decide its tier:
+
+- If it improves the core memory engine for any user → **Free**
+- If it requires infrastructure (PostgreSQL, external services, org admin) or is a paid differentiator → **Enterprise**
+- If unsure, default to **Free** and add to Enterprise later if needed

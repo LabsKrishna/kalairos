@@ -51,6 +51,7 @@ const Codes = {
   LLM_ENRICHMENT:     "ERR_LLM_ENRICHMENT",
   AUTH_FAILED:        "ERR_AUTH_FAILED",
   FORBIDDEN:          "ERR_FORBIDDEN",
+  WRITE_QUEUE_FULL:   "ERR_WRITE_QUEUE_FULL",
 };
 
 // ─── Signal Bus ──────────────────────────────────────────────────────────────
@@ -189,6 +190,14 @@ const Err = {
     new SmritiError(Codes.FORBIDDEN, detail || "You do not have permission for this operation.", {
       recoverable: false,
       suggestion: "Check your workspace role. Required permission may be read, write, admin, or owner.",
+    }),
+
+  writeQueueFull: (depth, max) =>
+    new SmritiError(Codes.WRITE_QUEUE_FULL,
+      `Write queue is full (${depth}/${max} pending). Retry after a short delay.`, {
+      recoverable: true,
+      suggestion: "Reduce concurrent write rate or increase writeQueueMax in init().",
+      context: { queueDepth: depth, queueMax: max },
     }),
 };
 

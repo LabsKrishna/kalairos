@@ -40,6 +40,11 @@ if (cmd === "start") {
       process.exit(1);
     });
 
+} else if (cmd === "migrate") {
+  console.error("[smriti] 'smriti migrate' requires Smriti Enterprise (PostgreSQL/pgvector).");
+  console.error("  See https://github.com/LabsKrishna/smriti-db#enterprise for upgrade information.");
+  process.exit(1);
+
 } else {
   console.log("Smriti CLI");
   console.log("");
@@ -48,10 +53,12 @@ if (cmd === "start") {
   console.log("  smriti demo             Run interactive demo (no API key needed)");
   console.log("  smriti status           Print server status as JSON");
   console.log('  smriti query <text>     Run a semantic query against the server');
+  console.log("  smriti migrate [file]   [Enterprise] Import data.smriti → PostgreSQL");
   console.log("");
   console.log("Environment:");
-  console.log("  SMRITI_PORT             Server port (default: 3000)");
-  console.log("  SMRITI_LINK_THRESHOLD   Graph link threshold (default: 0.72)");
+  console.log("  SMRITI_PORT              Server port (default: 3000)");
+  console.log("  SMRITI_RATE_LIMIT        Max requests/minute per IP (default: 120, 0=off)");
+  console.log("  SMRITI_LINK_THRESHOLD    Graph link threshold (default: 0.72)");
   console.log("  SMRITI_VERSION_THRESHOLD Version detection threshold (default: 0.82)");
   process.exit(cmd === "help" ? 0 : 1);
 }

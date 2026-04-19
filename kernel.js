@@ -18,6 +18,10 @@ function cosine(a, b) {
 //
 // Recency uses exponential half-life decay: at updatedAt == now, the full recencyWeight applies;
 // at (now - halfLife) it's halved; further back it fades toward zero.
+//
+// trustWeight is opt-in (default 0, behavior unchanged). When > 0, the final score is scaled
+// by `(1 - trustWeight + trustWeight * trustScore)`. Missing trustScore is treated as 1.0
+// (neutral — no penalty), so callers that never set trust see no change.
 function makeHybridKernel({
   graphBoostWeight   = 0.01,
   keywordBoostWeight = 0.05,
@@ -25,6 +29,7 @@ function makeHybridKernel({
   importanceWeight   = 0.05,
   recencyWeight      = 0.10,
   recencyHalfLifeMs  = 30 * 86_400_000, // 30 days
+  trustWeight        = 0,
   minFinalScore      = 0.45,
   minSemanticScore   = 0.35,
   now                = Date.now(),
@@ -67,7 +72,15 @@ function makeHybridKernel({
       recencyBoost = recencyWeight * Math.exp(-Math.LN2 * ageMs / recencyHalfLifeMs);
     }
 
-    const score = Math.min(1, semantic + graphBoost + kwBoost + llmBoost + importanceBoost + recencyBoost);
+    // Trust scaling (opt-in): when trustWeight=0 this is always 1.0, so behavior is
+    // byte-identical to the pre-trust kernel. Entities with no trustScore are treated
+    // as fully trusted (1.0), preserving backward compat for records written before
+    // trust was tracked.
+    const trust           = entity.trustScore != null ? entity.trustScore : 1.0;
+    const trustMultiplier = 1 - trustWeight + trustWeight * trust;
+
+    const rawScore = semantic + graphBoost + kwBoost + llmBoost + importanceBoost + recencyBoost;
+    const score    = Math.min(1, rawScore * trustMultiplier);
     if (score < minFinalScore) return null;
 
     return {
@@ -80,6 +93,8 @@ function makeHybridKernel({
       llmBoost:        +llmBoost.toFixed(4),
       importanceBoost: +importanceBoost.toFixed(4),
       importance:      +(entity.importance || 0).toFixed(4),
+      trust:           +trust.toFixed(4),
+      trustMultiplier: +trustMultiplier.toFixed(4),
       updatedAt:       entity.updatedAt || null,
     };
   };

@@ -190,12 +190,21 @@ Every update creates a version, never an overwrite. Each version records the new
 
 ### Time-travel queries
 
-Pass `asOf` (Unix ms) to any query. Entities that didn't exist yet are skipped. Each entity is scored against the version that was current at that time.
+Use `queryAt(text, timestamp)` for a point-in-time snapshot, or `queryRange(text, since, until)` for entities whose version timeline overlaps a range. Entities that didn't exist yet are skipped. Each entity is scored against the version current at that timestamp.
 
 ```js
-const results = await kalairos.query('raw material cost', {
-	asOf: new Date('2026-01-15').getTime(),
-});
+// Point-in-time snapshot
+const snapshot = await kalairos.queryAt(
+	'raw material cost',
+	new Date('2026-01-15').getTime(),
+);
+
+// Range query — entities active between these bounds
+const window = await kalairos.queryRange(
+	'raw material cost',
+	new Date('2026-01-01').getTime(),
+	new Date('2026-01-31').getTime(),
+);
 ```
 
 ### Contradiction detection
@@ -305,7 +314,9 @@ Options: `{ type, timestamp, metadata, tags, source, classification, retention, 
 ### Read
 
 ```js
-await kalairos.query(text, { limit?, filter?, asOf? })
+await kalairos.query(text, { limit?, maxTokens?, filter? })
+await kalairos.queryAt(text, timestamp, { limit?, maxTokens?, filter? })
+await kalairos.queryRange(text, since, until, { limit?, maxTokens?, filter? })
 await kalairos.get(id)
 await kalairos.getMany(ids)
 await kalairos.getHistory(id)

@@ -210,11 +210,14 @@ app.post("/ingest/file", _requireAuth("write"), _wrap(async (req) => {
 }));
 
 app.post("/query", _requireAuth("read"), _wrap(async (req) => {
-  const { text, limit = 10, maxTokens = null, filter = {}, asOf = null } = req.body;
+  const { text, limit = 10, maxTokens = null, filter = {}, asOf = null, since = null, until = null } = req.body;
   const err = _validateText(text);
   if (err) throw { code: Codes.VALIDATION, message: err };
   const safeLimit = Math.min(Math.max(1, Math.floor(Number(limit) || 10)), 200);
-  return await lib.query(text, { limit: safeLimit, maxTokens, filter, asOf, allowedWorkspaces: req.allowedWorkspaces });
+  const opts = { limit: safeLimit, maxTokens, filter, allowedWorkspaces: req.allowedWorkspaces };
+  if (asOf != null) return await lib.queryAt(text, asOf, opts);
+  if (since != null || until != null) return await lib.queryRange(text, since, until, opts);
+  return await lib.query(text, opts);
 }));
 
 app.post("/entities/batch", _requireAuth("read"), _wrap(async (req) => {

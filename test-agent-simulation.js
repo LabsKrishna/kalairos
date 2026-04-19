@@ -101,7 +101,7 @@ const INIT_OPTS = {
 
   // Verify classification defaults to "internal" when not explicitly overridden
   console.log(`\n[Agent Day 5] Historical query (asOf Day 1 — default classification):`);
-  res = await lib.query("atlas project Q2 budget forecast", { asOf: day1 });
+  res = await lib.queryAt("atlas project Q2 budget forecast", day1);
   assert.ok(res.results.length > 0, "historical query should return the day 1 version");
   assert.strictEqual(res.results[0].classification, "internal", "classification should default to 'internal'");
   assert.strictEqual(res.results[0].delta, null, "first version should have no delta");
@@ -110,7 +110,7 @@ const INIT_OPTS = {
   console.log("   Delta:", res.results[0]?.delta);
 
   console.log(`\n[Agent Day 5] Historical query (asOf Day 2):`);
-  res = await lib.query("atlas project Q2 budget forecast", { asOf: day2 });
+  res = await lib.queryAt("atlas project Q2 budget forecast", day2);
   assert.ok(res.results.length > 0, "historical query should return the day 2 version");
   assert.strictEqual(res.results[0].id, id);
   assert.match(res.results[0].text, /2\.7 million/);
@@ -196,8 +196,8 @@ const INIT_OPTS = {
   assert.match(aRes.results[0].text, /2\.55 million/);
   console.log(`[Agent Helper] Current recall: "${aRes.results[0].text}"`);
 
-  // recall() — time travel
-  aRes = await agent.recall("atlas project Q2 budget forecast", { asOf: aDay1 });
+  // recallAt() — time travel
+  aRes = await agent.recallAt("atlas project Q2 budget forecast", aDay1);
   assert.ok(aRes.results.length > 0, "historical recall should return results");
   assert.match(aRes.results[0].text, /2\.4 million/);
   console.log(`[Agent Helper] Historical recall (Day 1): "${aRes.results[0].text}"`);

@@ -83,13 +83,34 @@ class AgentMemory {
   }
 
   /**
-   * Recall memories matching a query. Supports time-travel via asOf.
+   * Recall memories matching a query (current state, no time travel).
    * @param {string} text — natural language query
-   * @param {{ limit?, filter?, asOf? }} [opts]
-   * @returns {Promise<{ count, results, filter, asOf, config }>}
+   * @param {{ limit?, maxTokens?, filter?, allowedWorkspaces? }} [opts]
+   * @returns {Promise<{ count, results, filter, config }>}
    */
   async recall(text, opts = {}) {
-    return this._engine.query(text, { ...opts, allowedWorkspaces: opts.allowedWorkspaces });
+    return this._engine.query(text, opts);
+  }
+
+  /**
+   * Recall memory state as of a specific point in time.
+   * @param {string} text — natural language query
+   * @param {number} timestamp — Unix ms
+   * @param {{ limit?, maxTokens?, filter?, allowedWorkspaces? }} [opts]
+   */
+  async recallAt(text, timestamp, opts = {}) {
+    return this._engine.queryAt(text, timestamp, opts);
+  }
+
+  /**
+   * Recall memories whose version timeline overlaps `[since, until]`.
+   * @param {string} text — natural language query
+   * @param {number|null} since — Unix ms
+   * @param {number|null} until — Unix ms
+   * @param {{ limit?, maxTokens?, filter?, allowedWorkspaces? }} [opts]
+   */
+  async recallRange(text, since, until, opts = {}) {
+    return this._engine.queryRange(text, since, until, opts);
   }
 
   /**

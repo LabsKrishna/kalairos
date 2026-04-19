@@ -259,6 +259,136 @@ const INIT_OPTS = {
     assert.strictEqual(h.versionCount, 6, `expected 6 versions, got ${h.versionCount}`);
   });
 
+  console.log("\n── delta persistence round-trip ─────────────────────────────────");
+
+  await test("delta survives reload from file-store", async () => {
+    const os   = require("os");
+    const path = require("path");
+    const fs   = require("fs");
+    const tmp  = path.join(os.tmpdir(), `kalairos-delta-${Date.now()}.jsonl`);
+
+    try {
+      await lib.init({ ...INIT_OPTS, dataFile: tmp });
+      const id = await lib.ingest("the server runs on port 8080");
+      await lib.ingest("the server runs on port 9090");
+      await lib.shutdown();
+
+      await lib.init({ ...INIT_OPTS, dataFile: tmp });
+      const h = await lib.getHistory(id);
+
+      assert.ok(h.versions.length >= 2, "expected at least 2 versions after reload");
+      const latest = h.versions[h.versions.length - 1];
+      assert.ok(latest.delta, "delta must be present on reloaded version");
+      assert.ok(typeof latest.delta.summary === "string", "delta.summary must be a string");
+      assert.ok(typeof latest.delta.type === "string", "delta.type must be a string");
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+
+  console.log("\n── range query (since/until) ────────────────────────────────────");
+
+  await test("range mode scores against the version current at `until`", async () => {
+    await lib.init(INIT_OPTS);
+    const id = await lib.ingest("quarterly revenue is fifty million dollars");
+    // Force a second version with a distinct timestamp window
+    await new Promise(r => setTimeout(r, 5));
+    const t1 = Date.now();
+    await new Promise(r => setTimeout(r, 5));
+    await lib.ingest("quarterly revenue is sixty million dollars");
+
+    // Query with until=t1 — should score against v1 ("fifty"), not v2
+    const res = await lib.queryRange("quarterly revenue", null, t1);
+    assert.ok(res.results.length >= 1, "expected a result");
+    const r = res.results.find(x => x.id === id);
+    assert.ok(r, "entity must be in results");
+    assert.ok(r.text.includes("fifty"), `expected v1 text with 'fifty', got: ${r.text}`);
+    assert.strictEqual(res.until, t1, "response must echo until");
+    assert.strictEqual(res.config.recencyWeight, 0, "recency must be disabled in range mode");
+  });
+
+  await test("range mode includes entities whose validity overlaps [since, until]", async () => {
+    await lib.init(INIT_OPTS);
+    const before = Date.now();
+    const id = await lib.ingest("distinct aardvark memory about ancient artifacts");
+    await new Promise(r => setTimeout(r, 5));
+    const after = Date.now() + 100;
+
+    const res = await lib.queryRange("aardvark artifacts", before, after);
+    const r = res.results.find(x => x.id === id);
+    assert.ok(r, "entity created within the range must be included");
+  });
+
+  await test("range mode excludes entities that did not exist yet at `until`", async () => {
+    await lib.init(INIT_OPTS);
+    const tooEarly = Date.now() - 10_000;
+    const id = await lib.ingest("unique zebra memory about tropical forests");
+    const res = await lib.queryRange("zebra tropical", null, tooEarly);
+    assert.ok(!res.results.find(x => x.id === id), "entity must be excluded when until predates creation");
+  });
+
+  await test("query() rejects time arguments with a helpful message", async () => {
+    await lib.init(INIT_OPTS);
+    await lib.ingest("some fact for conflict test");
+    await assert.rejects(
+      async () => lib.query("fact", { asOf: Date.now() }),
+      /queryAt/,
+      "passing asOf to query() must redirect to queryAt"
+    );
+    await assert.rejects(
+      async () => lib.query("fact", { since: 0 }),
+      /queryRange/,
+      "passing since to query() must redirect to queryRange"
+    );
+    await assert.rejects(
+      async () => lib.query("fact", { until: Date.now() }),
+      /queryRange/,
+      "passing until to query() must redirect to queryRange"
+    );
+  });
+
+  await test("queryRange rejects since > until", async () => {
+    await lib.init(INIT_OPTS);
+    await lib.ingest("another fact for bounds test");
+    await assert.rejects(
+      async () => lib.queryRange("fact", 2000, 1000),
+      /must be <= until/,
+      "since > until must throw"
+    );
+  });
+
+  await test("queryRange requires at least one bound", async () => {
+    await lib.init(INIT_OPTS);
+    await assert.rejects(
+      async () => lib.queryRange("fact", null, null),
+      /at least one of since or until/,
+      "fully-unbounded range must throw"
+    );
+  });
+
+  await test("unbounded since (null) defaults to -Infinity", async () => {
+    await lib.init(INIT_OPTS);
+    const id = await lib.ingest("panda bamboo mountain retreat quiet");
+    const res = await lib.queryRange("panda bamboo", null, Date.now() + 10_000);
+    assert.ok(res.results.find(x => x.id === id), "with only until, all prior entities must be considered");
+    assert.strictEqual(res.since, null, "since should echo null when omitted");
+  });
+
+  await test("buildChangelog is exported and consumes getHistory output", async () => {
+    await lib.init(INIT_OPTS);
+    assert.strictEqual(typeof lib.buildChangelog, "function", "buildChangelog must be exported");
+
+    const id = await lib.ingest("quarterly revenue is fifty million");
+    await lib.ingest("quarterly revenue is sixty million");
+    const h   = await lib.getHistory(id);
+    const log = lib.buildChangelog(h.versions);
+
+    assert.ok(Array.isArray(log), "changelog must be an array");
+    assert.strictEqual(log.length, h.versions.length, "changelog length must match versions");
+    assert.strictEqual(log[0].deltaType, "created", "v1 should be 'created'");
+    assert.ok(log[1].summary.length > 0, "v2 should have a non-empty summary");
+  });
+
   // ── Results ───────────────────────────────────────────────────────────────
   console.log(`\n${"─".repeat(60)}`);
   const total = passed + failed;

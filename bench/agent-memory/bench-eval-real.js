@@ -191,13 +191,13 @@ async function run(name, fn) {
   });
 
   await run("asOf returns correct version (stock price 30 days ago)", async () => {
-    const r = await lib.query("stock price", { limit: 1, asOf: now - 25 * DAY });
+    const r = await lib.queryAt("stock price", now - 25 * DAY, { limit: 1 });
     assert.ok(r.results.length >= 1, "should find stock price");
     assert.ok(r.results[0].text.includes("150"), `expected '150', got: ${r.results[0].text}`);
   });
 
   await run("asOf returns correct version (stock price 10 days ago)", async () => {
-    const r = await lib.query("stock price", { limit: 1, asOf: now - 10 * DAY });
+    const r = await lib.queryAt("stock price", now - 10 * DAY, { limit: 1 });
     assert.ok(r.results.length >= 1, "should find stock price");
     assert.ok(r.results[0].text.includes("175"), `expected '175', got: ${r.results[0].text}`);
   });

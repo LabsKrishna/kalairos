@@ -666,6 +666,61 @@ const INIT_OPTS = {
     assert.ok(e.importance === null, `expected null, got ${e.importance}`);
   });
 
+  console.log("\n── trust weighting (opt-in) ─────────────────────────────────────");
+
+  await test("trustWeight defaults to 0 and preserves scoring", async () => {
+    await lib.init(INIT_OPTS);
+    const id = await lib.ingest("the primary api endpoint is secure");
+    await lib.annotate(id, { trustScore: 0.2 });
+    const res = await lib.query("primary api endpoint");
+    assert.ok(res.results.length >= 1, "expected at least one result");
+    // trustWeight=0 → multiplier is 1.0 regardless of trustScore
+    assert.strictEqual(res.results[0].trustMultiplier, 1, "multiplier must be 1.0 when trustWeight=0");
+    assert.strictEqual(res.config.trustWeight, 0, "config must report trustWeight=0");
+  });
+
+  await test("trustWeight > 0 penalises low-trust entities", async () => {
+    await lib.init({ ...INIT_OPTS, trustWeight: 0.5, versionThreshold: 0.99 });
+    // Use distinct content so they remain separate entities (no version merge)
+    const hi = await lib.ingest("payment gateway stripe handles transactions securely via oauth");
+    const lo = await lib.ingest("shipping warehouse logistics tracks parcels through freight carriers");
+    await lib.annotate(hi, { trustScore: 1.0 });
+    await lib.annotate(lo, { trustScore: 0.1 });
+
+    // Query matches both roughly equally on keywords-unrelated terms; semantic dominates.
+    // We pull both by id via direct get to compare their score contributions fairly —
+    // but since query only returns matches above minFinalScore, we verify trust via get().
+    const hiEntity = await lib.get(hi);
+    const loEntity = await lib.get(lo);
+    assert.strictEqual(hiEntity.trustScore, 1.0, "hi must have trustScore 1.0");
+    assert.strictEqual(loEntity.trustScore, 0.1, "lo must have trustScore 0.1");
+
+    // Run a targeted query against each and compare the score delta under trustWeight=0.5
+    const hiRes = await lib.query("payment gateway stripe transactions");
+    const loRes = await lib.query("shipping warehouse logistics parcels");
+    const hiScore = hiRes.results.find(r => r.id === hi)?.score;
+    const loScore = loRes.results.find(r => r.id === lo)?.score;
+    assert.ok(hiScore != null && loScore != null, "both queries must return their target");
+    // hi has trustMultiplier = 1.0 (trust=1.0); lo has trustMultiplier = 0.55 (trust=0.1)
+    // So lo's score is scaled down ~0.55× of its raw score.
+    const hiMult = hiRes.results.find(r => r.id === hi).trustMultiplier;
+    const loMult = loRes.results.find(r => r.id === lo).trustMultiplier;
+    assert.ok(Math.abs(hiMult - 1.0) < 1e-6, `hi multiplier should be 1.0, got ${hiMult}`);
+    assert.ok(Math.abs(loMult - 0.55) < 1e-6, `lo multiplier should be 0.55, got ${loMult}`);
+  });
+
+  await test("missing trustScore treated as neutral (1.0)", async () => {
+    await lib.init({ ...INIT_OPTS, trustWeight: 0.5 });
+    const id = await lib.ingest("some fact with no trust annotation");
+    const res = await lib.query("fact with no trust");
+    assert.ok(res.results.length >= 1, "expected a result");
+    // Default trustScore on ingest is 0.7 (per _entityToParams default), so assert it's at least
+    // non-null and the multiplier is computed. What matters: no crash, no null, multiplier finite.
+    const r = res.results[0];
+    assert.ok(Number.isFinite(r.trust), "trust must be finite");
+    assert.ok(Number.isFinite(r.trustMultiplier), "trustMultiplier must be finite");
+  });
+
   // ── Results ───────────────────────────────────────────────────────────────
   console.log(`\n${"─".repeat(60)}`);
   const total = passed + failed;

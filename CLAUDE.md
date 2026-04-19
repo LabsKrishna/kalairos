@@ -5,9 +5,13 @@
 
 This file defines the product direction, engineering goals, and transformation path for Kalairos. All major decisions should support this document.
 
-## Change Recording Rule
+Change Recording Rule
+Core Best Practices
+-Make Atomic Commits: Keep every commit focused on a single task. Avoid mixing unrelated changes, like a bug fix and a style update, to ensure easy reviews and safe reverts.
+-Write Descriptive Messages: Use the imperative mood for your summary (e.g., "Add login" vs. "Added login"). Follow with a blank line and a "why" if the logic isn't obvious.
+-Commit Frequently: Save small, incremental updates often. This minimizes merge conflicts and makes it easier to pinpoint where bugs were introduced.
+-Use a .gitignore: Keep your repo clean by excluding build artifacts, dependencies, and sensitive credentials (like API keys) from the version history.
 
-Every meaningful repository change must be recorded in `TEMP_CHANGELOG.md` so humans and agents can quickly see what was added, updated, or deleted.
 
 ## 1. Product Goal
 

@@ -4,7 +4,25 @@
 "use strict";
 
 const assert = require("assert/strict");
+const fs     = require("fs");
+const path   = require("path");
 const { lib, BASE_OPTS, DAY, BenchSuite } = require("./helpers");
+
+// ─── Declared SLAs ──────────────────────────────────────────────────────────
+// Thresholds live here (not buried in assertion messages) so changes are
+// reviewable and consumers can read them without parsing code. Each entry:
+//   metric:     human name for the measured value
+//   threshold:  the SLA floor (or ceiling, depending on comparator)
+//   comparator: ">=" or "<=" — how `measured` is compared to `threshold`
+// When a bench entry exists in this table, BenchSuite.run records the metadata
+// alongside the measured value so the JSON report captures both.
+const SLA = {
+  "recall@5 for finance queries >= 0.50":               { metric: "recall@5",     threshold: 0.50, comparator: ">=" },
+  "recall@5 for engineering queries >= 0.50":           { metric: "recall@5",     threshold: 0.50, comparator: ">=" },
+  "precision@3 for health queries >= 0.33":             { metric: "precision@3",  threshold: 0.33, comparator: ">=" },
+  "MRR for targeted finance query >= 0.50":             { metric: "MRR",          threshold: 0.50, comparator: ">=" },
+  "noise separation: finance query ranks finance above noise": { metric: "finance-in-top5", threshold: 2, comparator: ">=" },
+};
 
 // ─── Metrics helpers ────────────────────────────────────────────────────────
 
@@ -34,6 +52,7 @@ function mrr(results, relevantIds) {
 
 async function run() {
   const suite = new BenchSuite("Memory Evaluation Benchmarks");
+  suite.setSLA(SLA);
   suite.start();
 
   // ── Scenario 1: Basic Recall ──────────────────────────────────────────────
@@ -69,37 +88,37 @@ async function run() {
   await suite.run("recall@5 for finance queries >= 0.50", async () => {
     const r = await lib.query("quarterly revenue budget expenses financial", { limit: 5 });
     const recall = recallAtK(r.results, topicA, 5);
-    console.log(`    recall@5 = ${(recall * 100).toFixed(1)}%`);
     assert.ok(recall >= 0.50, `recall@5 was ${recall}, expected >= 0.50`);
+    return recall;
   });
 
   await suite.run("recall@5 for engineering queries >= 0.50", async () => {
     const r = await lib.query("kubernetes database deployment engineering infrastructure", { limit: 5 });
     const recall = recallAtK(r.results, topicB, 5);
-    console.log(`    recall@5 = ${(recall * 100).toFixed(1)}%`);
     assert.ok(recall >= 0.50, `recall@5 was ${recall}, expected >= 0.50`);
+    return recall;
   });
 
   await suite.run("precision@3 for health queries >= 0.33", async () => {
     const r = await lib.query("patient health clinical treatment hospital", { limit: 3 });
     const precision = precisionAtK(r.results, topicC, 3);
-    console.log(`    precision@3 = ${(precision * 100).toFixed(1)}%`);
     assert.ok(precision >= 0.33, `precision@3 was ${precision}, expected >= 0.33`);
+    return precision;
   });
 
   await suite.run("MRR for targeted finance query >= 0.50", async () => {
     const r = await lib.query("revenue million dollars quarterly projection", { limit: 10 });
     const score = mrr(r.results, topicA);
-    console.log(`    MRR = ${score.toFixed(3)}`);
     assert.ok(score >= 0.50, `MRR was ${score}, expected >= 0.50`);
+    return score;
   });
 
   await suite.run("noise separation: finance query ranks finance above noise", async () => {
     const r = await lib.query("quarterly revenue budget expenses financial", { limit: 5 });
     // At least half the top-5 should be finance entities, not noise
     const financeInTop5 = r.results.filter(x => topicA.includes(x.id)).length;
-    console.log(`    finance in top 5 = ${financeInTop5}/5`);
     assert.ok(financeInTop5 >= 2, `expected >= 2 finance entities in top 5, got ${financeInTop5}`);
+    return financeInTop5;
   });
 
   // ── Scenario 2: Temporal Recall Accuracy ──────────────────────────────────
@@ -126,13 +145,13 @@ async function run() {
   });
 
   await suite.run("asOf returns correct historical version (stock price 30 days ago)", async () => {
-    const r = await lib.query("stock price", { limit: 1, asOf: now - 25 * DAY });
+    const r = await lib.queryAt("stock price", now - 25 * DAY, { limit: 1 });
     assert.ok(r.results.length >= 1, "should find stock price");
     assert.ok(r.results[0].text.includes("150"), `expected '150' in text, got: ${r.results[0].text}`);
   });
 
   await suite.run("asOf returns correct version (stock price 10 days ago)", async () => {
-    const r = await lib.query("stock price", { limit: 1, asOf: now - 10 * DAY });
+    const r = await lib.queryAt("stock price", now - 10 * DAY, { limit: 1 });
     assert.ok(r.results.length >= 1, "should find stock price");
     assert.ok(r.results[0].text.includes("175"), `expected '175' in text, got: ${r.results[0].text}`);
   });
@@ -222,6 +241,40 @@ async function run() {
   console.log(`  Pass Rate:  ${((summary.passed / summary.total) * 100).toFixed(1)}%`);
   console.log(`  Time:       ${summary.ms}ms`);
   console.log("═".repeat(60));
+
+  // ── SLA Table ─────────────────────────────────────────────────────────────
+  const slaEntries = summary.results.filter(r => r.threshold !== undefined);
+  if (slaEntries.length) {
+    console.log("\n  SLA REPORT");
+    console.log("  " + "─".repeat(58));
+    for (const r of slaEntries) {
+      const measured = r.measured != null ? r.measured.toFixed(3) : "—";
+      const verdict  = r.pass ? "PASS" : "FAIL";
+      console.log(`  ${verdict}  ${r.metric.padEnd(20)} measured=${measured}  ${r.comparator} ${r.threshold}`);
+    }
+    console.log("  " + "─".repeat(58));
+  }
+
+  // ── JSON persistence ──────────────────────────────────────────────────────
+  // Written to bench/agent-memory/bench-results.json on every run. Overwrites —
+  // consumers wanting trends should diff between git commits or archive their own.
+  // Skipped when KALAIROS_BENCH_NO_JSON is set (useful for CI dry runs).
+  if (!process.env.KALAIROS_BENCH_NO_JSON) {
+    const report = {
+      suite:       summary.suite,
+      generatedAt: new Date().toISOString(),
+      totalMs:     summary.ms,
+      passed:      summary.passed,
+      failed:      summary.failed,
+      total:       summary.total,
+      passRate:    +(summary.passed / summary.total).toFixed(4),
+      sla:         SLA,
+      results:     summary.results,
+    };
+    const outPath = path.join(__dirname, "bench-results.json");
+    fs.writeFileSync(outPath, JSON.stringify(report, null, 2));
+    console.log(`\n  Report written: ${path.relative(process.cwd(), outPath)}`);
+  }
 
   return summary;
 }

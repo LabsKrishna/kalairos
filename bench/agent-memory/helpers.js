@@ -50,21 +50,44 @@ class BenchSuite {
     console.log(`${"═".repeat(60)}\n`);
   }
 
-  /** Run a single named assertion. Returns { name, pass, error?, ms }. */
+  /**
+   * Run a single named assertion. The test fn may return a numeric metric value
+   * (e.g. the measured recall/precision/MRR) which is captured alongside the
+   * pass/fail result. When an SLA entry exists for the name, the threshold and
+   * comparator are recorded too so downstream consumers (JSON report, dashboards)
+   * have a full picture without re-parsing assertion messages.
+   *
+   * @param {string} name
+   * @param {Function} fn — async; may return `number` or `{ measured, ... }`
+   * @returns {{ name, pass, error?, ms, measured?, threshold?, comparator? }}
+   */
   async run(name, fn) {
     const t0 = Date.now();
+    const sla = (this.sla && this.sla[name]) || null;
     try {
-      await fn();
+      const ret = await fn();
       const ms = Date.now() - t0;
-      this.results.push({ name, pass: true, ms });
-      console.log(`  PASS  ${name} (${ms}ms)`);
+      let measured = null;
+      if (typeof ret === "number") measured = ret;
+      else if (ret && typeof ret === "object" && typeof ret.measured === "number") measured = ret.measured;
+      const entry = { name, pass: true, ms };
+      if (measured !== null) entry.measured = measured;
+      if (sla) { entry.threshold = sla.threshold; entry.comparator = sla.comparator; entry.metric = sla.metric; }
+      this.results.push(entry);
+      const measuredStr = measured !== null ? ` [${sla?.metric || "value"}=${measured.toFixed(3)}]` : "";
+      console.log(`  PASS  ${name} (${ms}ms)${measuredStr}`);
     } catch (err) {
       const ms = Date.now() - t0;
-      this.results.push({ name, pass: false, error: err.message, ms });
+      const entry = { name, pass: false, error: err.message, ms };
+      if (sla) { entry.threshold = sla.threshold; entry.comparator = sla.comparator; entry.metric = sla.metric; }
+      this.results.push(entry);
       console.log(`  FAIL  ${name} (${ms}ms)`);
       console.log(`        ${err.message}`);
     }
   }
+
+  /** Attach an SLA table so run() can annotate results with metric/threshold metadata. */
+  setSLA(sla) { this.sla = sla || {}; }
 
   /** Print summary and return { suite, passed, failed, total, ms, results }. */
   finish() {

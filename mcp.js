@@ -114,7 +114,10 @@ server.tool(
       if (workspaceId) filter.workspaceId = workspaceId;
       if (since)       filter.since = since;
       if (until)       filter.until = until;
-      const result = await dbx.query(text, { limit, maxTokens, filter, asOf });
+      const opts = { limit, maxTokens, filter };
+      const result = asOf != null
+        ? await dbx.queryAt(text, asOf, opts)
+        : await dbx.query(text, opts);
       return ok(result);
     } catch (err) { return fail(err); }
   },

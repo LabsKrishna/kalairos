@@ -58,6 +58,8 @@ function connect(baseUrl = "http://localhost:3000", { token } = {}) {
     ingestTimeSeries: (label, points, opts = {})      => post("/ingest/timeseries", { label, points, ...opts }),
     ingestFile:       (filePath, opts = {})           => post("/ingest/file", { filePath, ...opts }),
     query:            (text, opts = {})               => post("/query", { text, ...opts }),
+    queryAt:          (text, timestamp, opts = {})    => post("/query", { text, asOf: timestamp, ...opts }),
+    queryRange:       (text, since, until, opts = {}) => post("/query", { text, since, until, ...opts }),
     get:              (id)                            => get(`/entity/${id}`),
     getMany:          (ids)                           => post("/entities/batch", { ids }),
     remove:           (id)                            => del(`/entity/${id}`),

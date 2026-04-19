@@ -38,6 +38,10 @@ const DEFAULTS = {
   importanceWeight:   Number(process.env.KALAIROS_IMPORTANCE_WEIGHT || 0.05),
   recencyWeight:      Number(process.env.KALAIROS_RECENCY_WEIGHT    || 0.10),
   recencyHalfLifeMs:  Number(process.env.KALAIROS_RECENCY_HALFLIFE_DAYS || 30) * 86_400_000,
+  // Trust weighting is opt-in (default 0 = disabled). When > 0, query scores are scaled by
+  // `(1 - trustWeight + trustWeight * trustScore)`. trustScore missing on an entity is treated
+  // as fully trusted, preserving backward compat for records written before trust was tracked.
+  trustWeight:        Number(process.env.KALAIROS_TRUST_WEIGHT       || 0),
   minFinalScore:      Number(process.env.KALAIROS_MIN_SCORE         || 0.45),
   minSemanticScore:   Number(process.env.KALAIROS_MIN_SEMANTIC      || 0.35),
   maxVersions:        Number(process.env.KALAIROS_MAX_VERSIONS      || 0), // 0 = unlimited
@@ -904,6 +908,7 @@ async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), 
     importanceWeight:   CFG.importanceWeight,
     recencyWeight:      CFG.recencyWeight,
     recencyHalfLifeMs:  CFG.recencyHalfLifeMs,
+    trustWeight:        CFG.trustWeight,
     minFinalScore:      CFG.minFinalScore,
     minSemanticScore:   CFG.minSemanticScore,
     now,
@@ -924,6 +929,7 @@ async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), 
       links:       { size: e.links?.size || 0 },
       llmKeywords: e.llmKeywords || [],
       importance:  _computeImportance(e),
+      trustScore:  e.trustScore,
     }));
 
     promises.push(_pool.run({ chunk, queryVector, queryTerms, config: jobConfig }));
@@ -936,13 +942,11 @@ async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), 
 // ─── Query ────────────────────────────────────────────────────────────────────
 
 /**
- * Query the database for semantically similar entities.
- * Supports natural-language time and type filters embedded in the query text.
+ * Semantic query over current memory (no time travel).
  *
- * When `asOf` is supplied, each entity is scored against the version that was
- * current at that timestamp (time-travel query). Entities that did not yet
- * exist at asOf are skipped. Recency boost is disabled in asOf mode since
- * "now" has no meaning for a historical snapshot.
+ * For time-aware retrieval use:
+ *   - `queryAt(text, timestamp, opts)`  — snapshot at a point in time
+ *   - `queryRange(text, since, until, opts)` — version timeline overlap
  *
  * When `maxTokens` is supplied, results are packed greedily by score until the
  * token budget is exhausted — purpose-built for feeding results into agent
@@ -951,11 +955,70 @@ async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), 
  * Token estimation uses ~4 characters per token (no external tokenizer needed).
  *
  * @param {string} text
- * @param {{ limit?, maxTokens?, filter?: { type?, since?, until?, tags?, memoryType?, workspaceId? }, asOf?: number }} opts
- * @returns {{ count, results, filter, asOf, config, tokenUsage? }}
+ * @param {{ limit?, maxTokens?, filter?: { type?, since?, until?, tags?, memoryType?, workspaceId? }, allowedWorkspaces? }} [opts]
+ * @returns {{ count, results, filter, asOf, since, until, config, tokenUsage? }}
  */
-async function query(text, { limit = 10, maxTokens = null, filter = {}, asOf = null, allowedWorkspaces } = {}) {
+async function query(text, opts = {}) {
+  if (opts && (opts.asOf != null || opts.since != null || opts.until != null)) {
+    _assertInit();
+    throw emitError(Err.validation(
+      "query() does not accept time arguments. Use queryAt(text, timestamp) for time-travel or queryRange(text, since, until) for range queries."
+    ));
+  }
+  return _queryInternal(text, opts);
+}
+
+/**
+ * Time-travel query: score each entity against the version current at `timestamp`.
+ * Entities that did not yet exist are skipped. Recency boost is disabled —
+ * "now" has no meaning for a historical snapshot.
+ *
+ * @param {string} text
+ * @param {number} timestamp — Unix ms
+ * @param {{ limit?, maxTokens?, filter?, allowedWorkspaces? }} [opts]
+ * @returns {{ count, results, filter, asOf, since, until, config, tokenUsage? }}
+ */
+async function queryAt(text, timestamp, opts = {}) {
   _assertInit();
+  if (!Number.isFinite(Number(timestamp))) {
+    throw emitError(Err.validation("queryAt: timestamp must be a finite Unix ms number"));
+  }
+  return _queryInternal(text, { ...opts, asOf: Number(timestamp) });
+}
+
+/**
+ * Range query over the version timeline. An entity is included if any version's
+ * active interval overlaps `[since, until]`. Each is scored against the version
+ * current at `until` (or latest, if `until` is omitted). Either bound may be null
+ * for an open-ended range.
+ *
+ * @param {string} text
+ * @param {number|null} since — Unix ms (null for -Infinity)
+ * @param {number|null} until — Unix ms (null for +Infinity)
+ * @param {{ limit?, maxTokens?, filter?, allowedWorkspaces? }} [opts]
+ * @returns {{ count, results, filter, asOf, since, until, config, tokenUsage? }}
+ */
+async function queryRange(text, since, until, opts = {}) {
+  _assertInit();
+  if (since == null && until == null) {
+    throw emitError(Err.validation("queryRange: at least one of since or until must be provided"));
+  }
+  return _queryInternal(text, { ...opts, since, until });
+}
+
+async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {}, asOf = null, since = null, until = null, allowedWorkspaces } = {}) {
+  _assertInit();
+
+  const hasRange = (since !== null && since !== undefined) || (until !== null && until !== undefined);
+  const hasAsOf  = asOf !== null && asOf !== undefined;
+  if (hasAsOf && hasRange) {
+    throw emitError(Err.validation("asOf and { since, until } are distinct query modes — supply one or the other, not both"));
+  }
+  const sinceMs = hasRange ? (Number.isFinite(Number(since)) ? Number(since) : -Infinity) : null;
+  const untilMs = hasRange ? (Number.isFinite(Number(until)) ? Number(until) :  Infinity) : null;
+  if (hasRange && sinceMs > untilMs) {
+    throw emitError(Err.validation(`since (${since}) must be <= until (${until})`));
+  }
 
   const safeLimit   = Math.max(1, Math.min(100, Number(limit) || 10));
   const merged      = { ..._parseNLFilters(text), ...filter }; // explicit filter wins
@@ -994,14 +1057,63 @@ async function query(text, { limit = 10, maxTokens = null, filter = {}, asOf = n
     }).filter(Boolean);
   }
 
+  // Range mode: keep entities whose version timeline overlaps [sinceMs, untilMs],
+  // and score against the version current at untilMs (the range's right edge).
+  // Versions are stored newest-first. A version v is "active" from v.timestamp until
+  // the timestamp of the version written after it (or forever if it's the newest).
+  // Overlap condition: v.timestamp <= untilMs AND (next version's timestamp > sinceMs
+  // OR v is the newest). Simpler equivalent: any v with timestamp in [sinceMs, untilMs],
+  // OR the version that was active at sinceMs (covers long-lived entities whose last
+  // update predates the range but whose validity extends into it).
+  if (hasRange) {
+    subset = subset.map(e => {
+      const versions = e.versions || [];
+      if (!versions.length) return null;
+
+      // Find the version current at untilMs (newest with timestamp <= untilMs)
+      const scoreVersion = versions.find(v => v.timestamp <= untilMs);
+      if (!scoreVersion) return null; // entity did not exist yet at untilMs
+
+      // Overlap check: does any version's active interval intersect [sinceMs, untilMs]?
+      // The version current at untilMs is always a candidate if its timestamp >= sinceMs
+      // OR if its activity extends across sinceMs (i.e. it's the newest version current at untilMs
+      // and was written before sinceMs — still active during the range).
+      const overlaps = scoreVersion.timestamp >= sinceMs
+        || versions.some(v => v.timestamp >= sinceMs && v.timestamp <= untilMs);
+      if (!overlaps) return null;
+
+      const historicalLinks = new Set(scoreVersion.linkIds || []);
+      return {
+        id:        e.id,
+        type:      e.type,
+        text:      scoreVersion.text,
+        vector:    scoreVersion.vector,
+        updatedAt: scoreVersion.timestamp,
+        tags:      e.tags || [],
+        links:     historicalLinks.size > 0 ? historicalLinks : e.links,
+        memoryType:  e.memoryType || "long-term",
+        workspaceId: e.workspaceId || "default",
+        source:    scoreVersion.source || e.source || { type: "user" },
+        classification: scoreVersion.classification || e.classification || "internal",
+        delta:     scoreVersion.delta || null,
+        trustScore: e.trustScore,
+      };
+    }).filter(Boolean);
+  }
+
   const subsetById = new Map(subset.map(e => [e.id, e]));
 
   if (Object.keys(merged).length) subset = _applyFilter(subset, merged);
 
+  // In range mode, "now" is the right edge of the range (for recency math parity),
+  // and recency is disabled because the concept of "now" is undefined for a historical span.
+  const rangeNow = hasRange
+    ? (Number.isFinite(untilMs) ? untilMs : Date.now())
+    : null;
   console.time("[kalairos] query");
   const raw = await _runWorkers(queryVector, queryTerms, subset, {
-    now:        asOf !== null ? asOf : Date.now(),
-    useRecency: asOf === null,
+    now:        hasAsOf ? asOf : (hasRange ? rangeNow : Date.now()),
+    useRecency: !hasAsOf && !hasRange,
   });
   console.timeEnd("[kalairos] query");
 
@@ -1050,11 +1162,14 @@ async function query(text, { limit = 10, maxTokens = null, filter = {}, asOf = n
     results,
     filter:  merged,
     asOf,
+    since:   hasRange ? since : null,
+    until:   hasRange ? until : null,
     config:  {
       minScore:      CFG.minFinalScore,
       minSemantic:   CFG.minSemanticScore,
       linkThreshold: CFG.linkThreshold,
-      recencyWeight: asOf === null ? CFG.recencyWeight : 0,
+      recencyWeight: (hasAsOf || hasRange) ? 0 : CFG.recencyWeight,
+      trustWeight:   CFG.trustWeight,
     },
   };
   if (tokenUsage) response.tokenUsage = tokenUsage;
@@ -1840,6 +1955,8 @@ module.exports = {
   ingestTimeSeries,
   ingestFile,
   query,
+  queryAt,
+  queryRange,
   get,
   getMany,
   remove,
@@ -1858,6 +1975,7 @@ module.exports = {
   // Version semantics
   getContradictions,
   getDrift,
+  buildChangelog,
   // Provenance & trust
   annotate,
   shutdown,

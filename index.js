@@ -10,6 +10,7 @@ const { WorkerPool } = require("./worker-pool");
 const { AgentMemory } = require("./agent");
 const { Err, emitError, resetSignals } = require("./errors");
 const { AuthStore } = require("./auth");
+const { computeTrustSignals } = require("./trust");
 
 // ─── Trust Score Defaults ─────────────────────────────────────────────────────
 // Default trust scores by provenance type. Explicit annotations override these.
@@ -897,7 +898,7 @@ function _computeImportance(entity) {
 // ─── Parallel Hybrid Query ────────────────────────────────────────────────────
 
 async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), useRecency = true } = {}) {
-  if (subset.length === 0) return [];
+  if (subset.length === 0) return { results: [], trustBreakdowns: new Map() };
 
   const numWorkers = os.cpus().length;
   const chunkSize  = Math.ceil(subset.length / numWorkers);
@@ -915,12 +916,33 @@ async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), 
     useRecency,
   };
 
+  // Pre-compute multi-signal trust per entity in the main thread. The scalar
+  // `trust` goes to the worker (used for scoring); the full breakdown stays
+  // here in a Map and is re-attached to top-K results during assembly. This
+  // avoids serialising a breakdown object for every entity we score.
+  //
+  // For historical queries (queryAt / queryRange), `updatedAt` on the subset
+  // entity already reflects the snapshot time; we use it for recency decay.
+  // Contradiction/corroboration counts still draw from the full version
+  // history — point-in-time trust is a follow-up (documented in CLAUDE.md
+  // under time-aware retrieval).
+  const trustBreakdowns = new Map();
+  const scoredEntities = subset.map(e => {
+    const storeEntity = store.get(e.id) || e;
+    const { trust, breakdown } = computeTrustSignals(storeEntity, {
+      now,
+      recencyHalfLifeMs: CFG.recencyHalfLifeMs,
+    });
+    trustBreakdowns.set(e.id, breakdown);
+    return { e, trust };
+  });
+
   const promises = [];
   for (let i = 0; i < numWorkers; i++) {
-    const slice = subset.slice(i * chunkSize, (i + 1) * chunkSize);
+    const slice = scoredEntities.slice(i * chunkSize, (i + 1) * chunkSize);
     if (!slice.length) continue;
 
-    const chunk = slice.map(e => ({
+    const chunk = slice.map(({ e, trust }) => ({
       id:          e.id,
       text:        e.text,
       type:        e.type || "text",
@@ -929,14 +951,14 @@ async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), 
       links:       { size: e.links?.size || 0 },
       llmKeywords: e.llmKeywords || [],
       importance:  _computeImportance(e),
-      trustScore:  e.trustScore,
+      trustScore:  trust,  // pre-computed composite replaces the stored scalar
     }));
 
     promises.push(_pool.run({ chunk, queryVector, queryTerms, config: jobConfig }));
   }
 
   const arrays = await Promise.all(promises);
-  return arrays.flat().filter(Boolean);
+  return { results: arrays.flat().filter(Boolean), trustBreakdowns };
 }
 
 // ─── Query ────────────────────────────────────────────────────────────────────
@@ -1111,7 +1133,7 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
     ? (Number.isFinite(untilMs) ? untilMs : Date.now())
     : null;
   console.time("[kalairos] query");
-  const raw = await _runWorkers(queryVector, queryTerms, subset, {
+  const { results: raw, trustBreakdowns } = await _runWorkers(queryVector, queryTerms, subset, {
     now:        hasAsOf ? asOf : (hasRange ? rangeNow : Date.now()),
     useRecency: !hasAsOf && !hasRange,
   });
@@ -1122,6 +1144,7 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
     .slice(0, safeLimit)
     .map(r => {
       const entity = subsetById.get(r.id);
+      const breakdown = trustBreakdowns.get(r.id) || null;
       return {
         ...r,
         source:         entity?.source || { type: "user" },
@@ -1129,9 +1152,12 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
         retention:      entity?.retention || { policy: "keep", expiresAt: null },
         memoryType:     entity?.memoryType || "long-term",
         workspaceId:    entity?.workspaceId || "default",
+        // trustScore exposes the stored per-entity prior (source-default or annotation).
+        // `trust` on the result (from kernel) is the composite used for scoring.
         trustScore:     entity?.trustScore != null
                           ? entity.trustScore
                           : _defaultTrustScore(entity?.source?.type || "user"),
+        trustBreakdown: breakdown,
         delta:          entity?.delta || null,
       };
     });

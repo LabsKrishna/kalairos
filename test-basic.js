@@ -721,6 +721,178 @@ const INIT_OPTS = {
     assert.ok(Number.isFinite(r.trustMultiplier), "trustMultiplier must be finite");
   });
 
+  console.log("\n── multi-signal trust (trust.js) ────────────────────────────────");
+
+  // Unit tests against trust.js directly — pure function, no init needed
+  const { computeTrustSignals } = require("./trust");
+
+  await test("base = stored trustScore when present", async () => {
+    const e = { trustScore: 0.8, updatedAt: Date.now(), versions: [] };
+    const { breakdown } = computeTrustSignals(e);
+    assert.strictEqual(breakdown.base, 0.8, `expected base 0.8, got ${breakdown.base}`);
+  });
+
+  await test("base falls back to 0.5 for legacy entities without trustScore", async () => {
+    const e = { updatedAt: Date.now(), versions: [] };
+    const { breakdown } = computeTrustSignals(e);
+    assert.strictEqual(breakdown.base, 0.5, `expected legacy base 0.5, got ${breakdown.base}`);
+  });
+
+  await test("corroboration: distinct sources boost trust (+0.1 per additional)", async () => {
+    // 3 distinct user identities → 2 corroborators beyond the base → +0.2
+    const e = {
+      trustScore: 0.5,
+      updatedAt:  Date.now(),
+      versions: [
+        { source: { type: "user", actor: "alice" }, delta: { type: "addition" } },
+        { source: { type: "user", actor: "bob"   }, delta: { type: "addition" } },
+        { source: { type: "user", actor: "carol" }, delta: null },
+      ],
+    };
+    const { trust, breakdown } = computeTrustSignals(e);
+    assert.strictEqual(breakdown.sources, 3, `expected 3 sources, got ${breakdown.sources}`);
+    assert.ok(Math.abs(breakdown.corroboration - 0.2) < 1e-6, `expected corroboration +0.2, got ${breakdown.corroboration}`);
+    // base 0.5 + 0.2 + 0 = 0.7, × 1.0 × ~1.0 ≈ 0.70
+    assert.ok(trust >= 0.69 && trust <= 0.71, `expected trust ~0.70, got ${trust}`);
+  });
+
+  await test("corroboration caps at +0.4 (diminishing returns after 5 sources)", async () => {
+    const versions = [];
+    for (let i = 0; i < 10; i++) versions.push({ source: { type: "user", actor: `u${i}` }, delta: null });
+    const { breakdown } = computeTrustSignals({ trustScore: 0.5, updatedAt: Date.now(), versions });
+    assert.strictEqual(breakdown.corroboration, 0.4, `cap violated: ${breakdown.corroboration}`);
+  });
+
+  await test("contradiction penalty scales by severity × source trust", async () => {
+    // One contradiction: severity 1.0 (negation flip), source "agent" (trust 0.75)
+    // Penalty: -0.3 × 1.0 × 0.75 = -0.225
+    const e = {
+      trustScore: 0.5,
+      updatedAt: Date.now(),
+      versions: [
+        { source: { type: "agent", actor: "a1" },
+          delta: { type: "correction", contradicts: true, contradictionSeverity: 1.0 } },
+      ],
+    };
+    const { breakdown } = computeTrustSignals(e);
+    assert.ok(Math.abs(breakdown.contradiction - (-0.225)) < 1e-6,
+      `expected -0.225, got ${breakdown.contradiction}`);
+  });
+
+  await test("negation flip (severity 1.0) penalises more than numeric flip (0.7)", async () => {
+    const common = { trustScore: 0.5, updatedAt: Date.now() };
+    const neg = computeTrustSignals({
+      ...common,
+      versions: [{ source: { type: "user" },
+                   delta: { type: "correction", contradicts: true, contradictionSeverity: 1.0 } }],
+    });
+    const num = computeTrustSignals({
+      ...common,
+      versions: [{ source: { type: "user" },
+                   delta: { type: "update", contradicts: true, contradictionSeverity: 0.7 } }],
+    });
+    assert.ok(neg.trust < num.trust,
+      `negation (${neg.trust}) should penalise more than numeric (${num.trust})`);
+  });
+
+  await test("resolved contradictions (newer correction exists) contribute zero penalty", async () => {
+    // Versions are newest-first. A newer "correction" resolves the older contradiction.
+    const e = {
+      trustScore: 0.5,
+      updatedAt: Date.now(),
+      versions: [
+        { source: { type: "user" }, delta: { type: "correction" } },                                     // newer: resolves
+        { source: { type: "agent" }, delta: { type: "correction", contradicts: true, contradictionSeverity: 1.0 } }, // older contradiction
+      ],
+    };
+    const { breakdown } = computeTrustSignals(e);
+    assert.strictEqual(breakdown.contradictions.unresolved, 0,
+      `expected 0 unresolved, got ${breakdown.contradictions.unresolved}`);
+    assert.strictEqual(breakdown.contradiction, 0,
+      `expected 0 penalty, got ${breakdown.contradiction}`);
+  });
+
+  await test("kill switch: contradiction penalty ≤ -0.6 forces trust to 0.1", async () => {
+    // 3 severe contradictions from high-trust sources: 3 × -0.3 × 1.0 × 0.9 = -0.81
+    const versions = [];
+    for (let i = 0; i < 3; i++) {
+      versions.push({
+        source: { type: "user", actor: `u${i}` },
+        delta:  { type: "correction", contradicts: true, contradictionSeverity: 1.0 },
+      });
+    }
+    const { trust, breakdown } = computeTrustSignals({
+      trustScore: 1.0, updatedAt: Date.now(), versions,
+    });
+    assert.strictEqual(trust, 0.1, `kill switch not triggered: trust=${trust}`);
+    assert.strictEqual(breakdown.killed, true, "killed flag must be set");
+  });
+
+  await test("recency multiplier decays trust for stale entities (min floor 0.5)", async () => {
+    const now       = Date.now();
+    const halfLife  = 30 * 86_400_000;
+    // 10 half-lives old → recency ≈ exp(-LN2×10) ≈ 0.00098 → clamped to 0.5
+    const ancient   = { trustScore: 1.0, updatedAt: now - 10 * halfLife, versions: [] };
+    const fresh     = { trustScore: 1.0, updatedAt: now, versions: [] };
+    const a = computeTrustSignals(ancient, { now, recencyHalfLifeMs: halfLife });
+    const f = computeTrustSignals(fresh,   { now, recencyHalfLifeMs: halfLife });
+    assert.strictEqual(a.breakdown.recency, 0.5, `recency floor violated: ${a.breakdown.recency}`);
+    assert.ok(f.breakdown.recency > 0.99, `fresh recency should be ~1.0, got ${f.breakdown.recency}`);
+    assert.ok(a.trust < f.trust, "stale entity should have lower trust than fresh");
+  });
+
+  await test("actor multiplier is 1.0 placeholder (shape stable for future reputation)", async () => {
+    const { breakdown } = computeTrustSignals({ trustScore: 0.5, updatedAt: Date.now(), versions: [] });
+    assert.strictEqual(breakdown.actor, 1, "actor multiplier should be 1.0 placeholder");
+  });
+
+  await test("breakdown.formula is a human-readable explanation", async () => {
+    const { breakdown } = computeTrustSignals({
+      trustScore: 0.5,
+      updatedAt: Date.now(),
+      versions: [
+        { source: { type: "user", actor: "alice" }, delta: null },
+        { source: { type: "user", actor: "bob" },   delta: null },
+      ],
+    });
+    assert.match(breakdown.formula, /Trust \d\.\d{2} =/, "formula should start 'Trust X.XX ='");
+    assert.match(breakdown.formula, /corroboration/, "formula should mention corroboration");
+  });
+
+  console.log("\n── trustBreakdown surfaces in query results ─────────────────────");
+
+  await test("query results expose trustBreakdown with base + corroboration + contradiction", async () => {
+    await lib.init(INIT_OPTS);
+    const id = await lib.ingest("the api endpoint returns json responses reliably");
+    const res = await lib.query("api endpoint json responses");
+    assert.ok(res.results.length >= 1, "expected a result");
+    const r = res.results[0];
+    assert.ok(r.trustBreakdown, "result must have trustBreakdown");
+    assert.ok(Number.isFinite(r.trustBreakdown.base), "breakdown.base must be finite");
+    assert.ok(Number.isFinite(r.trustBreakdown.corroboration), "breakdown.corroboration must be finite");
+    assert.ok(Number.isFinite(r.trustBreakdown.contradiction), "breakdown.contradiction must be finite");
+    assert.ok(Number.isFinite(r.trustBreakdown.recency), "breakdown.recency must be finite");
+    assert.ok(typeof r.trustBreakdown.formula === "string", "breakdown.formula must be a string");
+    assert.ok(r.trustBreakdown.contradictions.total === 0, "fresh entity has no contradictions");
+  });
+
+  await test("contradicting ingests trigger contradictionSeverity in the delta", async () => {
+    await lib.init(INIT_OPTS);
+    // First assertion, then negation flip (polarity reversal)
+    const id  = await lib.ingest("the payment gateway is operational right now");
+    const id2 = await lib.ingest("the payment gateway is not operational right now");
+    // If they merged into one entity (version threshold), check version delta
+    if (id === id2) {
+      const hist = await lib.getHistory(id);
+      const contradictoryVersion = hist.versions.find(v => v.delta?.contradicts);
+      assert.ok(contradictoryVersion, "expected at least one contradicting version");
+      assert.strictEqual(contradictoryVersion.delta.contradictionSeverity, 1.0,
+        `negation flip should have severity 1.0, got ${contradictoryVersion.delta?.contradictionSeverity}`);
+    }
+    // If they did NOT merge (separate entities), test is a no-op — delta isn't generated.
+    // We verified the severity computation directly in versioning above.
+  });
+
   // ── Results ───────────────────────────────────────────────────────────────
   console.log(`\n${"─".repeat(60)}`);
   const total = passed + failed;

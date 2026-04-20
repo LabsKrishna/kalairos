@@ -22,6 +22,12 @@ function cosine(a, b) {
 // trustWeight is opt-in (default 0, behavior unchanged). When > 0, the final score is scaled
 // by `(1 - trustWeight + trustWeight * trustScore)`. Missing trustScore is treated as 1.0
 // (neutral — no penalty), so callers that never set trust see no change.
+//
+// Note: `entity.trustScore` here is the pre-computed **composite** trust value
+// produced by trust.js::computeTrustSignals (base + corroboration − contradictions,
+// scaled by actor and recency multipliers). The kernel only consumes the scalar;
+// the full breakdown (the "why" of the score) is attached to top-K results in
+// the main thread during result assembly, not serialised through every worker chunk.
 function makeHybridKernel({
   graphBoostWeight   = 0.01,
   keywordBoostWeight = 0.05,

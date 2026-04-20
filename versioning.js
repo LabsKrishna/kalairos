@@ -95,37 +95,45 @@ function buildSummary(type, addedTerms, removedTerms, semanticShift) {
   }
 }
 
-// Contradiction detector — flags updates where any of the following hold:
+// Contradiction detector — flags updates where any of the following hold, and
+// returns a severity weight (0–1) indicating how damaging the contradiction is
+// to trust. The boolean `contradicts` is preserved for back-compat; severity is
+// the new signal consumed by the trust aggregator (see trust.js).
 //
-// 1. Numeric value flip: a numeric/value term was both removed and added
-//    (e.g. "$50" → "$60", "3pm" → "4pm"). Signals a factual correction.
+// Severity hierarchy (most → least damaging):
+//   1.0 — Negation flip: polarity of the assertion reverses
+//         (e.g. "is ready" → "is not ready"). A full inversion.
+//   0.7 — Numeric value flip: a numeric/value term was both removed and added
+//         (e.g. "$50" → "$60"). A correction, not a reversal.
+//   0.5 — High-drift concept change: delta type is "drift" AND semanticShift > 0.25.
+//         Likely a topic flip but not polarity or value proven wrong.
+//   0.0 — Not a contradiction.
 //
-// 2. Negation flip: a negation word (not, no, cannot, …) was added or removed,
-//    flipping the polarity of the assertion (e.g. "is ready" → "is not ready").
-//    This catches factual reversals that have no numeric terms.
-//
-// 3. High-drift concept change: delta type is "drift" AND semanticShift > 0.25.
-//    A very large shift with entirely different terms is almost always a topic flip.
-//
-// Note: "drift" type changes are intentionally included for cases 2 and 3 so that
-// changes that are semantically massive but contain negation are still flagged.
-function detectContradiction(type, addedTerms, removedTerms, semanticShift) {
-  // 1. Numeric value flip
+// A single call returns the *highest* applicable severity (checks are ordered
+// so the strongest signal wins).
+function classifyContradiction(type, addedTerms, removedTerms, semanticShift) {
+  // 1. Negation flip — highest severity, checked first
+  const addedNegation   = addedTerms.some(isNegation);
+  const removedNegation = removedTerms.some(isNegation);
+  if (addedNegation !== removedNegation) return 1.0;
+
+  // 2. Numeric value flip (only meaningful for update/correction deltas)
   if (type === "update" || type === "correction") {
     const removedNumeric = removedTerms.some(isNumericTerm);
     const addedNumeric   = addedTerms.some(isNumericTerm);
-    if (removedNumeric && addedNumeric) return true;
+    if (removedNumeric && addedNumeric) return 0.7;
   }
 
-  // 2. Negation flip — works across all delta types
-  const addedNegation   = addedTerms.some(isNegation);
-  const removedNegation = removedTerms.some(isNegation);
-  if (addedNegation !== removedNegation) return true;
-
   // 3. High-drift topic change
-  if (type === "drift" && semanticShift > 0.25) return true;
+  if (type === "drift" && semanticShift > 0.25) return 0.5;
 
-  return false;
+  return 0;
+}
+
+// Back-compat wrapper: returns boolean for existing callers. New code should
+// use classifyContradiction() directly to access severity.
+function detectContradiction(type, addedTerms, removedTerms, semanticShift) {
+  return classifyContradiction(type, addedTerms, removedTerms, semanticShift) > 0;
 }
 
 // Main — builds a full intelligent delta between two versions
@@ -134,9 +142,9 @@ function buildDelta(oldText, oldVector, newText, newVector) {
   const semanticShift = Number((1 - similarity).toFixed(4));
 
   const { added, removed } = diffTerms(oldText, newText);
-  const type        = detectDeltaType(semanticShift, added, removed);
-  const summary     = buildSummary(type, added, removed, semanticShift);
-  const contradicts = detectContradiction(type, added, removed, semanticShift);
+  const type                  = detectDeltaType(semanticShift, added, removed);
+  const summary               = buildSummary(type, added, removed, semanticShift);
+  const contradictionSeverity = classifyContradiction(type, added, removed, semanticShift);
 
   return {
     type,
@@ -144,7 +152,8 @@ function buildDelta(oldText, oldVector, newText, newVector) {
     addedTerms:   added.slice(0, 20),
     removedTerms: removed.slice(0, 20),
     summary,
-    contradicts,
+    contradicts:            contradictionSeverity > 0,
+    contradictionSeverity:  +contradictionSeverity.toFixed(2),
   };
 }
 
@@ -209,4 +218,4 @@ function measureDrift(versions) {
   };
 }
 
-module.exports = { buildDelta, buildChangelog, measureDrift };
+module.exports = { buildDelta, buildChangelog, measureDrift, classifyContradiction };

@@ -178,7 +178,7 @@ async function run() {
   await lib.init(BASE_OPTS);
 
   // Ingest a corpus of varied-length memories
-  const lengths = [50, 100, 200, 400, 800];
+  const lengths = [50, 100, 200, 400, 700];
   for (const len of lengths) {
     const words = [];
     for (let i = 0; i < len; i++) words.push("memory");

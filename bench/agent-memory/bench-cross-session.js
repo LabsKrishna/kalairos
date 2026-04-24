@@ -104,7 +104,7 @@ async function run() {
 
   // ── Time-travel across sessions ───────────────────────────────────────────
   await bench.run("Time-travel to session 1: sees original revenue", async () => {
-    const res = await planner.recall("quarterly revenue", { asOf: t0 + DAY });
+    const res = await planner.recallAt("quarterly revenue", t0 + DAY);
     assert.ok(res.results.length > 0);
     assert.match(res.results[0].text, /12 million/, "should see researcher's original value");
   });

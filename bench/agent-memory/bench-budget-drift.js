@@ -71,13 +71,13 @@ async function run() {
   });
 
   await bench.run("Time-travel to day 0 returns 2.4M", async () => {
-    const res = await agent.recall("atlas project Q2 budget forecast", { asOf: t0 });
+    const res = await agent.recallAt("atlas project Q2 budget forecast", t0);
     assert.ok(res.results.length > 0);
     assert.match(res.results[0].text, /2\.4 million/);
   });
 
   await bench.run("Time-travel to day 4 returns 2.3M", async () => {
-    const res = await agent.recall("atlas project Q2 budget forecast", { asOf: t0 + 4 * DAY });
+    const res = await agent.recallAt("atlas project Q2 budget forecast", t0 + 4 * DAY);
     assert.ok(res.results.length > 0);
     assert.match(res.results[0].text, /2\.3 million/);
   });

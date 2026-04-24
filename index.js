@@ -56,6 +56,10 @@ const DEFAULTS = {
   // Excess writes are rejected with ERR_WRITE_QUEUE_FULL (HTTP 429) so callers
   // get a clear backpressure signal instead of unbounded memory growth.
   writeQueueMax: Number(process.env.KALAIROS_WRITE_QUEUE_MAX || 500),
+  // Maximum characters allowed per ingested memory text. Exceeding this throws
+  // ERR_TEXT_TOO_LONG rather than silently truncating — silent truncation
+  // corrupts recall because the embedding is computed from clipped text.
+  maxTextLen: Number(process.env.KALAIROS_MAX_TEXT_LEN || 5000),
 };
 
 // ─── Module state ─────────────────────────────────────────────────────────────
@@ -515,11 +519,15 @@ function _relinkEntity(entity) {
  * @param {{ type?, timestamp?, metadata?, tags?, source?, classification? }} opts
  * @returns {number} stable entity ID (never changes across updates)
  */
-async function ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces } = {}) {
+async function ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false } = {}) {
   _assertInit();
 
   const ts       = timestamp || Date.now();
-  const safeText = String(text || "").slice(0, 5000);
+  const rawText  = String(text || "");
+  if (rawText.length > CFG.maxTextLen) {
+    throw emitError(Err.textTooLong(rawText.length, CFG.maxTextLen));
+  }
+  const safeText = rawText;
   const vector   = await _embed(safeText, false, type);
   const src      = _normalizeSource(source);
   const cls      = _normalizeClassification(classification);
@@ -553,18 +561,21 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     // Two tiers: versionThreshold for direct updates, consolidationThreshold for
     // near-duplicate detection so the same fact expressed differently merges
     // instead of creating a separate entity.
+    // forceNew=true bypasses this scan entirely — guarantees a new entity row.
     let bestMatch = null, bestSim = 0;
     let consolidateMatch = null, consolidateSim = 0;
-    for (const entity of store.values()) {
-      if (!_isAlive(entity)) continue;
-      if (entity.type !== type) continue;
-      const sim = cosine(vector, entity.vector);
-      if (sim >= CFG.versionThreshold && sim > bestSim) {
-        bestSim   = sim;
-        bestMatch = entity;
-      } else if (sim >= CFG.consolidationThreshold && sim > consolidateSim) {
-        consolidateSim   = sim;
-        consolidateMatch = entity;
+    if (!forceNew) {
+      for (const entity of store.values()) {
+        if (!_isAlive(entity)) continue;
+        if (entity.type !== type) continue;
+        const sim = cosine(vector, entity.vector);
+        if (sim >= CFG.versionThreshold && sim > bestSim) {
+          bestSim   = sim;
+          bestMatch = entity;
+        } else if (sim >= CFG.consolidationThreshold && sim > consolidateSim) {
+          consolidateSim   = sim;
+          consolidateMatch = entity;
+        }
       }
     }
 

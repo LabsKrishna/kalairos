@@ -52,6 +52,7 @@ const Codes = {
   AUTH_FAILED:        "ERR_AUTH_FAILED",
   FORBIDDEN:          "ERR_FORBIDDEN",
   WRITE_QUEUE_FULL:   "ERR_WRITE_QUEUE_FULL",
+  TEXT_TOO_LONG:      "ERR_TEXT_TOO_LONG",
 };
 
 // ─── Signal Bus ──────────────────────────────────────────────────────────────
@@ -198,6 +199,14 @@ const Err = {
       recoverable: true,
       suggestion: "Reduce concurrent write rate or increase writeQueueMax in init().",
       context: { queueDepth: depth, queueMax: max },
+    }),
+
+  textTooLong: (actual, max) =>
+    new KalairosError(Codes.TEXT_TOO_LONG,
+      `Memory text is ${actual} characters, exceeds maxTextLen=${max}.`, {
+      recoverable: false,
+      suggestion: "Split the text into smaller memories, or raise the cap via init({ maxTextLen }) or KALAIROS_MAX_TEXT_LEN env.",
+      context: { actual, max },
     }),
 };
 

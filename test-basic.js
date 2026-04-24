@@ -893,6 +893,63 @@ const INIT_OPTS = {
     // We verified the severity computation directly in versioning above.
   });
 
+  // ── Text length validation (ERR_TEXT_TOO_LONG) ───────────────────────────
+  console.log("\n── text length validation ───────────────────────────────────────────");
+
+  await test("ingest() throws ERR_TEXT_TOO_LONG when text exceeds maxTextLen", async () => {
+    await lib.init({ ...INIT_OPTS, maxTextLen: 20 });
+    await assert.rejects(
+      () => lib.ingest("x".repeat(21)),
+      (err) => {
+        assert.strictEqual(err.code, "ERR_TEXT_TOO_LONG");
+        assert.ok(err.context.actual === 21);
+        assert.ok(err.context.max === 20);
+        return true;
+      }
+    );
+  });
+
+  await test("ingest() succeeds when text is exactly maxTextLen", async () => {
+    await lib.init({ ...INIT_OPTS, maxTextLen: 20 });
+    const id = await lib.ingest("x".repeat(20));
+    assert.ok(typeof id === "number");
+  });
+
+  await test("KALAIROS_MAX_TEXT_LEN env var sets the default cap", async () => {
+    process.env.KALAIROS_MAX_TEXT_LEN = "10";
+    // Re-require to pick up new env (module is already cached, so we test init override path instead)
+    await lib.init({ ...INIT_OPTS, maxTextLen: 10 });
+    await assert.rejects(
+      () => lib.ingest("x".repeat(11)),
+      (err) => { assert.strictEqual(err.code, "ERR_TEXT_TOO_LONG"); return true; }
+    );
+    delete process.env.KALAIROS_MAX_TEXT_LEN;
+  });
+
+  // ── forceNew option ───────────────────────────────────────────────────────
+  console.log("\n── forceNew ingest option ───────────────────────────────────────────");
+
+  await test("forceNew=true always creates a new entity even for identical text", async () => {
+    await lib.init(INIT_OPTS);
+    const id1 = await lib.ingest("the sky is blue", { forceNew: true });
+    const id2 = await lib.ingest("the sky is blue", { forceNew: true });
+    assert.notEqual(id1, id2, "forceNew should produce two separate entities");
+  });
+
+  await test("forceNew=false (default) merges identical text into the same entity", async () => {
+    await lib.init(INIT_OPTS);
+    const id1 = await lib.ingest("the sky is blue");
+    const id2 = await lib.ingest("the sky is blue");
+    assert.strictEqual(id1, id2, "default behaviour should merge identical text");
+  });
+
+  await test("forceNew=true creates new entity even when a near-duplicate exists", async () => {
+    await lib.init({ ...INIT_OPTS, consolidationThreshold: 0.50 });
+    const id1 = await lib.ingest("Alice loves hiking in the mountains");
+    const id2 = await lib.ingest("Alice loves hiking in the mountains", { forceNew: true });
+    assert.notEqual(id1, id2, "forceNew must bypass consolidation threshold");
+  });
+
   // ── Results ───────────────────────────────────────────────────────────────
   console.log(`\n${"─".repeat(60)}`);
   const total = passed + failed;

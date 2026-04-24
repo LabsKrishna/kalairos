@@ -1,78 +1,47 @@
 # Kalairos
 
-> Your AI agent forgot what it knew yesterday. That's not a bug — your database just doesn't care about time.
+> Durable, private, time-aware memory for long-running AI agents.
 
-**Vector databases store embeddings. Kalairos remembers.**
-
-Your agent stores a fact. Updates it. Then asks "what was true last week?" Your vector database returns nothing — the old embedding is gone. Kalairos returns the right answer, with a full version trail showing when and why it changed.
+Your agent stores a fact. Updates it. Then asks *"what was true last week?"* A vector DB forgets the old embedding. **Kalairos remembers — with a full version trail.**
 
 ```bash
 npm install kalairos
 ```
 
+No cloud service. No API key required (bring any embedder, or start with the bundled one). JSONL on disk — human-readable, git-friendly.
+
 ---
 
-## See it work — 30 seconds, no API key
+## Quick start — 10 lines, no API key
+
+```js
+const kalairos = require('kalairos');
+const embed = async (t) => [...t].map(c => c.charCodeAt(0) / 255); // toy embedder
+
+await kalairos.init({ embedFn: embed });
+const agent = kalairos.createAgent({ name: 'analyst' });
+
+const id = await agent.remember('Revenue target is $10M for Q3');
+await agent.remember('Revenue target revised to $12M for Q3');
+
+console.log((await agent.recall('revenue target'))[0].text);        // → "$12M"
+const then = Date.now() - 7 * 24 * 60 * 60 * 1000;
+console.log((await agent.recall('revenue target', { asOf: then }))[0].text); // → "$10M"
+```
+
+That's memory with time travel. Swap the toy embedder for OpenAI, Cohere, or any `async (text) => number[]` when you're ready.
+
+**Try the interactive demo — zero config:**
 
 ```bash
 npx kalairos demo
 ```
 
-Runs a live agent memory demo in your terminal. Zero config. Nothing written to disk.
-
 ---
 
-## Quick start
+## API stability
 
-```js
-const kalairos = require('kalairos');
-
-async function main() {
-	await kalairos.init({
-		// Bring your own embedder — any function that returns a number[]
-		embedFn: async (text) => {
-			const res = await fetch('https://api.openai.com/v1/embeddings', {
-				method: 'POST',
-				headers: {
-					Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-					'Content-Type': 'application/json',
-				},
-				body: JSON.stringify({ model: 'text-embedding-3-small', input: text }),
-			});
-			return (await res.json()).data[0].embedding;
-		},
-	});
-
-	const agent = kalairos.createAgent({ name: 'analyst' });
-
-	// Store a fact
-	const id = await agent.remember('Revenue target is $10M for Q3');
-
-	// Update it — version detection is automatic, no ID needed
-	await agent.remember('Revenue target revised to $12M for Q3');
-
-	// What's current?
-	const now = await agent.recall('revenue target');
-	// → "Revenue target revised to $12M for Q3"
-
-	// What was true BEFORE the revision?
-	const then = await agent.recall('revenue target', {
-		asOf: Date.now() - 7 * 24 * 60 * 60 * 1000, // one week ago
-	});
-	// → "Revenue target is $10M for Q3"
-
-	// What changed?
-	const history = await agent.getHistory(id);
-	// → v1: "$10M" → v2: "$12M", delta: "Value changed: [$10m] → [$12m]"
-
-	// Spot contradictions
-	const { contradictions } = await agent.getContradictions(id);
-
-	await kalairos.shutdown();
-}
-
-main();
-```
+Kalairos follows semver. Within the `1.x` line, the signatures of **`init`, `ingest`, `remember`, `query`, `getHistory`** — and their agent-shaped aliases on `createAgent()` — are **frozen**. Additive fields are fine; breaking changes require a major bump. See §19 in `CLAUDE.md` for the full contract.
 
 ---
 
@@ -309,7 +278,10 @@ await kalairos.ingestFile(filePath, opts?)
 await kalairos.ingestTimeSeries(label, points, opts?)
 ```
 
-Options: `{ type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, importance }`
+Options: `{ type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, importance, forceNew }`
+
+- **`forceNew`** (`boolean`, default `false`) — skip similarity matching and always create a new entity row. Use when you know two memories are distinct despite similar wording (e.g. separate journal entries on the same topic).
+- Text length is validated against **`maxTextLen`** (default `5000` chars, configurable via `init({ maxTextLen })` or `KALAIROS_MAX_TEXT_LEN` env). Exceeding it throws `ERR_TEXT_TOO_LONG` — split long content into smaller memories rather than relying on silent truncation.
 
 ### Read
 
@@ -345,6 +317,19 @@ const agent = kalairos.createAgent({ name, defaultClassification?, defaultTags?,
 kalairos.onSignal(code, callback)
 kalairos.getSignals(code?)
 ```
+
+---
+
+## Markdown export / import
+
+Memory is portable and diffable. Any agent or human can read it.
+
+```bash
+npx kalairos export --out memory.md --include-history   # dump to markdown
+npx kalairos import memory.md                           # ingest back (idempotent shape)
+```
+
+Checkpoint it into git, share it across agents, or hand-edit it when debugging. No proprietary format lock-in.
 
 ---
 

@@ -1,6 +1,6 @@
 {
   "name": "kalairos",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Durable, private, time-aware memory engine for long-running AI agents",
   "main": "./index.js",
   "exports": {
@@ -33,7 +33,10 @@
     "start": "node server.js",
     "test": "node test-basic.js && node test-versioning.js && node test-agent-simulation.js",
     "bench": "node bench/agent-memory/run-all.js",
-    "bench:real": "node bench/agent-memory/bench-eval-real.js"
+    "bench:real": "node bench/agent-memory/bench-eval-real.js",
+    "bench:latency": "node bench/latency.js",
+    "bench:poisoning": "node bench/poisoning/run.js",
+    "bench:longmemeval": "node bench/longmemeval/run.js"
   },
   "keywords": [
     "ai-memory",

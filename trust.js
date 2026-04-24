@@ -16,7 +16,12 @@
 //   corroboration  = min(0.4, 0.1 × (distinctSources − 1))
 //                    Subtract 1 because the first source IS the base, not a
 //                    corroboration. Cap at +0.4 (5 total sources) with
-//                    diminishing returns.
+//                    diminishing returns. `distinctSources` here is the count
+//                    of (type, actor) voices that support the CURRENT head
+//                    claim — versions older than the most-recent contradiction
+//                    corroborate the prior truth, not the new head, and are
+//                    excluded. URIs without an authenticated actor do not
+//                    multiply voices (see `sourceKey`).
 //
 //   contradiction  = Σ  −0.3 × severity(v) × sourceTrust(v)
 //                    over UNRESOLVED contradictions. A contradiction is
@@ -58,14 +63,15 @@ function sourceTrust(source) {
   return SOURCE_TRUST_DEFAULTS[t] ?? 0.70;
 }
 
-// Identity tuple for a source — two versions share a source identity iff all
-// three of (type, uri, actor) match. A bare `{ type: "user" }` with no uri/actor
-// still counts as one identity ("anonymous user source"); three such versions
-// collapse to a single corroborator, which is the right behavior — we don't
-// know if they're the same user or three different ones.
+// Identity tuple for a source — two versions are independent voices iff their
+// (type, actor) pair differs. URI alone is NOT part of the identity: a tool
+// without an authenticated actor is one voice regardless of how many domains
+// it's fronted from, because we cannot tell five tool URIs from one adversary
+// cycling domains (this is the repetition-attack defense). An anonymous user
+// (no actor) collapses to a single identity for the same reason.
 function sourceKey(source) {
-  if (!source) return "|||";
-  return `${source.type || ""}|${source.uri || ""}|${source.actor || ""}`;
+  if (!source) return "||";
+  return `${source.type || ""}|${source.actor || ""}`;
 }
 
 // Walk versions newest→oldest and mark each contradiction as resolved / unresolved.
@@ -113,15 +119,25 @@ function classifyContradictions(versions) {
   return out;
 }
 
-// Count distinct source identities that contributed non-contradicting content
-// to this entity. Corroboration = trusted restatement of the same fact from a
-// different source. Contradicting versions are excluded — a contradicting
-// source is not corroborating, it's opposing.
+// Count distinct source identities that corroborate the CURRENT head claim.
+//
+// Versions are stored newest-first. Walking from index 0 forward, each version
+// supports the head until — and including — the most recent contradicting
+// version. That contradicting version introduced the head text, so its source
+// IS a corroborator of head; but anything older corroborated the *prior*
+// (pre-contradiction) claim and must not count here.
+//
+// If the history contains no contradictions, every non-contradicting source
+// counts (equivalent to the original semantics for clean histories).
+//
+// This is the source-spoofing defense: a contradicting poison cannot inherit
+// the corroboration bonus earned by the truth it overturned.
 function countCorroborators(versions) {
   const seen = new Set();
-  for (const v of versions || []) {
-    if (v?.delta?.contradicts) continue;
+  if (!Array.isArray(versions) || versions.length === 0) return 0;
+  for (const v of versions) {
     seen.add(sourceKey(v.source));
+    if (v?.delta?.contradicts) break; // head-introducing version; stop
   }
   return seen.size;
 }

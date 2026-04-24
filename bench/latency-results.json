@@ -1,0 +1,31 @@
+{
+  "runAt": "2026-04-23T20:17:20.857Z",
+  "node": "v23.7.0",
+  "platform": "darwin",
+  "arch": "arm64",
+  "embedder": "deterministic bag-of-words, dim=64",
+  "results": [
+    {
+      "entities": 1000,
+      "queries": 500,
+      "ingestMs": 389,
+      "ingestPerItemMs": 0.389,
+      "p50": 10.141333,
+      "p95": 25.193542,
+      "p99": 35.074583,
+      "mean": 10.880015877999998,
+      "max": 53.895625
+    },
+    {
+      "entities": 10000,
+      "queries": 300,
+      "ingestMs": 23707,
+      "ingestPerItemMs": 2.371,
+      "p50": 117.177209,
+      "p95": 320.851333,
+      "p99": 1377.902167,
+      "mean": 152.72980543,
+      "max": 2201.795083
+    }
+  ]
+}

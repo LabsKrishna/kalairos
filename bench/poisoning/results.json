@@ -1,20 +1,7 @@
 {
-  "runAt": "2026-04-24T00:50:13.452Z",
-  "engines": {
-    "kalairos": {
-      "ranHere": true,
-      "passed": 5,
-      "total": 5
-    },
-    "mem0": {
-      "ranHere": false,
-      "note": "run bench/poisoning/adapter-mem0.js with MEM0_API_KEY"
-    },
-    "zep": {
-      "ranHere": false,
-      "note": "run bench/poisoning/adapter-zep.js against a local Zep"
-    }
-  },
+  "runAt": "2026-04-27T17:02:50.866Z",
+  "passed": 5,
+  "total": 5,
   "reports": [
     {
       "fixture": "indirect-injection",

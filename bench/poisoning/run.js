@@ -12,10 +12,6 @@
 // signals above. Failures mean the engine silently lost the defense we claim in
 // CLAUDE.md §15.
 //
-// The stubbed `mem0` / `zep` columns in the JSON report are intentionally
-// empty — those engines need external services we can't run in CI. Ship
-// adapters separately when API keys are provided.
-//
 // Usage: node bench/poisoning/run.js
 "use strict";
 
@@ -194,11 +190,8 @@ async function runFixture(fx) {
   const outPath = path.join(__dirname, "results.json");
   fs.writeFileSync(outPath, JSON.stringify({
     runAt: new Date().toISOString(),
-    engines: {
-      kalairos: { ranHere: true, passed, total },
-      mem0:     { ranHere: false, note: "run bench/poisoning/adapter-mem0.js with MEM0_API_KEY" },
-      zep:      { ranHere: false, note: "run bench/poisoning/adapter-zep.js against a local Zep" },
-    },
+    passed,
+    total,
     reports,
   }, null, 2));
   console.log(`  Wrote ${outPath}`);

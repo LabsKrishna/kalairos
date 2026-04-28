@@ -5,7 +5,7 @@
 [![license](https://img.shields.io/npm/l/kalairos.svg)](https://github.com/LabsKrishna/kalairos/blob/main/LICENSE)
 [![node](https://img.shields.io/node/v/kalairos.svg)](https://www.npmjs.com/package/kalairos)
 
-> **Memory that remembers what was true — not just what's true now.**
+> **Most systems store what is true. Kalairos stores what was true when decisions were made.**
 
 ---
 
@@ -145,6 +145,43 @@ flowchart LR
 ```
 
 Versions are **linear per entity** — each new version supersedes the previous; there is no branching. The "fork" effect happens *across* entities: when a `remember()` falls below the similarity threshold, it creates a new entity instead of a new version. Linearity is what keeps `queryAt(t)` well-defined: there is always one unambiguous answer to *"what did we believe about entity X at time T."*
+
+---
+
+## Every change leaves a breadcrumb. Important moments become checkpoints.
+
+Every `remember()` writes a trail event with `who` did it, `why`, when it became *effective*, and when it was *ingested*. Nothing extra to call. The trail is read-only and pure — `trail()` projects it from data already on disk.
+
+```js
+const policy = kalairos.scope({ source: { type: "agent", actor: "policy-bot" } });
+
+await policy.remember("Employees must submit reports by Friday");
+await policy.remember("Deadline changed to Wednesday", {
+  why:         "Policy update from HR memo",
+  effectiveAt: "2026-04-15",
+});
+
+const events = await kalairos.trail({ action: ["remembered", "superseded"] });
+// → [{ action: "remembered", who: { agent: "policy-bot" }, ingestAt, effectiveAt, ... },
+//    { action: "superseded", who: { agent: "policy-bot" }, why: "Policy update from HR memo", ... }]
+```
+
+Each event is one of a closed set: `remembered`, `superseded`, `corrected`, `contested`, `reaffirmed`, `forgotten`, `restored`, `imported`, `annotated`. Switch on it without guessing.
+
+When a moment matters — quarter close, audit cut, model ship — name it:
+
+```js
+await kalairos.checkpoint("q1-close", {
+  during: ["2026-01-01", "2026-04-01"],
+  why:    "Q1 audit reference",
+});
+
+const q1 = await kalairos.trail({ checkpoint: "q1-close" });
+const lastWeek = Date.now() - 7 * 86_400_000;
+const past     = await kalairos.queryAt("report deadline", lastWeek);
+```
+
+Checkpoints are frozen by default — backdated writes do not silently join them. Pass `live: true` if you want the filter to re-evaluate on every read.
 
 ---
 
@@ -294,8 +331,19 @@ await kalairos.getStatus()
 ### Delete
 
 ```js
-await kalairos.remove(id, { deletedBy? })    // soft delete
-await kalairos.purge(id)                      // permanent hard delete
+await kalairos.remove(id, { deletedBy? })           // soft delete
+await kalairos.forget(id, { reason?, who? })        // first-class verb, audited
+await kalairos.restore(id, { reason?, who? })       // reverse a forget
+await kalairos.purge(id)                            // permanent hard delete
+```
+
+### Audit trail and checkpoints
+
+```js
+await kalairos.trail({ entity?, since?, until?, action?, who?, checkpoint?, limit? })
+await kalairos.checkpoint(name, { during?, entity?, tags?, workspace?, why?, live? })
+await kalairos.getCheckpoint(name)
+await kalairos.listCheckpoints({ workspace? })
 ```
 
 ### Maintenance

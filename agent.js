@@ -71,6 +71,15 @@ class MemoryScope {
     if (!merged.memoryType && this.memoryType) merged.memoryType = this.memoryType;
     if (!merged.workspaceId && this.workspaceId) merged.workspaceId = this.workspaceId;
     if (merged.useLLM === undefined) merged.useLLM = this.useLLM;
+
+    // Auto-fill `who.agent` from the scope identity so trail events carry
+    // attribution without the caller having to thread it through every call.
+    const scopeAgent = (this.source && this.source.actor) || this.name || null;
+    if (!merged.who && scopeAgent) {
+      merged.who = { agent: scopeAgent };
+    } else if (merged.who && !merged.who.agent && scopeAgent) {
+      merged.who = { ...merged.who, agent: scopeAgent };
+    }
     return merged;
   }
 
@@ -149,8 +158,50 @@ class MemoryScope {
     const actor = (this.source && this.source.actor) || this.name || "scope";
     return this._engine.remove(id, {
       deletedBy: opts.deletedBy || { type: "scope", actor, reason },
+      reason,
+      who: opts.who || (actor ? { agent: actor } : null),
       allowedWorkspaces: opts.allowedWorkspaces,
     });
+  }
+
+  /**
+   * Restore a previously forgotten entity. Pairs with `forget()`.
+   */
+  async restore(id, opts = {}) {
+    if (typeof this._engine.restore !== "function") {
+      throw new Error("Engine does not support restore(). Upgrade kalairos.");
+    }
+    const actor = (this.source && this.source.actor) || this.name || "scope";
+    return this._engine.restore(id, {
+      reason: opts.reason,
+      who:    opts.who || (actor ? { agent: actor } : null),
+      allowedWorkspaces: opts.allowedWorkspaces,
+    });
+  }
+
+  /**
+   * Read-only audit trail of memory mutations across the store, scoped to
+   * this scope's workspace by default.
+   */
+  async trail(opts = {}) {
+    if (typeof this._engine.trail !== "function") {
+      throw new Error("Engine does not support trail(). Upgrade kalairos.");
+    }
+    const merged = { ...opts };
+    if (!merged.workspace && this.workspaceId) merged.workspace = this.workspaceId;
+    return this._engine.trail(merged);
+  }
+
+  /**
+   * Create a named checkpoint over the trail.
+   */
+  async checkpoint(name, opts = {}) {
+    if (typeof this._engine.checkpoint !== "function") {
+      throw new Error("Engine does not support checkpoint(). Upgrade kalairos.");
+    }
+    const merged = { ...opts };
+    if (!merged.workspace && this.workspaceId) merged.workspace = this.workspaceId;
+    return this._engine.checkpoint(name, merged);
   }
 
   /**
@@ -206,9 +257,25 @@ class MemoryScope {
   /** @deprecated use `getStartupSummary()` */
   async summarize(opts = {}) { return this.getStartupSummary(opts); }
 
-  /** @deprecated use `remove()` */
-  async forget(id, reason = "explicit forget", opts = {}) {
-    return this.remove(id, { ...opts, reason });
+  /**
+   * Forget an entity with an explicit reason. First-class verb that pairs with
+   * `restore()`. Delegates to the engine's `forget()` when available; older
+   * engines still get a soft-delete via `remove()`.
+   */
+  async forget(id, reasonOrOpts = "explicit forget", legacyOpts = {}) {
+    // Back-compat: forget(id, "reason", opts) AND forget(id, { reason, who })
+    let opts;
+    if (reasonOrOpts && typeof reasonOrOpts === "object") {
+      opts = { ...reasonOrOpts };
+    } else {
+      opts = { reason: String(reasonOrOpts), ...legacyOpts };
+    }
+    const actor = (this.source && this.source.actor) || this.name || "scope";
+    if (!opts.who && actor) opts.who = { agent: actor };
+    if (typeof this._engine.forget === "function") {
+      return this._engine.forget(id, opts);
+    }
+    return this.remove(id, opts);
   }
 
   /** @deprecated use `consolidate()` */

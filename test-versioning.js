@@ -389,6 +389,210 @@ const INIT_OPTS = {
     assert.ok(log[1].summary.length > 0, "v2 should have a non-empty summary");
   });
 
+  console.log("\n── trail / checkpoint / forget+restore ──────────────────────────");
+
+  await test("ACTIONS enum is closed and exported", async () => {
+    assert.ok(lib.ACTIONS && typeof lib.ACTIONS === "object");
+    const expected = ["remembered","superseded","corrected","contested","reaffirmed","forgotten","restored","imported","annotated"];
+    for (const a of expected) assert.strictEqual(lib.ACTIONS[a], a, `missing action: ${a}`);
+  });
+
+  await test("trail() rejects unknown action filters", async () => {
+    await lib.init(INIT_OPTS);
+    await assert.rejects(() => lib.trail({ action: "vibed" }), /Unknown action/i);
+  });
+
+  await test("first remember → action=remembered", async () => {
+    await lib.init(INIT_OPTS);
+    const scope = lib.scope({ source: { type: "agent", actor: "trail-bot" } });
+    const id = await scope.remember("the office printer is on the third floor");
+    const events = await lib.trail({ entity: id });
+    assert.strictEqual(events.length, 1, "expected one trail event");
+    assert.strictEqual(events[0].action, "remembered");
+    assert.strictEqual(events[0].who?.agent, "trail-bot");
+  });
+
+  await test("reaffirmed: same text + same source → no new version, but a trail event", async () => {
+    await lib.init(INIT_OPTS);
+    const scope = lib.scope({ source: { type: "agent", actor: "policy-bot" } });
+    const text  = "all reports must include a timestamp and the author name";
+    const id    = await scope.remember(text);
+    await scope.remember(text); // identical content + identical source → reaffirmed
+
+    const h = await lib.getHistory(id);
+    assert.strictEqual(h.versionCount, 1, "no new content version on reaffirmation");
+    const events = await lib.trail({ entity: id });
+    assert.strictEqual(events.length, 2, "expected 2 trail events (remembered + reaffirmed)");
+    assert.strictEqual(events[0].action, "remembered");
+    assert.strictEqual(events[1].action, "reaffirmed");
+    assert.strictEqual(events[1].contentChanged, false);
+  });
+
+  await test("same text + different source → superseded with why=null by default", async () => {
+    await lib.init(INIT_OPTS);
+    const scopeA = lib.scope({ source: { type: "agent", actor: "ingest-a" } });
+    const scopeB = lib.scope({ source: { type: "agent", actor: "ingest-b" } });
+    const text   = "quarterly revenue projection sits at twelve million dollars";
+    const id     = await scopeA.remember(text);
+    await scopeB.remember(text); // different actor → not reaffirmed
+
+    const h = await lib.getHistory(id);
+    assert.strictEqual(h.versionCount, 2, "expected 2 versions (different source)");
+    const latest = h.versions[h.versions.length - 1];
+    assert.strictEqual(latest.action, "superseded");
+    assert.strictEqual(latest.why, null, "why should default to null when not provided");
+  });
+
+  await test("forget + restore round-trip with trail and validTo", async () => {
+    await lib.init(INIT_OPTS);
+    const scope = lib.scope({ source: { type: "agent", actor: "compliance-bot" } });
+    const id = await scope.remember("user requested deletion of marketing emails");
+
+    await lib.forget(id, { reason: "GDPR request from user", who: { agent: "compliance-bot" } });
+    let h = await lib.getHistory(id);
+    assert.ok(h.deletedAt, "deletedAt must be set after forget");
+    assert.notStrictEqual(h.versions[h.versions.length - 1].validTo, null,
+      "latest version validTo must be closed after forget");
+    let events = await lib.trail({ entity: id });
+    assert.ok(events.some(e => e.action === "forgotten"), "expected a forgotten event");
+
+    await lib.restore(id, { reason: "GDPR request was withdrawn", who: { agent: "compliance-bot" } });
+    h = await lib.getHistory(id);
+    assert.strictEqual(h.deletedAt, null, "deletedAt cleared after restore");
+    assert.strictEqual(h.versions[h.versions.length - 1].validTo, null,
+      "latest version validTo reopened after restore");
+    events = await lib.trail({ entity: id });
+    assert.ok(events.some(e => e.action === "restored"), "expected a restored event");
+  });
+
+  await test("trail() filters by entity, action, and who.agent", async () => {
+    await lib.init(INIT_OPTS);
+    const a = lib.scope({ source: { type: "agent", actor: "alpha" } });
+    const b = lib.scope({ source: { type: "agent", actor: "beta"  } });
+    const idA = await a.remember("alpha's first observation about the market trend");
+    const idB = await b.remember("beta's distinct note on the supply chain disruption");
+    await a.remember("alpha's first observation about the market trend now revised");
+
+    const justA = await lib.trail({ who: { agent: "alpha" } });
+    assert.ok(justA.every(e => e.who?.agent === "alpha"), "who filter must match");
+    assert.ok(justA.length >= 2, "expected at least 2 events from alpha");
+
+    const onlyEntityB = await lib.trail({ entity: idB });
+    assert.ok(onlyEntityB.every(e => e.entityId === idB), "entity filter must match");
+
+    const justRemembered = await lib.trail({ action: "remembered" });
+    assert.ok(justRemembered.every(e => e.action === "remembered"), "action filter must match");
+    assert.ok(justRemembered.length >= 2);
+
+    void idA;
+  });
+
+  await test("trail() filters by since/until", async () => {
+    await lib.init(INIT_OPTS);
+    const scope = lib.scope({ source: { type: "agent", actor: "tester" } });
+    const t0 = Date.now();
+    await scope.remember("alpha facts about deep sea exploration vehicles");
+    await new Promise(r => setTimeout(r, 5));
+    const cut = Date.now();
+    await new Promise(r => setTimeout(r, 5));
+    await scope.remember("beta facts about high altitude balloon experiments");
+
+    const before = await lib.trail({ since: t0 - 1, until: cut });
+    const after  = await lib.trail({ since: cut + 1 });
+    assert.ok(before.length >= 1);
+    assert.ok(after.length >= 1);
+    assert.ok(before.every(e => e.ingestAt <= cut));
+    assert.ok(after.every(e => e.ingestAt > cut));
+  });
+
+  await test("frozen checkpoint excludes backdated events; live includes them", async () => {
+    await lib.init(INIT_OPTS);
+    const scope = lib.scope({ source: { type: "agent", actor: "policy-bot" } });
+    await scope.remember("policy: deadline is friday for weekly reports");
+
+    // Freeze a checkpoint covering the past minute
+    const from = Date.now() - 60_000;
+    const to   = Date.now() + 1; // inclusive of writes up to now
+    const frozen = await lib.checkpoint("freeze-test", { during: [from, to], live: false });
+    assert.strictEqual(frozen.frozen, true);
+    const frozenCount = (frozen.eventIds || []).length;
+    assert.ok(frozenCount >= 1, "frozen checkpoint must capture at least 1 event");
+
+    const live = await lib.checkpoint("live-test", { during: [from, to + 60_000], live: true });
+    assert.strictEqual(live.frozen, false);
+
+    // Now write another event whose effectiveAt is backdated into the window
+    await scope.remember("policy: bonus rule effective last week", {
+      effectiveAt: from + 1_000,
+      why: "backfilled from policy memo",
+    });
+
+    const frozenEvents = await lib.trail({ checkpoint: "freeze-test" });
+    assert.strictEqual(frozenEvents.length, frozenCount,
+      "frozen checkpoint must NOT pick up the backdated event");
+
+    const liveEvents = await lib.trail({ checkpoint: "live-test" });
+    assert.ok(liveEvents.length > frozenCount,
+      "live checkpoint MUST re-evaluate and include backdated events");
+  });
+
+  await test("checkpoint duplicates throw", async () => {
+    await lib.init(INIT_OPTS);
+    await lib.checkpoint("only-once", { during: [Date.now() - 1, Date.now() + 1] });
+    await assert.rejects(
+      () => lib.checkpoint("only-once", { during: [Date.now() - 1, Date.now() + 1] }),
+      /already exists/i,
+    );
+  });
+
+  await test("lazy back-compat: legacy raw entity loads with synthesized fields", async () => {
+    const os    = require("os");
+    const path  = require("path");
+    const fs    = require("fs");
+    const tmp   = path.join(os.tmpdir(), `kalairos-legacy-${Date.now()}.jsonl`);
+
+    // Hand-craft a file with the OLD version shape (no action, validFrom, etc.)
+    const legacy = {
+      id: 999000001,
+      type: "text",
+      text: "legacy fact updated once",
+      vector: new Array(64).fill(0.01),
+      source: { type: "user" },
+      classification: "internal",
+      retention: { policy: "keep", expiresAt: null },
+      memoryType: "long-term",
+      workspaceId: "default",
+      links: [],
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_500_000,
+      versions: [
+        { text: "legacy fact updated once",  vector: new Array(64).fill(0.01), timestamp: 1_700_000_500_000, delta: { type: "update", summary: "updated", semanticShift: 0.05, addedTerms: [], removedTerms: [] }, source: { type: "user" }, classification: "internal", linkIds: [] },
+        { text: "legacy fact",                vector: new Array(64).fill(0.01), timestamp: 1_700_000_000_000, delta: null, source: { type: "user" }, classification: "internal", linkIds: [] },
+      ],
+    };
+    fs.writeFileSync(tmp, JSON.stringify(legacy) + "\n");
+
+    try {
+      await lib.init({ ...INIT_OPTS, dataFile: tmp });
+      const h = await lib.getHistory(999000001);
+      assert.strictEqual(h.versionCount, 2);
+      assert.strictEqual(h.versions[0].action, "remembered", "v1 should synthesise to remembered");
+      assert.ok(["superseded", "corrected"].includes(h.versions[1].action), "v2 should synthesise to a supersede flavour");
+      assert.ok(h.versions[0].versionId, "versionId must be synthesised");
+      assert.ok(h.versions[1].versionId, "versionId must be synthesised");
+      assert.strictEqual(h.versions[0].validTo, h.versions[1].effectiveAt, "v1 validTo must close at v2 effectiveAt");
+      assert.strictEqual(h.versions[1].validTo, null, "latest version stays open");
+      assert.strictEqual(h.versions[0].who, null, "legacy who is honestly null");
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+
+  await test("invalid action on trail filter throws", async () => {
+    await lib.init(INIT_OPTS);
+    await assert.rejects(() => lib.trail({ action: "invented" }), /Unknown action/i);
+  });
+
   // ── Results ───────────────────────────────────────────────────────────────
   console.log(`\n${"─".repeat(60)}`);
   const total = passed + failed;

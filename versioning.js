@@ -218,4 +218,46 @@ function measureDrift(versions) {
   };
 }
 
-module.exports = { buildDelta, buildChangelog, measureDrift, classifyContradiction };
+// ─── Action Vocabulary ────────────────────────────────────────────────────────
+// Closed enum of trail-event actions. Every version record and every metadata-
+// only trail event records exactly one of these. Keeping this set small and
+// closed is what makes the trail auditable — readers can switch on it without
+// guessing.
+const ACTIONS = Object.freeze({
+  remembered: "remembered",
+  superseded: "superseded",
+  corrected:  "corrected",
+  contested:  "contested",
+  reaffirmed: "reaffirmed",
+  forgotten:  "forgotten",
+  restored:   "restored",
+  imported:   "imported",
+  annotated:  "annotated",
+});
+
+const ACTION_SET = new Set(Object.values(ACTIONS));
+
+function isValidAction(action) {
+  return typeof action === "string" && ACTION_SET.has(action);
+}
+
+// Synthesise an action for a legacy version record that pre-dates the action
+// field. Driven entirely by position in the version chain and delta type so
+// the result is deterministic and reproducible across reloads.
+function synthesizeAction(versionIdx, delta) {
+  if (versionIdx === 0) return ACTIONS.remembered;
+  const t = delta && typeof delta === "object" ? delta.type : null;
+  if (t === "correction")    return ACTIONS.corrected;
+  if (t === "consolidation") return ACTIONS.superseded;
+  return ACTIONS.superseded;
+}
+
+module.exports = {
+  buildDelta,
+  buildChangelog,
+  measureDrift,
+  classifyContradiction,
+  ACTIONS,
+  isValidAction,
+  synthesizeAction,
+};

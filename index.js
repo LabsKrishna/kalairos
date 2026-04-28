@@ -5,7 +5,7 @@ const os     = require("os");
 const fs     = require("fs");
 const path   = require("path");
 const { cosine } = require("./kernel");
-const { buildDelta, buildChangelog, measureDrift } = require("./versioning");
+const { buildDelta, buildChangelog, measureDrift, ACTIONS, isValidAction, synthesizeAction } = require("./versioning");
 const { WorkerPool } = require("./worker-pool");
 const { MemoryScope, AgentMemory } = require("./agent");
 const { Err, emitError, resetSignals } = require("./errors");
@@ -196,6 +196,107 @@ function _isAlive(entity) { return !entity.deletedAt; }
 // Returns all non-deleted entities.
 function _getAllAlive() { return Array.from(store.values()).filter(_isAlive); }
 
+// ─── Trail / version-record helpers ──────────────────────────────────────────
+// Deterministic versionId derived from entity id + chain length. Cheap, stable
+// across reloads, and sortable when paired with the entity id.
+function _makeVersionId(entityId, ordinal) {
+  return `${entityId}:${ordinal}`;
+}
+
+// Accepts ISO-8601 strings and finite numbers; returns ms or throws validation.
+function _normalizeTimestampInput(value, fieldName) {
+  if (value == null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  throw emitError(Err.validation(`${fieldName} must be an ISO-8601 string or finite ms timestamp`));
+}
+
+// Canonicalises the `who` field. Caller-supplied is preserved; missing fields
+// are dropped so we don't fabricate provenance.
+function _normalizeWho(input) {
+  if (!input || typeof input !== "object") return null;
+  const out = {};
+  if (input.agent)       out.agent       = String(input.agent);
+  if (input.onBehalfOf)  out.onBehalfOf  = String(input.onBehalfOf);
+  if (input.user)        out.user        = String(input.user);
+  if (input.session)     out.session     = String(input.session);
+  if (input.actor && !out.agent) out.agent = String(input.actor);
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+let _anonRememberWarned = false;
+
+// Append a trail event to an entity. Trail events live alongside content
+// versions (newest-first) on a separate field so the original `versions[]`
+// shape — which downstream callers rely on for content history — is unchanged.
+function _appendTrailEvent(entity, event) {
+  if (!isValidAction(event.action)) {
+    throw emitError(Err.validation(`Unknown action "${event.action}". Must be one of: ${Object.values(ACTIONS).join(", ")}`));
+  }
+  if (!Array.isArray(entity.trailEvents)) entity.trailEvents = [];
+  entity.trailEvents.unshift(event);
+}
+
+// Build a content version record with the full audit shape.
+function _buildVersionRecord({
+  entity,
+  text,
+  vector,
+  ingestAt,
+  effectiveAt,
+  delta,
+  source,
+  classification,
+  linkSnapshot,
+  action,
+  who,
+  why,
+  previousVersionId,
+}) {
+  const ordinal     = (entity.versions?.length || 0) + 1;
+  const versionId   = _makeVersionId(entity.id, ordinal);
+  const eff         = effectiveAt ?? ingestAt;
+  return {
+    versionId,
+    text,
+    vector,
+    timestamp:   ingestAt,    // legacy alias kept for back-compat
+    ingestAt,
+    effectiveAt: eff,
+    validFrom:   eff,
+    validTo:     null,
+    previousVersionId: previousVersionId || null,
+    delta,
+    source,
+    classification,
+    linkIds: linkSnapshot,
+    action,
+    who:  who || null,
+    why:  (typeof why === "string" && why.length) ? why : null,
+  };
+}
+
+// Snapshot an entity version into a trail-event projection.
+function _versionToTrailEvent(entity, v) {
+  return {
+    entityId:          entity.id,
+    versionId:         v.versionId,
+    action:            v.action,
+    who:               v.who || null,
+    why:               v.why ?? null,
+    effectiveAt:       v.effectiveAt ?? v.timestamp,
+    ingestAt:          v.ingestAt    ?? v.timestamp,
+    previousVersionId: v.previousVersionId || null,
+    source:            v.source || entity.source || { type: "user" },
+    contentChanged:    true,
+    deltaSummary:      v.delta?.summary || null,
+    classification:    v.classification || entity.classification || "internal",
+  };
+}
+
 // ─── Shared Entity Serialization ─────────────────────────────────────────────
 // Single source of truth for entity → DTO conversion. Fields are already
 // normalized at write-time, so no re-normalization needed on read.
@@ -277,6 +378,7 @@ async function init(overrides = {}) {
   const { FileStore } = require("./store/file-store");
   store = new FileStore();
   await _loadStore();
+  _loadCheckpoints();
 
   _pool = new WorkerPool(os.cpus().length);
   _pool.start();
@@ -336,6 +438,40 @@ function _normalizeRaw(raw) {
       raw.versions[0].timestamp < raw.versions[raw.versions.length - 1].timestamp) {
     raw.versions.reverse();
   }
+
+  // Lazy back-compat: synthesise audit fields on legacy version records that
+  // were written before the trail shape existed. We walk oldest-first so
+  // previousVersionId chains correctly. Newly-written versions already carry
+  // these fields; we only fill what's missing.
+  if (raw.versions.length > 0) {
+    const oldestFirst = [...raw.versions].reverse();
+    let prevVersionId = null;
+    for (let i = 0; i < oldestFirst.length; i++) {
+      const v = oldestFirst[i];
+      if (!v.versionId)         v.versionId   = _makeVersionId(raw.id, i + 1);
+      if (v.ingestAt == null)   v.ingestAt    = v.timestamp;
+      if (v.effectiveAt == null) v.effectiveAt = v.timestamp;
+      if (v.validFrom == null)  v.validFrom   = v.effectiveAt;
+      if (v.validTo === undefined) {
+        // Closed by the next version; latest stays open until forgotten.
+        v.validTo = (i < oldestFirst.length - 1)
+          ? (oldestFirst[i + 1].effectiveAt ?? oldestFirst[i + 1].timestamp)
+          : null;
+      }
+      if (!v.previousVersionId) v.previousVersionId = prevVersionId;
+      if (v.who === undefined)  v.who = null;
+      if (v.why === undefined)  v.why = null;
+      if (!v.action)            v.action = synthesizeAction(i, v.delta);
+      prevVersionId = v.versionId;
+    }
+    // If the entity is soft-deleted, the latest version's validTo should be
+    // closed at deletedAt rather than left open.
+    if (raw.deletedAt && raw.versions[0]?.validTo == null) {
+      raw.versions[0].validTo = raw.deletedAt;
+    }
+  }
+
+  if (!Array.isArray(raw.trailEvents)) raw.trailEvents = [];
 
   return raw;
 }
@@ -519,7 +655,7 @@ function _relinkEntity(entity) {
  * @param {{ type?, timestamp?, metadata?, tags?, source?, classification? }} opts
  * @returns {number} stable entity ID (never changes across updates)
  */
-async function ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false } = {}) {
+async function ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false, who, why, effectiveAt } = {}) {
   _assertInit();
 
   const ts       = timestamp || Date.now();
@@ -534,6 +670,9 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
   const ret      = _normalizeRetention(retention);
   const mt       = _normalizeMemoryType(memoryType);
   const ws       = _normalizeWorkspaceId(workspaceId);
+  const whoNorm  = _normalizeWho(who);
+  const effectiveAtMs = _normalizeTimestampInput(effectiveAt, "effectiveAt");
+  const whyText  = (typeof why === "string" && why.trim().length) ? why.trim().slice(0, 500) : null;
 
   // Workspace write check: caller must be allowed to write to the target workspace
   if (allowedWorkspaces && !allowedWorkspaces.includes(ws)) {
@@ -586,12 +725,93 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
 
     // ── Update / Consolidation path: merge into existing entity ─────────────
     if (mergeTarget) {
+      const latest = mergeTarget.versions[0];
+      const sameContent = latest && latest.text === safeText;
+      const sameSource  = latest && (latest.source?.type === src.type)
+                                  && ((latest.source?.actor || null) === (src.actor || null))
+                                  && ((latest.source?.uri   || null) === (src.uri   || null));
+
+      // ── Reaffirmed: identical content + identical source ─────────────────
+      // Skip a new content version; record a metadata-only trail event so the
+      // audit log still captures that a write happened.
+      if (sameContent && sameSource) {
+        const reaffirmEvent = {
+          entityId:          mergeTarget.id,
+          versionId:         _makeVersionId(mergeTarget.id, mergeTarget.versions.length + 1) + ":reaffirmed",
+          action:            ACTIONS.reaffirmed,
+          who:               whoNorm,
+          why:               whyText,
+          effectiveAt:       effectiveAtMs ?? ts,
+          ingestAt:          ts,
+          previousVersionId: latest.versionId || null,
+          source:            src,
+          contentChanged:    false,
+          deltaSummary:      null,
+          classification:    cls,
+        };
+        _appendTrailEvent(mergeTarget, reaffirmEvent);
+        // Refresh updatedAt so recency-aware features still notice the touch,
+        // but keep text/vector untouched.
+        mergeTarget.updatedAt = ts;
+        if (Number.isFinite(trustScore)) mergeTarget.trustScore = Math.max(0, Math.min(1, trustScore));
+        _persistAll();
+        console.log(`[kalairos] Reaffirmed entity ${mergeTarget.id} (no content change)`);
+        return mergeTarget.id;
+      }
+
       const delta = buildDelta(mergeTarget.text, mergeTarget.vector, safeText, vector);
       if (isConsolidation) delta.type = "consolidation";
 
+      // Action selection: correction → corrected, anything else → superseded.
+      const action = delta.type === "correction" ? ACTIONS.corrected : ACTIONS.superseded;
+
       // Snapshot current linkIds before relink so the version captures the graph at this point
       const linkSnapshot = Array.from(mergeTarget.links);
-      mergeTarget.versions.unshift({ text: safeText, vector, timestamp: ts, delta, source: src, classification: cls, linkIds: linkSnapshot });
+
+      // Close validTo on the prior latest version — its valid interval ends
+      // when this new one becomes effective.
+      const newEffectiveAt = effectiveAtMs ?? ts;
+      if (latest) latest.validTo = newEffectiveAt;
+
+      const versionRecord = _buildVersionRecord({
+        entity:            mergeTarget,
+        text:              safeText,
+        vector,
+        ingestAt:          ts,
+        effectiveAt:       newEffectiveAt,
+        delta,
+        source:            src,
+        classification:    cls,
+        linkSnapshot,
+        action,
+        who:               whoNorm,
+        why:               whyText,
+        previousVersionId: latest?.versionId || null,
+      });
+      mergeTarget.versions.unshift(versionRecord);
+
+      // Contested event: contradiction severity ≥ 0.7 (numeric flip or
+      // negation flip) gets an explicit trail breadcrumb in addition to the
+      // superseded/corrected version. Lower severities are already captured
+      // by the delta alone.
+      const severity = Number(delta.contradictionSeverity || 0);
+      if (severity >= 0.7) {
+        _appendTrailEvent(mergeTarget, {
+          entityId:          mergeTarget.id,
+          versionId:         versionRecord.versionId + ":contested",
+          action:            ACTIONS.contested,
+          who:               whoNorm,
+          why:               whyText || delta.summary || null,
+          effectiveAt:       newEffectiveAt,
+          ingestAt:          ts,
+          previousVersionId: latest?.versionId || null,
+          source:            src,
+          contentChanged:    false,
+          deltaSummary:      delta.summary || null,
+          classification:    cls,
+          contradictionSeverity: severity,
+        });
+      }
 
       if (CFG.maxVersions > 0 && mergeTarget.versions.length > CFG.maxVersions) {
         mergeTarget.versions.length = CFG.maxVersions;
@@ -626,6 +846,8 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     // ── Create path: brand new entity ───────────────────────────────────────
     const id     = _newId();
     const enrichedMeta = llmEnrichment ? { ...metadata, llm: llmEnrichment } : metadata;
+    const initialEffectiveAt = effectiveAtMs ?? ts;
+    const initialVersionId   = _makeVersionId(id, 1);
     const entity = {
       id, type,
       text:      safeText,
@@ -647,7 +869,25 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       links:     new Set(),
       createdAt: ts,
       updatedAt: ts,
-      versions:  [{ text: safeText, vector, timestamp: ts, delta: null, source: src, classification: cls, linkIds: [] }],
+      versions:  [{
+        versionId:         initialVersionId,
+        text:              safeText,
+        vector,
+        timestamp:         ts,
+        ingestAt:          ts,
+        effectiveAt:       initialEffectiveAt,
+        validFrom:         initialEffectiveAt,
+        validTo:           null,
+        previousVersionId: null,
+        delta:             null,
+        source:            src,
+        classification:    cls,
+        linkIds:           [],
+        action:            ACTIONS.remembered,
+        who:               whoNorm,
+        why:               whyText,
+      }],
+      trailEvents: [],
     };
 
     store.set(id, entity);
@@ -668,6 +908,20 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
  */
 async function remember(text, opts = {}) {
   const source = opts.source || { type: "agent" };
+  let who = opts.who;
+  // If the caller didn't tell us who is writing, fall back to an anonymous
+  // marker and warn once per process. Scoped writes auto-fill `who.agent`
+  // and never hit this branch.
+  if (!who) {
+    who = { agent: "anon" };
+    if (!_anonRememberWarned) {
+      _anonRememberWarned = true;
+      console.warn(
+        "[kalairos] remember() was called without `who`. Trail events will be attributed to \"anon\". " +
+        "Use kalairos.scope({ source: { type: 'agent', actor: name } }) so writes carry agent identity."
+      );
+    }
+  }
   return ingest(text, {
     ...opts,
     source,
@@ -675,6 +929,9 @@ async function remember(text, opts = {}) {
     importance:     opts.importance,
     trustScore:     opts.trustScore,
     allowedWorkspaces: opts.allowedWorkspaces,
+    who,
+    why:         opts.why,
+    effectiveAt: opts.effectiveAt,
   });
 }
 
@@ -1256,7 +1513,7 @@ async function getMany(ids, { allowedWorkspaces } = {}) {
  * @param {number|string} id
  * @param {{ deletedBy?: string|object }} opts
  */
-async function remove(id, { deletedBy, allowedWorkspaces } = {}) {
+async function remove(id, { deletedBy, allowedWorkspaces, reason, who } = {}) {
   _assertInit();
   return _withWriteLock(() => {
     const numId = Number(id) || id;
@@ -1266,11 +1523,93 @@ async function remove(id, { deletedBy, allowedWorkspaces } = {}) {
     if (e.deletedAt) throw emitError(Err.alreadyDeleted(id));
 
     _unlinkEntity(e, numId);
-    e.deletedAt = Date.now();
+    const now = Date.now();
+    e.deletedAt = now;
     e.deletedBy = deletedBy ? _normalizeSource(deletedBy) : null;
+
+    // Close validTo on the latest version — the fact stops being current at
+    // the moment of forgetting.
+    const latest = e.versions?.[0];
+    if (latest && latest.validTo == null) latest.validTo = now;
+
+    _appendTrailEvent(e, {
+      entityId:          e.id,
+      versionId:         _makeVersionId(e.id, (e.versions?.length || 0) + 1) + ":forgotten",
+      action:            ACTIONS.forgotten,
+      who:               _normalizeWho(who),
+      why:               (typeof reason === "string" && reason.trim()) ? reason.trim().slice(0, 500) : null,
+      effectiveAt:       now,
+      ingestAt:          now,
+      previousVersionId: latest?.versionId || null,
+      source:            e.deletedBy || e.source || { type: "system" },
+      contentChanged:    false,
+      deltaSummary:      null,
+      classification:    e.classification || "internal",
+    });
 
     _persistAll();
     console.log(`[kalairos] Soft-deleted entity ${numId}`);
+  });
+}
+
+/**
+ * Forget an entity with an explicit reason and audit trail. First-class verb
+ * that pairs with `restore(id)` for reversible soft deletion.
+ *
+ * @param {number|string} id
+ * @param {{ reason?: string, who?: object, effectiveAt?: number|string, allowedWorkspaces? }} [opts]
+ */
+async function forget(id, { reason, who, effectiveAt, allowedWorkspaces } = {}) {
+  // effectiveAt is accepted for API symmetry with remember() — we forward it
+  // through the trail event timestamp via remove() if supplied.
+  if (effectiveAt != null) {
+    // Only validate; the trail event uses ts for ingestAt regardless.
+    _normalizeTimestampInput(effectiveAt, "effectiveAt");
+  }
+  return remove(id, { reason, who, allowedWorkspaces });
+}
+
+/**
+ * Restore a previously soft-deleted entity. Clears deletedAt, reopens
+ * validTo on the latest version, and appends a `restored` trail event.
+ *
+ * @param {number|string} id
+ * @param {{ reason?: string, who?: object, allowedWorkspaces? }} [opts]
+ */
+async function restore(id, { reason, who, allowedWorkspaces } = {}) {
+  _assertInit();
+  return _withWriteLock(() => {
+    const numId = Number(id) || id;
+    const e = store.get(numId);
+    if (!e) throw emitError(Err.notFound(id));
+    if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No admin access to workspace "${e.workspaceId || "default"}".`));
+    if (!e.deletedAt) throw emitError(Err.validation(`Entity ${numId} is not deleted; nothing to restore.`));
+
+    const now = Date.now();
+    e.deletedAt = null;
+    e.deletedBy = null;
+
+    const latest = e.versions?.[0];
+    if (latest) latest.validTo = null;
+
+    _appendTrailEvent(e, {
+      entityId:          e.id,
+      versionId:         _makeVersionId(e.id, (e.versions?.length || 0) + 1) + ":restored",
+      action:            ACTIONS.restored,
+      who:               _normalizeWho(who),
+      why:               (typeof reason === "string" && reason.trim()) ? reason.trim().slice(0, 500) : null,
+      effectiveAt:       now,
+      ingestAt:          now,
+      previousVersionId: latest?.versionId || null,
+      source:            e.source || { type: "system" },
+      contentChanged:    false,
+      deltaSummary:      null,
+      classification:    e.classification || "internal",
+    });
+
+    _persistAll();
+    console.log(`[kalairos] Restored entity ${numId}`);
+    return _serializeEntity(e);
   });
 }
 
@@ -1520,14 +1859,24 @@ async function getHistory(id, { allowedWorkspaces } = {}) {
     current: e.text,
     versionCount: e.versions.length,
     versions: versionsOldestFirst.map((v, i) => ({
-      version:        i + 1,
-      text:           v.text,
-      timestamp:      v.timestamp,
-      delta:          v.delta || null,
-      source:         v.source || e.source || { type: "user" },
-      classification: v.classification || e.classification || "internal",
-      linkIds:        v.linkIds || [],
+      version:           i + 1,
+      versionId:         v.versionId || _makeVersionId(e.id, i + 1),
+      text:              v.text,
+      timestamp:         v.timestamp,
+      ingestAt:          v.ingestAt    ?? v.timestamp,
+      effectiveAt:       v.effectiveAt ?? v.timestamp,
+      validFrom:         v.validFrom   ?? v.effectiveAt ?? v.timestamp,
+      validTo:           v.validTo === undefined ? null : v.validTo,
+      previousVersionId: v.previousVersionId || null,
+      action:            v.action || synthesizeAction(i, v.delta),
+      who:               v.who ?? null,
+      why:               v.why ?? null,
+      delta:             v.delta || null,
+      source:            v.source || e.source || { type: "user" },
+      classification:    v.classification || e.classification || "internal",
+      linkIds:           v.linkIds || [],
     })),
+    trailEvents: [...(e.trailEvents || [])].reverse(), // oldest-first for readability
   };
 }
 
@@ -1810,7 +2159,7 @@ async function getDrift(id, { allowedWorkspaces } = {}) {
  * @param {{ trustScore?, verified?, notes?, memoryType?, allowedWorkspaces? }} opts
  * @returns {object} updated serialized entity
  */
-async function annotate(id, { trustScore, verified, notes, memoryType, allowedWorkspaces } = {}) {
+async function annotate(id, { trustScore, verified, notes, memoryType, classification, who, why, allowedWorkspaces } = {}) {
   _assertInit();
   return _withWriteLock(() => {
     const numId = Number(id) || id;
@@ -1819,11 +2168,61 @@ async function annotate(id, { trustScore, verified, notes, memoryType, allowedWo
     if (!_isAlive(e)) throw emitError(Err.alreadyDeleted(id));
     if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No access to workspace "${e.workspaceId || "default"}".`));
 
-    if (Number.isFinite(trustScore)) e.trustScore = Math.max(0, Math.min(1, trustScore));
-    if (notes !== undefined)         e.metadata = { ...e.metadata, notes: String(notes).slice(0, 500) };
-    if (verified !== undefined)      e.metadata = { ...e.metadata, verified: !!verified, verifiedAt: Date.now() };
-    if (memoryType)                  e.memoryType = _normalizeMemoryType(memoryType);
+    const diff = {};
+    if (Number.isFinite(trustScore) && e.trustScore !== Math.max(0, Math.min(1, trustScore))) {
+      diff.trustScore = { from: e.trustScore, to: Math.max(0, Math.min(1, trustScore)) };
+      e.trustScore = diff.trustScore.to;
+    }
+    if (notes !== undefined) {
+      const next = String(notes).slice(0, 500);
+      if (next !== e.metadata?.notes) {
+        diff.notes = { from: e.metadata?.notes ?? null, to: next };
+        e.metadata = { ...e.metadata, notes: next };
+      }
+    }
+    if (verified !== undefined) {
+      const next = !!verified;
+      if (next !== !!e.metadata?.verified) {
+        diff.verified = { from: !!e.metadata?.verified, to: next };
+        e.metadata = { ...e.metadata, verified: next, verifiedAt: Date.now() };
+      }
+    }
+    if (memoryType) {
+      const next = _normalizeMemoryType(memoryType);
+      if (next !== e.memoryType) {
+        diff.memoryType = { from: e.memoryType, to: next };
+        e.memoryType = next;
+      }
+    }
+    if (classification) {
+      const next = _normalizeClassification(classification);
+      if (next !== e.classification) {
+        diff.classification = { from: e.classification, to: next };
+        e.classification = next;
+      }
+    }
     // updatedAt intentionally not changed — this is metadata, not a content update
+
+    // Trail event: only emit when something actually changed.
+    if (Object.keys(diff).length > 0) {
+      const now = Date.now();
+      const latest = e.versions?.[0];
+      _appendTrailEvent(e, {
+        entityId:          e.id,
+        versionId:         _makeVersionId(e.id, (e.versions?.length || 0) + 1) + ":annotated",
+        action:            ACTIONS.annotated,
+        who:               _normalizeWho(who),
+        why:               (typeof why === "string" && why.trim()) ? why.trim().slice(0, 500) : null,
+        effectiveAt:       now,
+        ingestAt:          now,
+        previousVersionId: latest?.versionId || null,
+        source:            e.source || { type: "user" },
+        contentChanged:    false,
+        deltaSummary:      null,
+        classification:    e.classification || "internal",
+        diff,
+      });
+    }
 
     _persistAll();
     console.log(`[kalairos] Annotated entity ${numId} (trust=${e.trustScore?.toFixed(2)}, verified=${e.metadata?.verified ?? "–"})`);
@@ -1946,6 +2345,280 @@ async function getStartupSummary({
   };
 }
 
+// ─── Trail (read-only audit projection) ──────────────────────────────────────
+// trail() is a pure projection over every entity's versions[] and trailEvents[].
+// It owns no storage of its own — every event is derived from data already
+// persisted by ingest/forget/restore/annotate. Lazy back-compat in
+// _normalizeRaw() means this works for entities written before the trail shape
+// existed.
+//
+// Trust changes that are reflected only in scoring (e.g. recency-weighted decay)
+// are NOT trail events. Only explicit annotate({ trustScore }) calls and
+// contradiction-flagging produce trail entries.
+
+function _matchesWho(eventWho, filterWho) {
+  if (!filterWho) return true;
+  if (!eventWho) return false;
+  if (filterWho.agent && eventWho.agent !== filterWho.agent) return false;
+  if (filterWho.user  && eventWho.user  !== filterWho.user)  return false;
+  return true;
+}
+
+function _collectTrailEvents(entity, allowedWorkspaces) {
+  if (allowedWorkspaces && !_wsAllowed(entity, allowedWorkspaces)) return [];
+  const out = [];
+  // Content versions → events (oldest-first within the entity)
+  const versionsOldestFirst = [...(entity.versions || [])].reverse();
+  for (const v of versionsOldestFirst) {
+    out.push(_versionToTrailEvent(entity, v));
+  }
+  // Metadata-only trail events (oldest-first)
+  const trailOldestFirst = [...(entity.trailEvents || [])].reverse();
+  for (const ev of trailOldestFirst) out.push({ ...ev });
+  return out;
+}
+
+/**
+ * Read-only projection of every memory mutation across the store. Sorted by
+ * ingestAt ascending; stable across restarts.
+ *
+ * @param {{ entity?, workspace?, since?, until?, action?, who?, checkpoint?, limit?, allowedWorkspaces? }} [opts]
+ * @returns {Array<object>} trail events
+ */
+async function trail(opts = {}) {
+  _assertInit();
+  const {
+    entity:     entityFilter,
+    workspace,
+    since,
+    until,
+    action,
+    who:        whoFilter,
+    checkpoint: checkpointName,
+    limit       = 100,
+    allowedWorkspaces,
+  } = opts;
+
+  const sinceMs = since != null ? _normalizeTimestampInput(since, "since") : null;
+  const untilMs = until != null ? _normalizeTimestampInput(until, "until") : null;
+  const safeLimit = Math.max(1, Math.min(1000, Number(limit) || 100));
+
+  const actionSet = action == null
+    ? null
+    : new Set(Array.isArray(action) ? action.map(String) : [String(action)]);
+  if (actionSet) {
+    for (const a of actionSet) {
+      if (!isValidAction(a)) {
+        throw emitError(Err.validation(`Unknown action filter "${a}". Must be one of: ${Object.values(ACTIONS).join(", ")}`));
+      }
+    }
+  }
+
+  // Resolve target entities
+  let entities;
+  if (entityFilter != null) {
+    const e = store.get(Number(entityFilter) || entityFilter);
+    entities = e ? [e] : [];
+  } else {
+    entities = Array.from(store.values());
+  }
+
+  let events = [];
+  for (const e of entities) {
+    if (workspace && (e.workspaceId || "default") !== workspace) continue;
+    events.push(..._collectTrailEvents(e, allowedWorkspaces));
+  }
+
+  if (sinceMs   != null) events = events.filter(ev => ev.ingestAt >= sinceMs);
+  if (untilMs   != null) events = events.filter(ev => ev.ingestAt <= untilMs);
+  if (actionSet)         events = events.filter(ev => actionSet.has(ev.action));
+  if (whoFilter)         events = events.filter(ev => _matchesWho(ev.who, whoFilter));
+
+  // Checkpoint filter — frozen sets win; live re-evaluates the filter now.
+  if (checkpointName) {
+    const cp = _checkpoints.get(checkpointName);
+    if (!cp) throw emitError(Err.notFound(`checkpoint:${checkpointName}`));
+    if (cp.frozen) {
+      const ids = new Set(cp.eventIds || []);
+      events = events.filter(ev => ids.has(ev.versionId));
+    } else {
+      events = _applyCheckpointFilter(events, cp.filter);
+    }
+  }
+
+  events.sort((a, b) => a.ingestAt - b.ingestAt);
+  return events.slice(0, safeLimit);
+}
+
+// ─── Checkpoints ─────────────────────────────────────────────────────────────
+// Named, append-only markers around a slice of the trail. Frozen by default —
+// the matching event-id set is captured at creation, so backdated writes do
+// not re-enter the checkpoint after the fact.
+
+const _checkpoints = new Map(); // name → record
+
+function _checkpointsFile() {
+  const data = CFG.dataFile;
+  if (!data || data === ":memory:") return null;
+  return data + ".checkpoints";
+}
+
+function _loadCheckpoints() {
+  _checkpoints.clear();
+  const file = _checkpointsFile();
+  if (!file || !fs.existsSync(file)) return;
+  try {
+    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        const cp = JSON.parse(line);
+        if (cp && cp.name) _checkpoints.set(cp.name, cp);
+      } catch {
+        console.warn(`[kalairos] checkpoints: skipping malformed line: ${line.slice(0, 80)}`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[kalairos] checkpoints: load failed: ${err.message}`);
+  }
+}
+
+function _persistCheckpoint(cp) {
+  const file = _checkpointsFile();
+  if (!file) return;
+  fs.appendFileSync(file, JSON.stringify(cp) + "\n");
+}
+
+function _normalizeCheckpointFilter(opts) {
+  const filter = {};
+  if (opts.during) {
+    if (!Array.isArray(opts.during) || opts.during.length !== 2) {
+      throw emitError(Err.validation("checkpoint.during must be a [from, to] pair"));
+    }
+    filter.during = [
+      _normalizeTimestampInput(opts.during[0], "checkpoint.during[0]"),
+      _normalizeTimestampInput(opts.during[1], "checkpoint.during[1]"),
+    ];
+  }
+  if (opts.entity != null) {
+    filter.entity = Array.isArray(opts.entity)
+      ? opts.entity.map(x => Number(x) || x)
+      : [Number(opts.entity) || opts.entity];
+  }
+  if (Array.isArray(opts.tags) && opts.tags.length) {
+    filter.tags = opts.tags.map(String);
+  }
+  if (opts.workspace) filter.workspace = String(opts.workspace);
+  if (opts.action) {
+    filter.action = Array.isArray(opts.action) ? opts.action.map(String) : [String(opts.action)];
+  }
+  return filter;
+}
+
+function _applyCheckpointFilter(events, filter) {
+  let out = events;
+  if (filter.during) {
+    const [from, to] = filter.during;
+    out = out.filter(ev => ev.ingestAt >= from && ev.ingestAt <= to);
+  }
+  if (filter.entity) {
+    const ids = new Set(filter.entity);
+    out = out.filter(ev => ids.has(ev.entityId));
+  }
+  if (filter.action) {
+    const actions = new Set(filter.action);
+    out = out.filter(ev => actions.has(ev.action));
+  }
+  if (filter.tags) {
+    const wanted = new Set(filter.tags);
+    out = out.filter(ev => {
+      const ent = store.get(ev.entityId);
+      if (!ent) return false;
+      return (ent.tags || []).some(t => wanted.has(t));
+    });
+  }
+  if (filter.workspace) {
+    out = out.filter(ev => {
+      const ent = store.get(ev.entityId);
+      return ent && (ent.workspaceId || "default") === filter.workspace;
+    });
+  }
+  return out;
+}
+
+/**
+ * Create a named checkpoint over the trail. Frozen-by-default — the matching
+ * event-id set is captured at creation time, so future backdated events do
+ * not retroactively join this checkpoint.
+ *
+ * @param {string} name — must be unique across the store
+ * @param {{ during?, entity?, tags?, workspace?, action?, why?, live? }} [opts]
+ * @returns {{ name, createdAt, frozen, eventIds?, filter, why? }}
+ */
+async function checkpoint(name, opts = {}) {
+  _assertInit();
+  const cpName = String(name || "").trim();
+  if (!cpName) throw emitError(Err.validation("checkpoint name is required"));
+
+  return _withWriteLock(() => {
+    const ws = opts.workspace || null;
+    // Names must be unique within a workspace (or globally if no workspace).
+    for (const existing of _checkpoints.values()) {
+      if (existing.name === cpName && (existing.filter?.workspace || null) === ws) {
+        throw emitError(Err.validation(`checkpoint "${cpName}" already exists in workspace "${ws || "default"}"`));
+      }
+    }
+
+    const filter = _normalizeCheckpointFilter(opts);
+    const live   = !!opts.live;
+    const why    = (typeof opts.why === "string" && opts.why.trim()) ? opts.why.trim().slice(0, 500) : null;
+
+    // Snapshot the matching events now so a frozen checkpoint never moves.
+    let eventIds;
+    if (!live) {
+      const all = [];
+      for (const e of store.values()) all.push(..._collectTrailEvents(e));
+      const matched = _applyCheckpointFilter(all, filter);
+      eventIds = matched.map(ev => ev.versionId).filter(Boolean);
+    }
+
+    const record = {
+      name:      cpName,
+      createdAt: Date.now(),
+      frozen:    !live,
+      filter,
+      why,
+    };
+    if (!live) record.eventIds = eventIds;
+
+    _checkpoints.set(cpName, record);
+    _persistCheckpoint(record);
+    console.log(`[kalairos] Created checkpoint "${cpName}" (${live ? "live" : `frozen, ${eventIds.length} events`})`);
+    return { ...record };
+  });
+}
+
+/**
+ * Look up a single checkpoint by name. Returns null when not found.
+ */
+async function getCheckpoint(name) {
+  _assertInit();
+  const cp = _checkpoints.get(String(name || ""));
+  return cp ? { ...cp } : null;
+}
+
+/**
+ * List all checkpoints in the store, optionally scoped to a workspace.
+ * @param {{ workspace? }} [opts]
+ */
+async function listCheckpoints({ workspace } = {}) {
+  _assertInit();
+  const all = Array.from(_checkpoints.values());
+  const filtered = workspace
+    ? all.filter(cp => (cp.filter?.workspace || null) === workspace)
+    : all;
+  return filtered.map(cp => ({ ...cp }));
+}
+
 // ─── Shutdown ─────────────────────────────────────────────────────────────────
 
 /**
@@ -2042,6 +2715,16 @@ module.exports = {
   buildChangelog,
   // Provenance & trust
   annotate,
+  // Forget / restore as first-class verbs
+  forget,
+  restore,
+  // Audit trail + named checkpoints
+  trail,
+  checkpoint,
+  getCheckpoint,
+  listCheckpoints,
+  // Action vocabulary
+  ACTIONS,
   shutdown,
   scope,
   createAgent,

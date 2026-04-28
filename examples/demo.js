@@ -91,20 +91,28 @@ async function main() {
 
   section(1, "Layer 1 — init, remember, query");
 
-  code('kalairos.remember("Revenue target is $10M for Q3")');
-  const id1 = await kalairos.remember("Revenue target is $10M for Q3");
+  code('kalairos.remember("Employees must submit reports by Friday", { source: { type: "policy", actor: "HR" } })');
+  const id1 = await kalairos.remember("Employees must submit reports by Friday", {
+    who:    { agent: "policy-bot", onBehalfOf: "HR" },
+    source: { type: "policy", actor: "HR" },
+  });
   result(`Stored as entity ${bold(String(id1))}`);
 
   const tBeforeUpdate = Date.now();
   await sleep(60);
 
-  code('kalairos.remember("Revenue target revised to $12M for Q3")');
-  await kalairos.remember("Revenue target revised to $12M for Q3");
+  code('kalairos.remember("Deadline changed to Wednesday", { effectiveAt: "2026-04-15", why: "Policy update from HR memo" })');
+  await kalairos.remember("Deadline changed to Wednesday", {
+    who:         { agent: "policy-bot", onBehalfOf: "HR" },
+    why:         "Policy update from HR memo",
+    source:      { type: "policy", actor: "HR", ref: "hr-memo-2026-04-15" },
+    effectiveAt: "2026-04-15",
+  });
   result(`Updated entity ${bold(String(id1))} ${dim("→ version 2")}`);
   note("Same entity detected automatically — no ID required.");
 
-  code('kalairos.query("revenue target")');
-  const current = await kalairos.query("revenue target");
+  code('kalairos.query("report deadline")');
+  const current = await kalairos.query("report deadline");
   if (current.results && current.results.length > 0) {
     result(`"${current.results[0].text}" ${dim("(current)")}`);
   } else {
@@ -115,8 +123,9 @@ async function main() {
 
   section(2, "Layer 2 — Time-aware memory");
 
-  code('kalairos.queryAt("revenue target", <before update>)');
-  const past = await kalairos.queryAt("revenue target", tBeforeUpdate);
+  code('kalairos.queryAt("report deadline", lastWeek)');
+  const lastWeek = Date.now() - 7 * 86_400_000;
+  const past = await kalairos.queryAt("report deadline", Math.max(lastWeek, tBeforeUpdate));
   if (past.results && past.results.length > 0) {
     result(`"${past.results[0].text}" ${dim("(what was true then)")}`);
   } else {
@@ -129,9 +138,21 @@ async function main() {
     for (const v of history.versions) {
       const delta = v.delta ? dim(` — ${v.delta.summary}`) : "";
       const flag  = v.delta && v.delta.contradicts ? yellow(" [CONTRADICTION]") : "";
-      result(`v${v.version}: "${v.text}"${delta}${flag}`);
+      result(`v${v.version} [${v.action}]: "${v.text}"${delta}${flag}`);
     }
   }
+
+  code(`kalairos.trail({ entity: ${id1} })`);
+  const trail = await kalairos.trail({ entity: id1 });
+  for (const ev of trail) {
+    const who = ev.who?.agent ? dim(` by ${ev.who.agent}`) : "";
+    const why = ev.why ? dim(` — ${ev.why}`) : "";
+    result(`${ev.action}${who}${why}`);
+  }
+
+  code('kalairos.checkpoint("policy-snapshot", { entity: id1, why: "audit reference" })');
+  const cp = await kalairos.checkpoint("policy-snapshot", { entity: id1, why: "audit reference" });
+  result(`Checkpoint frozen with ${bold(String((cp.eventIds || []).length))} event(s)`);
 
   // ── Layer 3: advanced maintenance ──────────────────────────────────────────
 

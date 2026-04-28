@@ -1569,14 +1569,24 @@ async function remove(id, { deletedBy, allowedWorkspaces, reason, who } = {}) {
  * @param {number|string} id
  * @param {{ reason?: string, who?: object, effectiveAt?: number|string, allowedWorkspaces? }} [opts]
  */
-async function forget(id, { reason, who, effectiveAt, allowedWorkspaces } = {}) {
+async function forget(id, { reason, who, deletedBy, effectiveAt, allowedWorkspaces } = {}) {
   // effectiveAt is accepted for API symmetry with remember() — we forward it
   // through the trail event timestamp via remove() if supplied.
   if (effectiveAt != null) {
     // Only validate; the trail event uses ts for ingestAt regardless.
     _normalizeTimestampInput(effectiveAt, "effectiveAt");
   }
-  return remove(id, { reason, who, allowedWorkspaces });
+  // If the caller passed `who` (the principal performing the forget) but no
+  // explicit `deletedBy`, derive source attribution from it so the entity's
+  // deletedBy field reflects the actor. Scoped agent handles call us with
+  // who={agent: name}; without this mapping, deletedBy stays null and the
+  // audit trail loses the "who deleted this" signal.
+  let derivedDeletedBy = deletedBy;
+  if (!derivedDeletedBy && who && typeof who === "object") {
+    if (who.agent) derivedDeletedBy = { type: "agent", actor: String(who.agent) };
+    else if (who.user) derivedDeletedBy = { type: "user", actor: String(who.user) };
+  }
+  return remove(id, { reason, who, deletedBy: derivedDeletedBy, allowedWorkspaces });
 }
 
 /**

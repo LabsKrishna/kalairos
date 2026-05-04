@@ -33,6 +33,7 @@
     "start": "node server.js",
     "postinstall": "node scripts/download-model.js || true",
     "test": "node test-basic.js && node test-versioning.js && node test-agent-simulation.js && node test-scope.js && node test-sqlite-index.js",
+    "test:coverage": "c8 --reporter=text --reporter=lcov npm test",
     "bench": "node bench/agent-memory/run-all.js",
     "bench:real": "node bench/agent-memory/bench-eval-real.js",
     "bench:latency": "node bench/latency.js",
@@ -73,7 +74,14 @@
   "homepage": "https://github.com/LabsKrishna/kalairos#readme",
   "type": "commonjs",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/LabsKrishna"
+  },
+  "devDependencies": {
+    "c8": "^10.1.3"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

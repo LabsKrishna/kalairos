@@ -24,8 +24,26 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
+      # Plain test runs on every matrix combo EXCEPT node-22, where the
+      # coverage-instrumented variant runs in its place (same suite, plus
+      # c8 instrumentation). Coverage is only uploaded from ubuntu-22 —
+      # the canonical platform — to avoid duplicate uploads from the
+      # macos/windows runners on the same commit.
       - run: npm test
-      - if: matrix.os == 'ubuntu-latest'
+        if: matrix.node-version != 22
+      - name: Test with coverage
+        run: npm run test:coverage
+        if: matrix.node-version == 22
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == 22
+        with:
+          files: ./coverage/lcov.info
+          fail_ci_if_error: false
+      # Agent-memory benchmark gates only on ubuntu-22 — perf thresholds
+      # are Linux-calibrated, and we don't need the same numbers from
+      # every matrix combo.
+      - if: matrix.os == 'ubuntu-latest' && matrix.node-version == 22
         run: npm run bench
 
   poisoning:

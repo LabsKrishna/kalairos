@@ -19,7 +19,19 @@ jobs:
           node-version: ${{ matrix.node-version }}
       - run: npm ci
       - run: npm test
+        if: matrix.node-version != 22
+      - name: Test with coverage
+        run: npm run test:coverage
+        if: matrix.node-version == 22
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: matrix.node-version == 22
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          fail_ci_if_error: false
       - run: npm run bench
+        if: matrix.node-version == 22
 
   poisoning:
     # CLAUDE.md §17: poisoning benchmark is a CI gate. The runner already

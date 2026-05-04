@@ -4,6 +4,8 @@
 [![npm downloads](https://img.shields.io/npm/dw/kalairos.svg)](https://www.npmjs.com/package/kalairos)
 [![license](https://img.shields.io/npm/l/kalairos.svg)](https://github.com/LabsKrishna/kalairos/blob/main/LICENSE)
 [![node](https://img.shields.io/node/v/kalairos.svg)](https://www.npmjs.com/package/kalairos)
+[![codecov](https://codecov.io/gh/LabsKrishna/kalairos/graph/badge.svg)](https://codecov.io/gh/LabsKrishna/kalairos)
+[![CI](https://github.com/LabsKrishna/kalairos/actions/workflows/ci.yml/badge.svg)](https://github.com/LabsKrishna/kalairos/actions/workflows/ci.yml)
 
 > **Most systems store what is true. Kalairos stores what was true when decisions were made.**
 

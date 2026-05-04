@@ -1,7 +1,7 @@
 {
   "name": "kalairos",
-  "version": "1.4.2",
-  "description": "Durable, private, time-aware memory engine for long-running AI agents",
+  "version": "1.4.3",
+  "description": "AI agent memory with time-travel — versioned, local-first, MCP-ready. For LLM backends that need to know what was true then, not just now.",
   "main": "./index.js",
   "exports": {
     ".": {
@@ -39,6 +39,19 @@
     "bench:longmemeval": "node bench/longmemeval/run.js"
   },
   "keywords": [
+    "backend",
+    "memory",
+    "agent",
+    "ai",
+    "mcp",
+    "llm",
+    "node",
+    "nodejs",
+    "storage",
+    "database",
+    "history",
+    "versioning",
+    "sqlite",
     "ai-memory",
     "agent-memory",
     "llm-memory",
@@ -51,7 +64,6 @@
     "knowledge-graph",
     "ai-agent",
     "autonomous-agent",
-    "mcp",
     "mcp-server",
     "model-context-protocol",
     "local-first",

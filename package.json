@@ -1,6 +1,6 @@
 {
   "name": "kalairos",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "description": "Durable, private, time-aware memory engine for long-running AI agents",
   "main": "./index.js",
   "exports": {
@@ -31,6 +31,7 @@
   },
   "scripts": {
     "start": "node server.js",
+    "postinstall": "node scripts/download-model.js || true",
     "test": "node test-basic.js && node test-versioning.js && node test-agent-simulation.js && node test-scope.js",
     "bench": "node bench/agent-memory/run-all.js",
     "bench:real": "node bench/agent-memory/bench-eval-real.js",
@@ -79,6 +80,9 @@
     "axios": "^1.15.0",
     "express": "^5.2.1"
   },
+  "optionalDependencies": {
+    "onnxruntime-node": "^1.25.1"
+  },
   "files": [
     "README.md",
     "llms.txt",
@@ -97,6 +101,9 @@
     "errors.js",
     "agent.js",
     "auth.js",
+    "embedder.js",
+    "tokenizer.json",
+    "scripts/download-model.js",
     "mcp.js",
     "mcp.mjs",
     "store/file-store.js",

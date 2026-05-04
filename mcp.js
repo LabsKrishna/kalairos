@@ -322,15 +322,28 @@ server.tool(
 // ─── Boot ────────────────────────────────────────────────────────────────────
 
 async function main() {
-  // Initialize DBX with bag-of-words fallback (works out of the box, no API key needed).
-  // Users can override via environment or by wrapping this file.
   const dataFile = process.env.KALAIROS_DATA_FILE || path.join(process.cwd(), "data.kalairos");
+
+  let embedFn      = async (text) => _bowEmbed(text);
+  let embeddingDim = BOW_DIM;
+
+  try {
+    const neuralEmbedder = require("./embedder");
+    const loaded = await neuralEmbedder.load();
+    if (loaded) {
+      embedFn      = (text) => neuralEmbedder.embed(text);
+      embeddingDim = neuralEmbedder.DIM;
+      process.stderr.write("kalairos: neural embedder loaded (768-dim)\n");
+    }
+  } catch {
+    // embedder.js or onnxruntime-node not available — BoW fallback
+  }
 
   await dbx.init({
     dataFile,
     strictEmbeddings: false,
-    embedFn: async (text) => _bowEmbed(text),
-    embeddingDim: BOW_DIM,
+    embedFn,
+    embeddingDim,
   });
 
   const transport = new StdioServerTransport();

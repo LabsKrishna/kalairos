@@ -16,6 +16,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `test-scope.js` now runs as part of `npm test`.
 - HTTPS warning in `remote.connect()` when a non-loopback `http://` URL is
   used with a bearer token.
+- `better-sqlite3` runtime dependency, ahead of the v1.7 hybrid storage
+  index (KAL-101). The full feature ships behind `KALAIROS_INDEX_SQLITE=1`
+  in a later release; set `KALAIROS_INDEX=off` to disable the index entirely
+  if a later version enables it by default and you need the legacy code path.
 
 ### Changed
 - `store/file-store.js`: writes and appends now `fsync` before returning,

@@ -950,6 +950,22 @@ const INIT_OPTS = {
     assert.notEqual(id1, id2, "forceNew must bypass consolidation threshold");
   });
 
+  // ── better-sqlite3 cross-platform smoke (KAL-101) ────────────────────────
+  console.log("\n── better-sqlite3 smoke (KAL-101) ───────────────────────────────");
+
+  await test("better-sqlite3 :memory: open, create, insert, query", () => {
+    const Database = require("better-sqlite3");
+    const db = new Database(":memory:");
+    try {
+      db.exec("CREATE TABLE smoke (id INTEGER PRIMARY KEY, v TEXT NOT NULL)");
+      db.prepare("INSERT INTO smoke (v) VALUES (?)").run("hello");
+      const row = db.prepare("SELECT v FROM smoke WHERE id = 1").get();
+      assert.strictEqual(row.v, "hello");
+    } finally {
+      db.close();
+    }
+  });
+
   // ── Results ───────────────────────────────────────────────────────────────
   console.log(`\n${"─".repeat(60)}`);
   const total = passed + failed;

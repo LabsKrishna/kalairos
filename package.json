@@ -32,7 +32,7 @@
   "scripts": {
     "start": "node server.js",
     "postinstall": "node scripts/download-model.js || true",
-    "test": "node test-basic.js && node test-versioning.js && node test-agent-simulation.js && node test-scope.js",
+    "test": "node test-basic.js && node test-versioning.js && node test-agent-simulation.js && node test-scope.js && node test-sqlite-index.js",
     "bench": "node bench/agent-memory/run-all.js",
     "bench:real": "node bench/agent-memory/bench-eval-real.js",
     "bench:latency": "node bench/latency.js",
@@ -108,6 +108,7 @@
     "mcp.js",
     "mcp.mjs",
     "store/file-store.js",
+    "store/sqlite-index.js",
     "examples/demo.js"
   ]
 }

@@ -7,7 +7,14 @@ const fs     = require("fs");
 const os     = require("os");
 const path   = require("path");
 
-const { SqliteIndex, applySchemaV1, rebuild, SCHEMA_VERSION } = require("./store/sqlite-index");
+const {
+  SqliteIndex,
+  applySchemaV1,
+  rebuild,
+  decideOnBoot,
+  replayForward,
+  SCHEMA_VERSION,
+} = require("./store/sqlite-index");
 
 // ── Minimal async test runner (mirrors test-basic.js) ───────────────────────
 let passed = 0, failed = 0;
@@ -450,6 +457,264 @@ await test("two consecutive rebuilds of the same JSONL produce byte-identical lo
   // KAL-105 AC: test runs in <2 seconds (1000 rows, two rebuilds, on a typical SSD).
   // Loose bound to stay green on shared CI runners while still flagging regressions.
   assert.ok(elapsed < 5000, `1000-row × 2 determinism test should run in well under 5s; took ${elapsed}ms`);
+});
+
+// ── KAL-106 boot decision tree ──────────────────────────────────────────────
+console.log("\n── Boot decision tree (KAL-106) ─────────────────────────────────");
+
+// Helper: build a SQLite + JSONL pair in a known IN_SYNC state, then return
+// the paths so each branch test can perturb one input and call decideOnBoot.
+//
+// Default n=20 so the JSONL exceeds 4 KB. The first-4-KB hash check (branch d)
+// fires before the size check (branches e/g); using a tiny fixture means a
+// trailing append or tail-truncation also changes the first 4 KB and fires d
+// instead of the size branches. With 20 rows (~5–7 KB depending on padding)
+// the first 4 KB stays stable as a prefix when only the tail changes.
+async function freshInSyncPair(label, n = 20) {
+  const jsonlPath  = fresh(`${label}.jsonl`);
+  const sqlitePath = fresh(`${label}.sqlite`);
+  writeFixtureJsonl(jsonlPath, n);
+  // Sanity: confirm the fixture is large enough that the first 4 KB is just
+  // a prefix. If this assertion ever fires, bump n.
+  assert.ok(fs.statSync(jsonlPath).size > 4096,
+    `fixture ${label} too small (${fs.statSync(jsonlPath).size}B) — bump n to keep branch e/g tests honest`);
+  await rebuild({ jsonlPath, sqlitePath });
+  return { jsonlPath, sqlitePath };
+}
+
+// Helper: directly mutate the meta row for a key so we can simulate the
+// preconditions of the various REBUILD branches.
+function setMeta(sqlitePath, key, value) {
+  const idx = new SqliteIndex();
+  idx.open(sqlitePath);
+  try {
+    idx.db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run(key, value);
+  } finally {
+    idx.close();
+  }
+}
+
+await test("branch (a) — SQLite missing → REBUILD", () => {
+  const jsonlPath  = fresh("branch-a.jsonl");
+  const sqlitePath = fresh("branch-a.sqlite"); // never created
+  writeFixtureJsonl(jsonlPath, 3);
+  const d = decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+  assert.equal(d.action, "REBUILD");
+  assert.equal(d.reason, "sqlite-missing");
+});
+
+await test("branch (b) — schema_version mismatch → REBUILD", async () => {
+  const { jsonlPath, sqlitePath } = await freshInSyncPair("branch-b");
+  setMeta(sqlitePath, "schema_version", "999");
+  const d = decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+  assert.equal(d.action, "REBUILD");
+  assert.equal(d.reason, "schema-version-mismatch");
+  assert.equal(d.actual, "999");
+});
+
+await test("branch (h) — dirty flag set → REBUILD (evaluated before c/d/e/g)", async () => {
+  const { jsonlPath, sqlitePath } = await freshInSyncPair("branch-h");
+  setMeta(sqlitePath, "dirty", "1");
+  // Even with everything else aligned, dirty must short-circuit.
+  const d = decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+  assert.equal(d.action, "REBUILD");
+  assert.equal(d.reason, "dirty-flag-set");
+});
+
+await test("branch (c) — jsonl_path mismatch → REBUILD", async () => {
+  const { jsonlPath, sqlitePath } = await freshInSyncPair("branch-c");
+  // Also create a different JSONL with the same shape so branches d/e don't fire.
+  const otherJsonl = fresh("branch-c-other.jsonl");
+  fs.copyFileSync(jsonlPath, otherJsonl);
+  const d = decideOnBoot({ jsonlPath: otherJsonl, sqlitePath, quiet: true });
+  assert.equal(d.action, "REBUILD");
+  assert.equal(d.reason, "jsonl-path-mismatch");
+});
+
+await test("branch (d) — sha256-first-4kb mismatch → REBUILD", async () => {
+  const { jsonlPath, sqlitePath } = await freshInSyncPair("branch-d");
+  // Edit the start of the file (within the first 4kb hash window) without
+  // changing its overall size. Branches a/b/h/c all align; only d should fire.
+  const buf = fs.readFileSync(jsonlPath);
+  buf[0] = buf[0] === 0x7B /* '{' */ ? 0x20 /* space */ : 0x7B;
+  fs.writeFileSync(jsonlPath, buf);
+  const d = decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+  assert.equal(d.action, "REBUILD");
+  assert.equal(d.reason, "jsonl-hash-mismatch");
+});
+
+await test("branch (e) — JSONL shrunk → REBUILD", async () => {
+  const { jsonlPath, sqlitePath } = await freshInSyncPair("branch-e");
+  // Drop the tail rows but keep enough that the first 4 KB stays unchanged —
+  // otherwise branch d (hash mismatch) would fire first and we wouldn't be
+  // testing branch e in isolation.
+  const lines = fs.readFileSync(jsonlPath, "utf8").split("\n").filter(Boolean);
+  const kept  = lines.slice(0, lines.length - 5);
+  fs.writeFileSync(jsonlPath, kept.join("\n") + "\n");
+  assert.ok(fs.statSync(jsonlPath).size > 4096, "shrunk file must still exceed 4 KB to isolate branch e");
+  const d = decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+  assert.equal(d.action, "REBUILD");
+  assert.equal(d.reason, "jsonl-shrunk");
+});
+
+await test("branch (g) — JSONL grew → REPLAY", async () => {
+  const { jsonlPath, sqlitePath } = await freshInSyncPair("branch-g");
+  // Append a valid extra line. Hash of first 4kb unchanged, size grew.
+  const extraLine = JSON.stringify({
+    id: 9_000_001,
+    text: "external append",
+    type: "text",
+    memoryType: "long-term",
+    workspaceId: "default",
+    tags: [],
+    trustScore: 0.9,
+    links: [],
+    versions: [{ versionId: "9000001:1", timestamp: 1_700_900_000_000 }],
+  }) + "\n";
+  fs.appendFileSync(jsonlPath, extraLine);
+  const d = decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+  assert.equal(d.action, "REPLAY");
+  assert.equal(d.reason, "jsonl-grew");
+  assert.ok(d.sizeNow > d.metaSize);
+});
+
+await test("branch (f) — in sync → READY", async () => {
+  const { jsonlPath, sqlitePath } = await freshInSyncPair("branch-f");
+  const d = decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+  assert.equal(d.action, "READY");
+  assert.equal(d.reason, "in-sync");
+});
+
+await test("decideOnBoot is pure — does not mutate SQLite or JSONL", async () => {
+  const { jsonlPath, sqlitePath } = await freshInSyncPair("purity");
+  const sqlBefore   = fs.readFileSync(sqlitePath);
+  const jsonlBefore = fs.readFileSync(jsonlPath);
+  decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+  decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+  assert.ok(sqlBefore.equals(fs.readFileSync(sqlitePath)),  "SQLite should not change");
+  assert.ok(jsonlBefore.equals(fs.readFileSync(jsonlPath)), "JSONL should not change");
+});
+
+await test("corrupt SQLite → REBUILD with sqlite-open-failed reason", () => {
+  const jsonlPath  = fresh("corrupt.jsonl");
+  const sqlitePath = fresh("corrupt.sqlite");
+  writeFixtureJsonl(jsonlPath, 3);
+  fs.writeFileSync(sqlitePath, "not actually a sqlite database");
+  const d = decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+  assert.equal(d.action, "REBUILD");
+  assert.equal(d.reason, "sqlite-open-failed");
+});
+
+// ── KAL-107 replay-forward ──────────────────────────────────────────────────
+console.log("\n── Replay-forward (KAL-107) ─────────────────────────────────────");
+
+await test("replayForward applies only the new lines, leaving prior rows untouched", async () => {
+  const jsonlPath  = fresh("replay.jsonl");
+  const sqlitePath = fresh("replay.sqlite");
+  writeFixtureJsonl(jsonlPath, 100);
+  await rebuild({ jsonlPath, sqlitePath });
+
+  // Append 10 more rows out-of-band — the canonical "external tool wrote
+  // to JSONL between sessions" scenario from §6.2 case g.
+  const extras = [];
+  for (let i = 100; i < 110; i++) {
+    extras.push(JSON.stringify({
+      id: 1_000_000 + i,
+      text: `replayed-${i}`,
+      type: "text",
+      memoryType: "long-term",
+      workspaceId: "default",
+      tags: [],
+      trustScore: 0.7,
+      links: [],
+      versions: [{ versionId: `${1_000_000 + i}:1`, timestamp: 1_700_000_000_000 + i * 1000 }],
+    }));
+  }
+  fs.appendFileSync(jsonlPath, extras.join("\n") + "\n");
+
+  // Decide: should be REPLAY.
+  const decision = decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+  assert.equal(decision.action, "REPLAY");
+
+  // Replay.
+  const result = await replayForward({ jsonlPath, sqlitePath });
+  assert.equal(result.rowsApplied, 10);
+
+  // Verify final state.
+  const idx = new SqliteIndex();
+  idx.open(sqlitePath);
+  try {
+    const total = idx.db.prepare("SELECT COUNT(*) AS c FROM facts").get().c;
+    assert.equal(total, 110, "should have all 100 original + 10 new rows");
+    const lastIds = idx.db.prepare(
+      "SELECT id FROM facts WHERE id >= ? ORDER BY id"
+    ).all(String(1_000_100)).map(r => r.id);
+    assert.deepEqual(lastIds, Array.from({ length: 10 }, (_, i) => String(1_000_100 + i)));
+
+    // After replay, decideOnBoot should report READY.
+    idx.close();
+    const next = decideOnBoot({ jsonlPath, sqlitePath, quiet: true });
+    assert.equal(next.action, "READY");
+  } finally {
+    if (idx.db) idx.close();
+  }
+});
+
+// True end-to-end transactionality (BEGIN IMMEDIATE / ROLLBACK on a real
+// crash mid-replay) requires fault injection that's intrusive to expose
+// from test code. KAL-110's fuzz harness — which spawns a child process,
+// sends SIGKILL at random points, and checks convergence on restart — owns
+// that verification. Here we just structurally test the per-line skip path
+// already covered by the malformed-line case below.
+
+await test("replayForward skips malformed JSONL lines and still updates meta", async () => {
+  const jsonlPath  = fresh("replay-malformed.jsonl");
+  const sqlitePath = fresh("replay-malformed.sqlite");
+  writeFixtureJsonl(jsonlPath, 3);
+  await rebuild({ jsonlPath, sqlitePath });
+
+  // Append: bad line, good line.
+  const goodLine = JSON.stringify({
+    id: 9_000_003,
+    text: "good replay row",
+    type: "text",
+    memoryType: "long-term",
+    workspaceId: "default",
+    tags: [],
+    trustScore: 0.7,
+    links: [],
+    versions: [{ versionId: "9000003:1", timestamp: 1_700_999_999_999 }],
+  });
+  fs.appendFileSync(jsonlPath, "{ broken json\n" + goodLine + "\n");
+
+  const origWarn = console.warn;
+  console.warn = () => {};
+  let result;
+  try {
+    result = await replayForward({ jsonlPath, sqlitePath });
+  } finally {
+    console.warn = origWarn;
+  }
+
+  assert.equal(result.rowsApplied, 1, "only the good line should apply");
+  const idx = new SqliteIndex();
+  idx.open(sqlitePath);
+  try {
+    const c = idx.db.prepare("SELECT COUNT(*) AS c FROM facts").get().c;
+    assert.equal(c, 4, "3 original + 1 newly replayed");
+    assert.equal(idx._meta("last_jsonl_offset"), String(fs.statSync(jsonlPath).size));
+  } finally {
+    idx.close();
+  }
+});
+
+await test("replayForward is a no-op when JSONL hasn't grown", async () => {
+  const { jsonlPath, sqlitePath } = await freshInSyncPair("replay-noop");
+  const before = dumpLogical(sqlitePath);
+  const result = await replayForward({ jsonlPath, sqlitePath });
+  assert.equal(result.rowsApplied, 0);
+  const after = dumpLogical(sqlitePath);
+  assert.equal(after, before, "no-op replay should not touch the index");
 });
 
 // ── Cleanup + results ───────────────────────────────────────────────────────

@@ -11,8 +11,12 @@
 //   * applySchemaV1(db) — the v1 DDL from spec §3, idempotent.
 //   * rebuild({ jsonlPath, sqlitePath }) — stream-rebuild from JSONL with
 //     tmp-DB + atomic rename for crash safety (KAL-104, spec §7).
+//   * decideOnBoot({ jsonlPath, sqlitePath }) — the §6.2 8-branch decision
+//     tree returning READY / REPLAY / REBUILD (KAL-106). Pure, no mutations.
+//   * replayForward({ jsonlPath, sqlitePath }) — apply only the JSONL bytes
+//     beyond meta.last_jsonl_offset, in one transaction (KAL-107).
 //
-// Write path, boot decision tree, query API land in later tickets.
+// Write path, query API land in later tickets.
 "use strict";
 
 const Database = require("better-sqlite3");
@@ -427,4 +431,176 @@ function _safeUnlink(filePath) {
   try { fs.unlinkSync(filePath); } catch (err) { if (err.code !== "ENOENT") throw err; }
 }
 
-module.exports = { SqliteIndex, applySchemaV1, rebuild, SCHEMA_VERSION };
+// ── Boot decision tree (KAL-106, spec §6.2) ─────────────────────────────────
+//
+// Pure decision — no state mutations. Returns one of:
+//   { action: "READY",   reason, ... }
+//   { action: "REPLAY",  reason, lastOffset, sizeNow, ... }
+//   { action: "REBUILD", reason, ... }
+//
+// Evaluation order is locked by spec §6.2: a → b → h → c → d → e → g → f.
+// The first matching branch short-circuits.
+//
+// Pass `quiet: true` to suppress the structured log line — the function still
+// returns the decision object. Used by tests to keep output readable.
+function decideOnBoot({ jsonlPath, sqlitePath, quiet = false }) {
+  // Branch a — SQLite missing entirely (first run, deleted file).
+  if (!fs.existsSync(sqlitePath)) {
+    return _logDecision({ action: "REBUILD", reason: "sqlite-missing", sqlitePath }, quiet);
+  }
+
+  // Compute current JSONL state. Missing JSONL is treated as size=0 / hash="";
+  // downstream branches surface the divergence.
+  const jsonlExists = fs.existsSync(jsonlPath);
+  const sizeNow     = jsonlExists ? fs.statSync(jsonlPath).size : 0;
+  const sha256Now   = jsonlExists && sizeNow > 0 ? _sha256First4kb(jsonlPath) : "";
+
+  // Read meta read-only — this is a pure decision.
+  let meta;
+  try {
+    const db = new Database(sqlitePath, { readonly: true });
+    try {
+      meta = _readBootMeta(db);
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    // Corrupt header, missing tables, or any other open failure — rebuild.
+    return _logDecision({ action: "REBUILD", reason: "sqlite-open-failed", error: err.message }, quiet);
+  }
+
+  // Branch b — schema-version drift; future-proofs migrations.
+  if (meta.schema_version !== SCHEMA_VERSION) {
+    return _logDecision({ action: "REBUILD", reason: "schema-version-mismatch",
+                          expected: SCHEMA_VERSION, actual: meta.schema_version }, quiet);
+  }
+
+  // Branch h — last write to SQLite failed; meta.dirty was set by the write
+  // path (KAL-108). Order h before c/d/e/g per §6.2: dirty trumps any size
+  // comparison since we don't trust the index's claimed offset.
+  if (meta.dirty === "1") {
+    return _logDecision({ action: "REBUILD", reason: "dirty-flag-set" }, quiet);
+  }
+
+  // Branch c — different JSONL than this index was built from.
+  if (meta.jsonl_path !== jsonlPath) {
+    return _logDecision({ action: "REBUILD", reason: "jsonl-path-mismatch",
+                          expected: jsonlPath, actual: meta.jsonl_path }, quiet);
+  }
+
+  // Branch d — JSONL replaced or edited at the start. SQLite offsets may now
+  // point at stale bytes; only safe move is rebuild.
+  if (meta.jsonl_sha256_first_4kb !== sha256Now) {
+    return _logDecision({ action: "REBUILD", reason: "jsonl-hash-mismatch",
+                          expected: meta.jsonl_sha256_first_4kb, actual: sha256Now }, quiet);
+  }
+
+  const metaSize = parseInt(meta.jsonl_size_bytes ?? "0", 10);
+
+  // Branch e — JSONL shrunk. Either truncation or replacement; either way the
+  // index claims to know offsets that no longer exist.
+  if (sizeNow < metaSize) {
+    return _logDecision({ action: "REBUILD", reason: "jsonl-shrunk", sizeNow, metaSize }, quiet);
+  }
+
+  // Branch g — JSONL grew (external append). Replay only the new lines.
+  if (sizeNow > metaSize) {
+    return _logDecision({ action: "REPLAY", reason: "jsonl-grew",
+                          sizeNow, metaSize, lastOffset: metaSize }, quiet);
+  }
+
+  // Branch f — same path, same hash, same size, schema match, not dirty.
+  return _logDecision({ action: "READY", reason: "in-sync", sizeNow }, quiet);
+}
+
+function _readBootMeta(db) {
+  const rows = db.prepare(
+    "SELECT key, value FROM meta WHERE key IN ('schema_version','jsonl_path','jsonl_sha256_first_4kb','jsonl_size_bytes','dirty')"
+  ).all();
+  const out = {};
+  for (const r of rows) out[r.key] = r.value;
+  return out;
+}
+
+function _logDecision(d, quiet) {
+  if (!quiet) console.log(`[kalairos] sqlite-index: decision=${JSON.stringify(d)}`);
+  return d;
+}
+
+// ── Replay-forward (KAL-107, spec §6.2 case g) ──────────────────────────────
+//
+// Open the live SQLite, seek to meta.last_jsonl_offset in JSONL, parse and
+// apply only the newer bytes. One BEGIN IMMEDIATE / COMMIT around the whole
+// run so a partial replay doesn't leave SQLite half-updated. Malformed lines
+// are logged and skipped, matching loadRaw's behaviour.
+async function replayForward({ jsonlPath, sqlitePath }) {
+  const db = new Database(sqlitePath);
+  for (const p of PRAGMAS) db.pragma(p);
+
+  const startOffset = parseInt(
+    db.prepare("SELECT value FROM meta WHERE key = 'last_jsonl_offset'").get()?.value ?? "0",
+    10,
+  );
+  const sizeNow = fs.existsSync(jsonlPath) ? fs.statSync(jsonlPath).size : 0;
+
+  if (sizeNow <= startOffset) {
+    // Nothing to do — caller invoked replay on a no-op situation. Return a
+    // shaped result so callers can branch without re-checking sizes.
+    db.close();
+    return { rowsApplied: 0, lastOffset: startOffset };
+  }
+
+  const stmts = _prepareWriteStmts(db);
+
+  db.exec("BEGIN IMMEDIATE");
+  let offset = startOffset;
+  let rowsApplied = 0;
+  try {
+    const stream = fs.createReadStream(jsonlPath, { encoding: "utf8", start: startOffset });
+    const rl     = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+    for await (const line of rl) {
+      const lineStart = offset;
+      offset += Buffer.byteLength(line, "utf8") + 1;
+      if (!line) continue;
+      let raw;
+      try {
+        raw = JSON.parse(line);
+      } catch {
+        console.warn(`[kalairos] sqlite-index: replay skipping malformed JSONL line at offset ${lineStart}`);
+        continue;
+      }
+      try {
+        const entity = normalizeRaw(raw);
+        _applyEntity(stmts, entity, lineStart);
+        rowsApplied++;
+      } catch (err) {
+        console.warn(`[kalairos] sqlite-index: replay skipping unindexable entity ${raw?.id}: ${err.message}`);
+      }
+    }
+
+    // Trust the file's actual size as the canonical end-of-replay marker —
+    // line accounting can drift by one byte if the file omits a trailing
+    // newline. fs.stat is authoritative.
+    stmts.upsertMeta.run("jsonl_size_bytes",  String(sizeNow));
+    stmts.upsertMeta.run("last_jsonl_offset", String(sizeNow));
+
+    db.exec("COMMIT");
+  } catch (err) {
+    try { db.exec("ROLLBACK"); } catch {}
+    db.close();
+    throw err;
+  }
+
+  db.close();
+  return { rowsApplied, lastOffset: sizeNow };
+}
+
+module.exports = {
+  SqliteIndex,
+  applySchemaV1,
+  rebuild,
+  decideOnBoot,
+  replayForward,
+  SCHEMA_VERSION,
+};

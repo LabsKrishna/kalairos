@@ -17,6 +17,8 @@
 //     beyond meta.last_jsonl_offset, in one transaction (KAL-107).
 //   * SqliteIndex.applyEntity(row, jsonlOffset) — per-write UPSERT used by
 //     the live write path under KALAIROS_INDEX_SQLITE=1 (KAL-108).
+//   * SqliteIndex.truncateAndReplay(jsonlPath) — wipe + re-derive in one
+//     transaction; used by _persistAll after a JSONL rewrite (KAL-109).
 //   * SqliteIndex.markDirty() — best-effort meta.dirty=1 flag for the boot
 //     decision tree to pick up after a failed write txn (KAL-108, §4).
 //
@@ -210,6 +212,74 @@ class SqliteIndex {
       _applyEntity(this.stmts, row, jsonlOffset);
       this.stmts.upsertMeta.run("jsonl_size_bytes",  String(sizeAfter));
       this.stmts.upsertMeta.run("last_jsonl_offset", String(sizeAfter));
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw err;
+    }
+  }
+
+  // Truncate every row table and replay the new JSONL into the live
+  // connection (KAL-109, spec §6.1). Used by _persistAll after the atomic
+  // JSONL rewrite: the prior SQLite contents reflect the *old* JSONL and
+  // its byte offsets, so we wipe and re-derive in one transaction. Same
+  // critical section as the JSONL rewrite — no window where SQLite
+  // reflects the old JSONL after persistAll has acked.
+  //
+  // Synchronous (better-sqlite3 + fs.readFileSync) so this can run inside
+  // index.js's sync write-lock. JSONL reads are bounded by file size; for
+  // typical stores (1–25 MB) this is negligible. KAL-115 will benchmark.
+  truncateAndReplay(jsonlPath) {
+    if (!this.db || !this.stmts) {
+      throw new Error("SqliteIndex.truncateAndReplay: index is not open");
+    }
+
+    const jsonlExists = fs.existsSync(jsonlPath);
+    const jsonlSize   = jsonlExists ? fs.statSync(jsonlPath).size : 0;
+    const jsonlSha    = jsonlExists && jsonlSize > 0 ? _sha256First4kb(jsonlPath) : "";
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // Wipe row tables. facts_fts is content-linked and auto-cleaned by the
+      // AFTER DELETE trigger on facts; we don't touch it directly.
+      this.db.exec("DELETE FROM facts");
+      this.db.exec("DELETE FROM fact_versions");
+      this.db.exec("DELETE FROM links");
+
+      // Replay the (already-fsync'd) JSONL synchronously. Reading the whole
+      // file is acceptable here — persistAll just wrote it and held the lock,
+      // so it's hot in the OS page cache.
+      if (jsonlExists && jsonlSize > 0) {
+        const data  = fs.readFileSync(jsonlPath, "utf8");
+        const lines = data.split("\n");
+        let offset  = 0;
+        for (const line of lines) {
+          const lineStart = offset;
+          offset += Buffer.byteLength(line, "utf8") + 1;
+          if (!line) continue;
+          let raw;
+          try {
+            raw = JSON.parse(line);
+          } catch {
+            console.warn(`[kalairos] sqlite-index: truncate+replay skipping malformed line at offset ${lineStart}`);
+            continue;
+          }
+          try {
+            const entity = normalizeRaw(raw);
+            _applyEntity(this.stmts, entity, lineStart);
+          } catch (err) {
+            console.warn(`[kalairos] sqlite-index: truncate+replay skipping unindexable entity ${raw?.id}: ${err.message}`);
+          }
+        }
+      }
+
+      // Refresh all the meta keys the boot decision tree (§6.2) reads.
+      // Crucially, dirty=0 — we just synced, no need for next-start rebuild.
+      this.stmts.upsertMeta.run("jsonl_size_bytes",       String(jsonlSize));
+      this.stmts.upsertMeta.run("last_jsonl_offset",      String(jsonlSize));
+      this.stmts.upsertMeta.run("jsonl_sha256_first_4kb", jsonlSha);
+      this.stmts.upsertMeta.run("dirty",                  "0");
+
       this.db.exec("COMMIT");
     } catch (err) {
       try { this.db.exec("ROLLBACK"); } catch {}

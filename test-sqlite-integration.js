@@ -293,6 +293,19 @@ await test("SQLite txn failure marks dirty, acks the caller, emits a signal", as
     // Signal bus emitted ERR_INDEX_WRITE_FAILED.
     assert.ok(capturedSignal, "expected ERR_INDEX_WRITE_FAILED signal");
     assert.equal(capturedSignal.code, "ERR_INDEX_WRITE_FAILED");
+
+    // Mid-session check: dirty=1 is on disk while applyEntity is still
+    // patched. We have to look BEFORE shutdown because KAL-109's
+    // truncate+replay (running on the final flush) will clear dirty=0
+    // automatically — and that's the desired behaviour, just not what
+    // we're trying to assert here.
+    const midDirty = (() => {
+      const m = new SqliteIndex();
+      m.open(sqlitePath);
+      try { return m.db.prepare("SELECT value FROM meta WHERE key = ?").get("dirty").value; }
+      finally { m.close(); }
+    })();
+    assert.equal(midDirty, "1", "mid-session: meta.dirty must be set after the failed mirror");
   } finally {
     SqliteIndex.prototype.applyEntity = origApply;
     console.error = origErr;
@@ -300,53 +313,150 @@ await test("SQLite txn failure marks dirty, acks the caller, emits a signal", as
     await lib.shutdown();
   }
 
-  // dirty=1 should be set on disk so the next start triggers REBUILD.
+  // After shutdown, KAL-109's truncate+replay (running with the restored
+  // applyEntity) re-derives SQLite from JSONL and clears dirty. The user-
+  // visible guarantee is data presence, not the transient flag value.
   const snap = snapshot(sqlitePath);
-  assert.equal(snap.meta.dirty, "1", "meta.dirty must be set so next start triggers REBUILD");
-
-  // Restart: REBUILD should fire (branch h) and produce a clean index that
-  // includes the row that JSONL has but SQLite was missing.
-  await lib.init(baseInitOpts(dataFile));
-  await lib.shutdown();
-
-  const recovered = snapshot(sqlitePath);
-  assert.equal(recovered.meta.dirty, "0", "rebuild should clear dirty");
-  assert.ok(recovered.facts.some(f => /durable/.test(f.text)),
-            "the row that JSONL had but SQLite missed must be present after rebuild");
+  assert.equal(snap.meta.dirty, "0", "shutdown's truncate+replay should clear dirty");
+  assert.ok(snap.facts.some(f => /durable/.test(f.text)),
+            "the row that JSONL had must be in SQLite after shutdown");
 });
 
-// ── persistAll stopgap ──────────────────────────────────────────────────────
-console.log("\n── persistAll stopgap (KAL-108 → KAL-109) ────────────────────────");
+// ── persistAll truncate+replay (KAL-109) ────────────────────────────────────
+console.log("\n── persistAll truncate+replay (KAL-109) ──────────────────────────");
 
-await test("persistAll-driven rewrite (forget) marks dirty until KAL-109", async () => {
+await test("forget triggers truncate+replay; SQLite reflects soft-delete in same session", async () => {
   const dataFile   = freshDataFile();
   const sqlitePath = dataFile + ".sqlite";
 
   await lib.init(baseInitOpts(dataFile));
   const id = await lib.ingest("will be forgotten");
-  // forget() rewrites the JSONL via _persistAll; KAL-108's stopgap is to
-  // mark dirty so the next start cleanly rebuilds. KAL-109 will replace
-  // this with truncate + replay in the same critical section.
+  // forget() rewrites the JSONL via _persistAll. Under KAL-109, truncate +
+  // replay re-derives SQLite from the new JSONL inside the same critical
+  // section — no markDirty fallback, no next-start rebuild needed.
   await lib.forget(id);
+
+  // Mid-session check: open a second connection (WAL mode allows concurrent
+  // readers) and verify the soft-delete is already reflected without restart.
+  const idxMid = new SqliteIndex();
+  idxMid.open(sqlitePath);
+  try {
+    const row = idxMid.db.prepare("SELECT deleted_at FROM facts WHERE id = ?").get(String(id));
+    assert.ok(row, "row should be present in SQLite after persistAll");
+    assert.ok(row.deleted_at != null, "deleted_at must be populated mid-session, no restart required");
+    const dirty = idxMid.db.prepare("SELECT value FROM meta WHERE key = ?").get("dirty");
+    assert.equal(dirty.value, "0", "no dirty flag — KAL-109 sync, not KAL-108 stopgap");
+  } finally {
+    idxMid.close();
+  }
+
+  await lib.shutdown();
+
+  // Restart should be READY (not REBUILD) — the index is already in sync.
+  const before = snapshot(sqlitePath);
+  await lib.init(baseInitOpts(dataFile));
+  await lib.shutdown();
+  const after = snapshot(sqlitePath);
+  assert.equal(after.meta.dirty, "0");
+  assert.deepEqual(after.facts, before.facts, "READY restart should not change SQLite contents");
+});
+
+await test("annotate (edit) keeps SQLite in sync within the session", async () => {
+  const dataFile   = freshDataFile();
+  const sqlitePath = dataFile + ".sqlite";
+
+  await lib.init(baseInitOpts(dataFile));
+  const id = await lib.ingest("trust score will change");
+  // annotate updates trustScore — runs through _persistAll for the rewrite.
+  await lib.annotate(id, { trustScore: 0.42 });
+
+  const idxMid = new SqliteIndex();
+  idxMid.open(sqlitePath);
+  try {
+    const row = idxMid.db.prepare("SELECT trust_score FROM facts WHERE id = ?").get(String(id));
+    assert.ok(row, "row must be in SQLite after annotate");
+    assert.ok(Math.abs(row.trust_score - 0.42) < 1e-9, `trust_score should be 0.42, got ${row.trust_score}`);
+    assert.equal(idxMid.db.prepare("SELECT value FROM meta WHERE key = ?").get("dirty").value, "0");
+  } finally {
+    idxMid.close();
+  }
+
+  await lib.shutdown();
+});
+
+await test("ingestBatch leaves SQLite consistent after the batch flush", async () => {
+  const dataFile   = freshDataFile();
+  const sqlitePath = dataFile + ".sqlite";
+
+  await lib.init(baseInitOpts(dataFile));
+  // ingestBatch suppresses per-item I/O via _skipIO and emits a single
+  // _persistAll at the end. KAL-109 must keep SQLite consistent with the
+  // post-batch JSONL.
+  await lib.ingestBatch([
+    { text: "batch row alpha" },
+    { text: "batch row bravo" },
+    { text: "batch row charlie" },
+  ]);
   await lib.shutdown();
 
   const snap = snapshot(sqlitePath);
-  assert.equal(snap.meta.dirty, "1", "_persistAll must mark dirty under KAL-108");
+  assert.equal(snap.facts.length, 3, "all batch rows should be in SQLite");
+  assert.equal(snap.meta.dirty, "0", "batch flush should not leave dirty=1");
+  // last_jsonl_offset should match the actual JSONL size.
+  const jsonlSize = fs.statSync(dataFile).size;
+  assert.equal(snap.meta.last_jsonl_offset, String(jsonlSize),
+               "meta.last_jsonl_offset must match JSONL size after the batch flush");
+});
 
-  // Next start rebuilds from JSONL — the entity is now soft-deleted.
+await test("truncate+replay failure falls back to markDirty (KAL-108 path still works)", async () => {
+  const dataFile   = freshDataFile();
+  const sqlitePath = dataFile + ".sqlite";
+
   await lib.init(baseInitOpts(dataFile));
-  await lib.shutdown();
+  const id = await lib.ingest("survive truncate failure");
 
+  // Inject a failure into truncateAndReplay; persistAll's catch should fall
+  // back to markDirty so the next start cleanly rebuilds. Same prototype
+  // patch trick as the applyEntity-failure test above.
+  const origTAR = SqliteIndex.prototype.truncateAndReplay;
+  let capturedSignal = null;
+  const off = lib.onSignal(s => { if (s.code === "ERR_INDEX_WRITE_FAILED") capturedSignal = s; });
+  const origErr = console.error;
+  console.error = () => {};
+  let midDirty;
+  try {
+    SqliteIndex.prototype.truncateAndReplay = function() {
+      throw new Error("simulated truncate+replay failure");
+    };
+    // forget triggers persistAll → truncateAndReplay → throws → markDirty
+    await lib.forget(id);
+
+    // Mid-session: dirty must be set to 1 by the fallback path. We capture
+    // it BEFORE restoring the patch because shutdown's _persistAll would
+    // call truncateAndReplay successfully and clear it.
+    const m = new SqliteIndex();
+    m.open(sqlitePath);
+    try { midDirty = m.db.prepare("SELECT value FROM meta WHERE key = ?").get("dirty").value; }
+    finally { m.close(); }
+  } finally {
+    SqliteIndex.prototype.truncateAndReplay = origTAR;
+    console.error = origErr;
+    if (typeof off === "function") off();
+    await lib.shutdown();
+  }
+
+  assert.ok(capturedSignal, "ERR_INDEX_WRITE_FAILED signal should fire on truncate+replay failure");
+  assert.equal(midDirty, "1", "fallback path must mark dirty before shutdown's auto-recovery");
+
+  // After shutdown's recovery, dirty is cleared and the soft-delete is
+  // present — same data outcome as if truncate+replay had succeeded.
   const recovered = snapshot(sqlitePath);
   assert.equal(recovered.meta.dirty, "0");
-  // The entity should still be in SQLite (forget is a soft delete, not a
-  // line removal) — the deleted_at column reflects the state.
   const idx = new SqliteIndex();
   idx.open(sqlitePath);
   try {
     const row = idx.db.prepare("SELECT deleted_at FROM facts WHERE id = ?").get(String(id));
-    assert.ok(row, "the soft-deleted row should still exist in SQLite");
-    assert.ok(row.deleted_at != null, "deleted_at should be populated");
+    assert.ok(row.deleted_at != null, "soft-delete must be reflected after fallback recovery");
   } finally {
     idx.close();
   }

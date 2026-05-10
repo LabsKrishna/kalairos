@@ -429,19 +429,6 @@ function _serializeForIO(entity) {
 function _persistAll() {
   if (_skipIO > 0) return;
 
-  // KAL-108 stopgap: capture file size before the rewrite. After the write,
-  // if size changed, the SQLite index's per-row jsonl_offset bookkeeping is
-  // stale and we mark dirty so the next start rebuilds. We deliberately do
-  // NOT mark dirty unconditionally because shutdown's "final flush" rewrites
-  // the file with byte-identical content, and that would put us in an
-  // infinite "always rebuild on every restart" loop. KAL-109 replaces this
-  // stopgap with proper truncate+replay in the same critical section.
-  let beforeSize = null;
-  if (_sqliteIdx && CFG.dataFile && CFG.dataFile !== ":memory:") {
-    try { beforeSize = fs.existsSync(CFG.dataFile) ? fs.statSync(CFG.dataFile).size : 0; }
-    catch { beforeSize = null; }
-  }
-
   const rows = Array.from(store.values()).map(_serializeForIO);
   try {
     const result = store.persistAll(rows, CFG);
@@ -465,24 +452,17 @@ function _persistAll() {
     throw err;
   }
 
-  // Compare file sizes to detect a real content change vs a no-op flush.
-  // Different size ⇒ JSONL bytes diverged from what SQLite recorded ⇒ mark
-  // dirty for next-start rebuild. Same caveat as the boot tree's branch d
-  // (only first 4 KB hashed): a same-size content-change past the first
-  // 4 KB stays undetected — KAL-109's truncate+replay closes that gap.
-  //
-  // Edge case: an empty store rewriting persistAll writes "\n" (1 byte) for
-  // 0 rows, taking the file from "didn't exist" (size 0) to "1 byte". That
-  // transition is not a real divergence — SQLite is also empty — so we
-  // skip the dirty mark when both ends are effectively empty.
-  if (_sqliteIdx && beforeSize !== null) {
+  // KAL-109: truncate + replay keeps the SQLite index in lockstep with the
+  // freshly-rewritten JSONL. Same critical section, no observable window
+  // where SQLite reflects the old file. If it throws, fall back to KAL-108's
+  // markDirty path so the next start rebuilds.
+  if (_sqliteIdx && CFG.dataFile && CFG.dataFile !== ":memory:") {
     try {
-      const afterSize = fs.existsSync(CFG.dataFile) ? fs.statSync(CFG.dataFile).size : 0;
-      const isFreshEmpty = rows.length === 0 && beforeSize <= 1 && afterSize <= 1;
-      if (afterSize !== beforeSize && !isFreshEmpty) _sqliteIdx.markDirty();
-    } catch {
-      // Unable to stat after persistAll — be conservative and mark dirty.
+      _sqliteIdx.truncateAndReplay(CFG.dataFile);
+    } catch (err) {
       _sqliteIdx.markDirty();
+      emitError(Err.indexWriteFailed(err.message, err));
+      console.error(`[kalairos] SQLite truncate+replay failed: ${err.message}`);
     }
   }
 }

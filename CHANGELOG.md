@@ -6,7 +6,58 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-05-11
+
+Headline: **hybrid storage v1** — a SQLite index derived from the canonical
+JSONL store, shipped behind `KALAIROS_INDEX_SQLITE=1`. Default behaviour is
+unchanged; the index stays shadow-only until KAL-110 fuzz testing greenlights
+flipping the default. JSONL remains the source of truth — if SQLite
+disappears or diverges, the boot decision tree rebuilds or replays it
+deterministically.
+
 ### Added
+
+**Hybrid storage (opt-in via `KALAIROS_INDEX_SQLITE=1`):**
+- `better-sqlite3` runtime dependency. Multi-platform CI exercises the native
+  build on Linux, macOS, and Windows across Node 18 / 20 / 22 before any code
+  uses it (KAL-100, KAL-101).
+- `store/sqlite-index.js`: connection lifecycle, schema v1 (`facts`,
+  `fact_versions`, `links`, `meta`) with FTS5 sync triggers, WAL +
+  `synchronous=NORMAL` PRAGMAs (KAL-102, KAL-103).
+- `rebuildFrom(jsonlPath)` — single-pass `readline` stream-rebuild with
+  atomic `.rebuild → rename → fsync` for crash safety and orphan-tmp reaping
+  on entry (KAL-104).
+- Determinism test: rebuilds a 1000-row deterministic fixture twice and
+  byte-compares the dumped contents — catches future UPSERT-order or hash
+  drift at PR time (KAL-105).
+- `decideOnBoot({ jsonlPath, sqlitePath })` — the §6.2 8-branch boot
+  decision tree returning READY / REPLAY / REBUILD. Pure: read-only on
+  SQLite, leaves both files byte-identical, returns a parseable log line
+  (KAL-106).
+- `replayForward({ jsonlPath, sqlitePath })` — applies only the JSONL bytes
+  beyond `meta.last_jsonl_offset` in one `BEGIN IMMEDIATE` transaction
+  (KAL-107).
+- Live write-path under flag: `init()` runs `decideOnBoot` then auto-executes
+  REBUILD / REPLAY / READY before serving writes. `_appendEntity` mirrors
+  each row into SQLite via `applyEntity(row, lineStart, sizeAfter)`. JSONL
+  remains canonical: if the SQLite txn throws, the write is still
+  acknowledged, `meta.dirty=1` is set best-effort, and an
+  `ERR_INDEX_WRITE_FAILED` signal fires (KAL-108).
+- Same-session consistency on rewrites: `SqliteIndex.truncateAndReplay()`
+  wipes + re-derives in one transaction so `forget`, `annotate`, `restore`,
+  `ingestBatch`, and `consolidate` leave SQLite consistent without waiting
+  for the next restart (KAL-109).
+- `ERR_INDEX_WRITE_FAILED` error code with a "JSONL is canonical and the
+  write is durable" suggestion message — guides users away from panic when
+  the signal fires.
+
+**Quality & CI:**
+- Coverage reporting via `c8` (`npm run test:coverage`); Codecov upload on
+  the Node 22 CI leg with a token for protected-branch pushes.
+- Codecov and CI status badges in the README.
+- `funding` field in `package.json` (GitHub Sponsors).
+
+**Carried over from before the 1.5.0 / 1.6.0 changelog gap:**
 - `LICENSE` file at repo root (MIT, matches `package.json`).
 - `SECURITY.md` with vulnerability disclosure process.
 - `CHANGELOG.md` (this file).
@@ -16,12 +67,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `test-scope.js` now runs as part of `npm test`.
 - HTTPS warning in `remote.connect()` when a non-loopback `http://` URL is
   used with a bearer token.
-- `better-sqlite3` runtime dependency, ahead of the v1.7 hybrid storage
-  index (KAL-101). The full feature ships behind `KALAIROS_INDEX_SQLITE=1`
-  in a later release; set `KALAIROS_INDEX=off` to disable the index entirely
-  if a later version enables it by default and you need the legacy code path.
 
 ### Changed
+- `engines.node` simplified to `>=18`.
+- Entity normalization extracted to `store/entity-normalizer.js` so the
+  SQLite rebuild path and the in-memory hot cache share the same
+  legacy-data defaulting and version-backfill logic. Pure refactor — no
+  behaviour change; full test suite passes byte-for-byte at the same
+  counts as before.
 - `store/file-store.js`: writes and appends now `fsync` before returning,
   honouring CLAUDE.md §18 durability claims.
 - `store/file-store.js`: orphaned `.tmp` files left by a crash mid-rename are

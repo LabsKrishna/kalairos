@@ -1,10 +1,17 @@
-"""Phase 0 smoke test: package imports and schema stays in sync with JS."""
+"""Smoke + cross-language drift tests.
+
+Package surface checks live here. Anything that asserts "Python is in sync
+with JS source of truth" (SCHEMA_VERSION, meta keys, schema DDL, PRAGMA
+ordering) also lives here so a single test run answers: did either side
+drift?
+"""
 
 import re
 from pathlib import Path
 
 import kalairos
 from kalairos import schema
+from kalairos.sqlite_index import PRAGMAS, SCHEMA_V1_SQL
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 JS_SQLITE_INDEX = REPO_ROOT / "store" / "sqlite-index.js"
@@ -50,4 +57,34 @@ def test_meta_keys_referenced_in_js():
     assert not missing, (
         f"Meta keys declared in Python but not found in {JS_SQLITE_INDEX}: "
         f"{missing}"
+    )
+
+
+def test_schema_v1_sql_matches_js_source_of_truth():
+    """The Python SCHEMA_V1_SQL must match the JS SCHEMA_V1_SQL template
+    literal verbatim (after trimming). DDL drift fails CI immediately —
+    same shape on both runtimes is the v1.7 storage invariant."""
+    js_source = JS_SQLITE_INDEX.read_text()
+    m = re.search(r"const SCHEMA_V1_SQL\s*=\s*`(.*?)`;", js_source, re.DOTALL)
+    assert m, f"Could not find SCHEMA_V1_SQL template literal in {JS_SQLITE_INDEX}"
+    js_sql = m.group(1).strip()
+    py_sql = SCHEMA_V1_SQL.strip()
+    assert py_sql == js_sql, (
+        "Python SCHEMA_V1_SQL drifted from JS source.\n\n"
+        f"--- JS ({JS_SQLITE_INDEX}) ---\n{js_sql}\n\n"
+        f"--- Python ---\n{py_sql}"
+    )
+
+
+def test_pragmas_match_js_source_of_truth():
+    """PRAGMA list (and ORDER) must match JS exactly. journal_mode must
+    come first — WAL has to be active before any DDL runs."""
+    js_source = JS_SQLITE_INDEX.read_text()
+    m = re.search(r"const PRAGMAS\s*=\s*\[(.*?)\];", js_source, re.DOTALL)
+    assert m, f"Could not find PRAGMAS array in {JS_SQLITE_INDEX}"
+    js_pragmas = tuple(re.findall(r'"([^"]+)"', m.group(1)))
+    assert PRAGMAS == js_pragmas, (
+        f"Python PRAGMAS drifted from JS source.\n"
+        f"  JS:     {js_pragmas}\n"
+        f"  Python: {PRAGMAS}"
     )

@@ -11,10 +11,14 @@ from pathlib import Path
 
 import kalairos
 from kalairos import schema
+from kalairos.entity_normalizer import _SOURCE_TRUST_DEFAULTS, _VALID_MEMORY_TYPES
 from kalairos.sqlite_index import PRAGMAS, SCHEMA_V1_SQL
+from kalairos.versioning import ACTIONS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 JS_SQLITE_INDEX = REPO_ROOT / "store" / "sqlite-index.js"
+JS_ENTITY_NORMALIZER = REPO_ROOT / "store" / "entity-normalizer.js"
+JS_VERSIONING = REPO_ROOT / "versioning.js"
 
 
 def test_package_imports():
@@ -87,4 +91,58 @@ def test_pragmas_match_js_source_of_truth():
         f"Python PRAGMAS drifted from JS source.\n"
         f"  JS:     {js_pragmas}\n"
         f"  Python: {PRAGMAS}"
+    )
+
+
+def test_source_trust_defaults_match_js_source_of_truth():
+    """Default trust scores by source type must match JS verbatim. These
+    set the implicit trust floor on every entity, so drift changes which
+    rows are considered trustworthy by recall — a behavioral break, not
+    just a cosmetic one."""
+    js_source = JS_ENTITY_NORMALIZER.read_text()
+    m = re.search(
+        r"_SOURCE_TRUST_DEFAULTS\s*=\s*\{([^}]+)\}", js_source, re.DOTALL
+    )
+    assert m, f"Could not find _SOURCE_TRUST_DEFAULTS in {JS_ENTITY_NORMALIZER}"
+    js_defaults: dict[str, float] = {}
+    for match in re.finditer(r"(\w+):\s*([0-9.]+)", m.group(1)):
+        js_defaults[match.group(1)] = float(match.group(2))
+    assert _SOURCE_TRUST_DEFAULTS == js_defaults, (
+        f"Trust defaults drifted.\n  JS:     {js_defaults}\n"
+        f"  Python: {_SOURCE_TRUST_DEFAULTS}"
+    )
+
+
+def test_valid_memory_types_match_js_source_of_truth():
+    """The set of accepted memoryType values must match JS. A type valid
+    in one runtime but invalid in the other would silently downgrade to
+    'long-term' on the stricter side."""
+    js_source = JS_ENTITY_NORMALIZER.read_text()
+    m = re.search(
+        r"_VALID_MEMORY_TYPES\s*=\s*new Set\(\[(.*?)\]\)", js_source, re.DOTALL
+    )
+    assert m, f"Could not find _VALID_MEMORY_TYPES in {JS_ENTITY_NORMALIZER}"
+    js_types = set(re.findall(r'"([^"]+)"', m.group(1)))
+    assert set(_VALID_MEMORY_TYPES) == js_types, (
+        f"Valid memory types drifted.\n  JS:     {js_types}\n"
+        f"  Python: {set(_VALID_MEMORY_TYPES)}"
+    )
+
+
+def test_actions_vocab_matches_js_source_of_truth():
+    """Audit-trail action vocabulary must match. The trail is "auditable"
+    only if readers can switch on a closed enum — drift means a switch
+    statement on one runtime would silently miss actions written by the
+    other."""
+    js_source = JS_VERSIONING.read_text()
+    m = re.search(
+        r"const ACTIONS\s*=\s*Object\.freeze\(\{([^}]+)\}\)", js_source, re.DOTALL
+    )
+    assert m, f"Could not find ACTIONS object in {JS_VERSIONING}"
+    js_actions: dict[str, str] = {}
+    for match in re.finditer(r'(\w+):\s*"([^"]+)"', m.group(1)):
+        js_actions[match.group(1)] = match.group(2)
+    py_actions = dict(ACTIONS)
+    assert py_actions == js_actions, (
+        f"ACTIONS vocab drifted.\n  JS:     {js_actions}\n  Python: {py_actions}"
     )

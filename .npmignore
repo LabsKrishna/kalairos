@@ -8,3 +8,14 @@ CLAUDE.md
 *.log
 TEMP_CHANGELOG.md
 dashboard.html
+
+# Agent-platform epic — Python kernel + runtime + mainframe live here.
+# Not part of the npm package; the JS `kalairos` package ships JS only.
+python/
+*.py
+*.pyc
+__pycache__/
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/

@@ -11,6 +11,7 @@ from .ledger import Ledger
 from .schema import SCHEMA_VERSION
 from .server import LedgerServer
 from .sqlite_index import SqliteStreamer
+from .tool import Tool, ToolRegistry, tool
 
 __all__ = [
     "JsonlAppender",
@@ -18,5 +19,8 @@ __all__ = [
     "LedgerServer",
     "SCHEMA_VERSION",
     "SqliteStreamer",
+    "Tool",
+    "ToolRegistry",
+    "tool",
     "__version__",
 ]

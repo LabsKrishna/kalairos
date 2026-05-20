@@ -12,8 +12,10 @@ Contract (the one rule we never break):
 
 Phase 1.2.1: open / close / health_check + schema v1.
 Phase 1.2.3: _apply_entity + _sha256_first_4kb + rebuild() + rebuild_from().
-Phase 1.2.4 (this file's current state): decide_on_boot + replay_forward.
-Phase 1.2.5+: live-write apply path.
+Phase 1.2.4: decide_on_boot + replay_forward.
+Phase 1.2.5 (this file's current state): live-write apply_entity +
+  truncate_and_replay + mark_dirty.
+Phase 1.3+: Ledger wiring on top of this surface.
 """
 
 from __future__ import annotations
@@ -775,6 +777,147 @@ class SqliteStreamer:
         if self.db is not None:
             self.close()
         return rebuild(jsonl_path, target)
+
+    def apply_entity(
+        self,
+        row: dict,
+        jsonl_offset: int,
+        jsonl_size_after: int | None = None,
+    ) -> None:
+        """Apply one entity's UPSERTs in a single transaction (spec §4).
+
+        The live-write path: every successful append to JSONL must be
+        followed by `apply_entity` so SQLite stays in sync with the
+        canonical store. `jsonl_size_after` defaults to `jsonl_offset` for
+        callers that don't track the post-write file size separately;
+        decide_on_boot reads `meta.last_jsonl_offset` to detect divergence,
+        so passing the actual post-write size keeps the boot decision
+        sharper.
+
+        Raises RuntimeError if the streamer isn't open. On internal SQLite
+        failure the transaction is rolled back and the error re-raised so
+        the caller can call mark_dirty() and reject the originating write.
+        """
+        if self.db is None:
+            raise RuntimeError(
+                "SqliteStreamer.apply_entity: index is not open"
+            )
+        size_after = (
+            jsonl_size_after if jsonl_size_after is not None else jsonl_offset
+        )
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            _apply_entity(self.db, row, jsonl_offset)
+            _upsert_meta(self.db, META_KEY_JSONL_SIZE_BYTES, str(size_after))
+            _upsert_meta(self.db, META_KEY_LAST_JSONL_OFFSET, str(size_after))
+            self.db.execute("COMMIT")
+        except Exception:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+
+    def truncate_and_replay(self, jsonl_path: Path | str) -> None:
+        """Wipe every row table and replay the JSONL into this connection
+        in one transaction (spec §6.1).
+
+        Used by the persist_all/rewrite path: after the canonical JSONL is
+        rewritten in place, SQLite's prior contents reflect the *old*
+        JSONL and its byte offsets, so we wipe and re-derive in one
+        transaction. Same critical section as the JSONL rewrite — no
+        window where SQLite reflects the old JSONL after persist_all
+        has acked.
+
+        Refreshes every meta key decide_on_boot reads (jsonl_size_bytes,
+        last_jsonl_offset, jsonl_sha256_first_4kb, dirty=0) so the next
+        boot lands in branch f (READY).
+        """
+        if self.db is None:
+            raise RuntimeError(
+                "SqliteStreamer.truncate_and_replay: index is not open"
+            )
+        jsonl_path = Path(jsonl_path)
+        jsonl_exists = jsonl_path.exists()
+        jsonl_size = jsonl_path.stat().st_size if jsonl_exists else 0
+        jsonl_sha = (
+            _sha256_first_4kb(jsonl_path)
+            if (jsonl_exists and jsonl_size > 0)
+            else ""
+        )
+
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            # Wipe row tables. facts_fts is content-linked and auto-cleaned
+            # by the AFTER DELETE trigger on facts; we don't touch it.
+            self.db.execute("DELETE FROM facts")
+            self.db.execute("DELETE FROM fact_versions")
+            self.db.execute("DELETE FROM links")
+
+            if jsonl_exists and jsonl_size > 0:
+                with open(jsonl_path, "rb") as f:
+                    offset = 0
+                    for line_bytes in f:
+                        line_start = offset
+                        offset += len(line_bytes)
+                        line = line_bytes.rstrip(b"\n").decode("utf-8")
+                        if not line:
+                            continue
+                        try:
+                            raw = json.loads(line)
+                        except json.JSONDecodeError:
+                            log.warning(
+                                "SqliteStreamer.truncate_and_replay: "
+                                "skipping malformed JSONL line at offset %d",
+                                line_start,
+                            )
+                            continue
+                        try:
+                            entity = normalize_raw(raw)
+                            _apply_entity(self.db, entity, line_start)
+                        except Exception as e:
+                            log.warning(
+                                "SqliteStreamer.truncate_and_replay: "
+                                "skipping unindexable entity %r: %s",
+                                raw.get("id") if isinstance(raw, dict) else None,
+                                e,
+                            )
+
+            _upsert_meta(self.db, META_KEY_JSONL_SIZE_BYTES, str(jsonl_size))
+            _upsert_meta(self.db, META_KEY_LAST_JSONL_OFFSET, str(jsonl_size))
+            _upsert_meta(self.db, META_KEY_JSONL_SHA256_FIRST_4KB, jsonl_sha)
+            _upsert_meta(self.db, META_KEY_DIRTY, "0")
+
+            self.db.execute("COMMIT")
+        except Exception:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+
+    def mark_dirty(self) -> None:
+        """Best-effort `meta.dirty = "1"` flag. Called by the live-write
+        path after a write txn fails so the next boot's decide_on_boot
+        triggers REBUILD via branch h.
+
+        Runs outside any transaction (the prior one already failed) and
+        swallows its own errors — if even this write fails, JSONL is
+        still canonical and the user's data is intact. The cost of
+        false-positive dirty is one extra rebuild on next start; the
+        cost of false-negative dirty is the SQLite index drifts silently
+        from JSONL. We pick the former.
+        """
+        if self.db is None:
+            return
+        try:
+            self.db.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (META_KEY_DIRTY, "1"),
+            )
+        except sqlite3.Error:
+            # Intentional swallow — see docstring.
+            pass
 
     def _meta(self, key: str) -> str | None:
         if self.db is None:

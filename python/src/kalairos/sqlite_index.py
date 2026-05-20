@@ -1,23 +1,49 @@
 """SqliteStreamer — streams JSONL appends into the derived SQLite read index.
 
 Mirrors `store/sqlite-index.js`: schema v1, WAL mode with the §11 PRAGMA
-set, and (in subsequent sub-PRs) the READY/REPLAY/REBUILD boot decision
-tree, stream-rebuild, replay-forward, and live-write apply path.
+set, stream-rebuild from JSONL, and (in subsequent sub-PRs) the
+READY/REPLAY/REBUILD boot decision tree, replay-forward, and live-write
+apply path.
 
 Contract (the one rule we never break):
   Every row in this database was first in JSONL. SQLite is a derived,
-  rebuildable cache.
+  rebuildable cache. If it disappears, `rebuild()` reconstructs it
+  deterministically from JSONL.
 
-Phase 1.2.1 lands the connection lifecycle and schema. Streaming and
-applying entities follow in Phase 1.2.2+.
+Phase 1.2.1: open / close / health_check + schema v1.
+Phase 1.2.3 (this file's current state): _apply_entity + _sha256_first_4kb +
+  rebuild() + SqliteStreamer.rebuild_from().
+Phase 1.2.4+: boot decision tree, replay-forward, live-write apply path.
 """
 
 from __future__ import annotations
 
+import errno
+import hashlib
+import json
+import logging
+import math
+import os
 import sqlite3
+import time
 from pathlib import Path
+from typing import Any
 
-from .schema import SCHEMA_VERSION
+from .__about__ import __version__
+from .entity_normalizer import normalize_raw
+from .schema import (
+    META_KEY_DIRTY,
+    META_KEY_INDEX_BUILT_AT,
+    META_KEY_JSONL_PATH,
+    META_KEY_JSONL_SHA256_FIRST_4KB,
+    META_KEY_JSONL_SIZE_BYTES,
+    META_KEY_KALAIROS_VERSION,
+    META_KEY_LAST_JSONL_OFFSET,
+    SCHEMA_VERSION,
+)
+
+log = logging.getLogger(__name__)
+
 
 # PRAGMA configuration (spec §11). Applied on every open(); order matters
 # — journal_mode first so WAL is in effect before any DDL, then synchronous
@@ -35,6 +61,18 @@ PRAGMAS = (
     "wal_autocheckpoint = 1000",
     "temp_store = MEMORY",
     "mmap_size = 268435456",
+    "cache_size = -65536",
+    "foreign_keys = OFF",
+)
+
+# Rebuild-time PRAGMAs (spec §7). journal_mode = DELETE (not WAL) so the
+# rebuild stays in a single file before the atomic rename swap; WAL leaves
+# `-wal` and `-shm` siblings that complicate moving the DB into place.
+# After rename, the next `open()` flips back to WAL automatically.
+REBUILD_PRAGMAS = (
+    "journal_mode = DELETE",
+    "synchronous = NORMAL",
+    "temp_store = MEMORY",
     "cache_size = -65536",
     "foreign_keys = OFF",
 )
@@ -125,11 +163,293 @@ def apply_schema_v1(db: sqlite3.Connection) -> None:
     db.commit()
 
 
+# ── Hashing / fingerprinting ────────────────────────────────────────────────
+
+
+def _sha256_first_4kb(path: Path | str) -> str:
+    """SHA-256 of the first 4 KiB of a file. Used by the boot decision
+    tree as a cheap fingerprint to detect that JSONL has been *replaced*
+    (versus appended-to) since the last open.
+
+    Returns the hex digest. Reads at most 4096 bytes — large files are
+    not hashed in full because we only need divergence detection, not
+    integrity.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        chunk = f.read(4096)
+        if chunk:
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ── Apply entity to SQLite (UPSERT into facts/fact_versions/links) ──────────
+
+
+def _apply_entity(db: sqlite3.Connection, raw: dict, jsonl_offset: int) -> None:
+    """UPSERT one entity into facts/fact_versions/links.
+
+    Mirrors `store/sqlite-index.js` _applyEntity step-for-step. Caller is
+    responsible for the transaction frame — both rebuild() (single big txn)
+    and the live-write path (per-write txn) use this helper.
+    """
+    eid = str(raw["id"])
+    versions = raw.get("versions") or []
+    # In JS the versions list is newest-first after normalize_raw; we walk
+    # oldest-first for inserts so version=1 (oldest) lands first, matching
+    # the natural reading order of the audit trail.
+    oldest_first = list(reversed(versions))
+    created_at = oldest_first[0].get("timestamp", 0) if oldest_first else 0
+    updated_at = versions[0].get("timestamp", created_at) if versions else created_at
+
+    db.execute(
+        """
+        INSERT INTO facts (
+          id, text, namespace, type, workspace_id, tags,
+          trust_score, confidence, created_at, updated_at,
+          deleted_at, deleted_by, source_turn_id, jsonl_offset
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          text           = excluded.text,
+          namespace      = excluded.namespace,
+          type           = excluded.type,
+          workspace_id   = excluded.workspace_id,
+          tags           = excluded.tags,
+          trust_score    = excluded.trust_score,
+          confidence     = excluded.confidence,
+          created_at     = excluded.created_at,
+          updated_at     = excluded.updated_at,
+          deleted_at     = excluded.deleted_at,
+          deleted_by     = excluded.deleted_by,
+          source_turn_id = excluded.source_turn_id,
+          jsonl_offset   = excluded.jsonl_offset
+        """,
+        (
+            eid,
+            str(raw.get("text") or ""),
+            str(raw["memoryType"]),
+            raw.get("type"),
+            raw.get("workspaceId"),
+            json.dumps(raw.get("tags") or []),
+            _finite_or_none(raw.get("trustScore")),
+            None,  # confidence — not populated in v1 spec
+            int(created_at or 0),
+            int(updated_at or 0),
+            raw.get("deletedAt"),
+            raw.get("deletedBy"),
+            None,  # source_turn_id — not populated in v1 spec
+            jsonl_offset,
+        ),
+    )
+
+    for i, v in enumerate(oldest_first):
+        v_trust = _finite_or_none(v.get("trustScore"))
+        if v_trust is None:
+            v_trust = _finite_or_none(raw.get("trustScore"))
+        db.execute(
+            """
+            INSERT OR REPLACE INTO fact_versions (
+              fact_id, version, text, trust_score, written_at, jsonl_offset
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                eid,
+                i + 1,
+                str(v.get("text") or raw.get("text") or ""),
+                v_trust,
+                int(v.get("timestamp") or v.get("ingestAt") or 0),
+                jsonl_offset,
+            ),
+        )
+
+    # Delete-before-insert keeps live re-writes correct: if a later JSONL
+    # line drops a link, that drop must reflect in SQLite. On a rebuild,
+    # the delete is a no-op for first visits.
+    db.execute("DELETE FROM links WHERE src_id = ?", (eid,))
+    # Legacy entity links carry no per-link kind. The sentinel "related"
+    # keeps (src_id, dst_id, kind) PK well-defined and deterministic across
+    # rebuilds.
+    for dst in raw.get("links") or []:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO links (src_id, dst_id, kind, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (eid, str(dst), "related", int(created_at or 0)),
+        )
+
+
+# ── Stream-rebuild from JSONL ───────────────────────────────────────────────
+
+
+def rebuild(jsonl_path: Path | str, sqlite_path: Path | str) -> dict:
+    """Stream-rebuild a SQLite index from a canonical JSONL ledger.
+
+    Crash-safety strategy mirrors store/sqlite-index.js's rebuild(): build
+    at `<sqlite_path>.rebuild`, fsync, atomically rename into place. If
+    the caller crashes mid-rebuild, the canonical SQLite file is untouched
+    and the orphan `.rebuild` is reaped on the next attempt.
+
+    Returns `{"rows_applied": N, "jsonl_size": K, "last_offset": L}`.
+    """
+    jsonl_path = Path(jsonl_path)
+    sqlite_path = Path(sqlite_path)
+    tmp_path = sqlite_path.parent / (sqlite_path.name + ".rebuild")
+
+    # Reap orphan .rebuild + WAL/SHM siblings from a prior crashed attempt.
+    for stale in (tmp_path, Path(f"{tmp_path}-wal"), Path(f"{tmp_path}-shm")):
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            pass
+
+    jsonl_exists = jsonl_path.exists()
+    jsonl_size = jsonl_path.stat().st_size if jsonl_exists else 0
+    jsonl_sha = (
+        _sha256_first_4kb(jsonl_path) if (jsonl_exists and jsonl_size > 0) else ""
+    )
+
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_db = sqlite3.connect(str(tmp_path), isolation_level=None)
+    try:
+        for pragma in REBUILD_PRAGMAS:
+            tmp_db.execute(f"PRAGMA {pragma}")
+        apply_schema_v1(tmp_db)
+
+        rows_applied = 0
+        last_offset = 0
+
+        tmp_db.execute("BEGIN IMMEDIATE")
+        try:
+            if jsonl_exists and jsonl_size > 0:
+                with open(jsonl_path, "rb") as f:
+                    offset = 0
+                    for line_bytes in f:
+                        line_start = offset
+                        offset += len(line_bytes)
+                        line = line_bytes.rstrip(b"\n").decode("utf-8")
+                        if not line:
+                            continue
+                        try:
+                            raw = json.loads(line)
+                        except json.JSONDecodeError:
+                            log.warning(
+                                "SqliteStreamer.rebuild: skipping malformed "
+                                "JSONL line at offset %d",
+                                line_start,
+                            )
+                            continue
+                        try:
+                            entity = normalize_raw(raw)
+                            _apply_entity(tmp_db, entity, line_start)
+                            rows_applied += 1
+                        except Exception as e:
+                            log.warning(
+                                "SqliteStreamer.rebuild: skipping unindexable "
+                                "entity %r: %s",
+                                raw.get("id") if isinstance(raw, dict) else None,
+                                e,
+                            )
+                    last_offset = offset
+
+            # Meta written exactly once at the end of the txn so a partial
+            # rebuild never leaves stale meta visible — the orphan tmp DB
+            # gets reaped instead.
+            _upsert_meta(tmp_db, META_KEY_JSONL_PATH, str(jsonl_path))
+            _upsert_meta(tmp_db, META_KEY_JSONL_SIZE_BYTES, str(jsonl_size))
+            _upsert_meta(tmp_db, META_KEY_JSONL_SHA256_FIRST_4KB, jsonl_sha)
+            _upsert_meta(tmp_db, META_KEY_LAST_JSONL_OFFSET, str(last_offset))
+            _upsert_meta(tmp_db, META_KEY_KALAIROS_VERSION, __version__)
+            _upsert_meta(
+                tmp_db, META_KEY_INDEX_BUILT_AT, str(int(time.time() * 1000))
+            )
+            _upsert_meta(tmp_db, META_KEY_DIRTY, "0")
+
+            tmp_db.execute("COMMIT")
+        except Exception:
+            try:
+                tmp_db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+    except Exception:
+        tmp_db.close()
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+    tmp_db.close()
+    os.replace(tmp_path, sqlite_path)
+    _fsync_dir(sqlite_path.parent)
+
+    return {
+        "rows_applied": rows_applied,
+        "jsonl_size": jsonl_size,
+        "last_offset": last_offset,
+    }
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _upsert_meta(db: sqlite3.Connection, key: str, value: str) -> None:
+    db.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value)
+    )
+
+
+def _finite_or_none(x: Any):
+    """Return x if it's a finite number, else None — matches the JS
+    `Number.isFinite(x) ? x : null` check used at SQLite-write time."""
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        if math.isnan(x) or math.isinf(x):
+            return None
+        return x
+    return None
+
+
+# Errnos tolerated when fsyncing a directory. Mirrors
+# python/src/kalairos/jsonl.py — Windows can't open a directory for read at
+# all (EACCES); some filesystems return ENOTSUP / EINVAL when fsyncing a
+# directory fd. Anything else surfaces.
+_DIR_FSYNC_OK = frozenset(
+    {errno.EACCES, errno.EISDIR, errno.EINVAL, errno.ENOTSUP, errno.EPERM}
+)
+
+
+def _fsync_dir(dir_path: Path) -> None:
+    """Best-effort fsync of a directory after a rename. Mirrors
+    python/src/kalairos/jsonl.py — see that file for the platform exception
+    list rationale."""
+    try:
+        fd = os.open(dir_path, os.O_RDONLY)
+    except OSError as e:
+        if e.errno in _DIR_FSYNC_OK:
+            return
+        raise
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as e:
+            if e.errno not in _DIR_FSYNC_OK:
+                raise
+    finally:
+        os.close(fd)
+
+
+# ── SqliteStreamer class ────────────────────────────────────────────────────
+
+
 class SqliteStreamer:
     """Connection lifecycle for the SQLite read index over canonical JSONL.
 
     Phase 1.2.1: open / close / health_check + schema v1.
-    Phase 1.2.2+: stream-rebuild, replay-forward, apply-entity, decision tree.
+    Phase 1.2.3 (current): + `rebuild_from()` (close + standalone rebuild).
+    Phase 1.2.4+: boot decision tree, replay-forward, live-write apply path.
     """
 
     def __init__(self, path: Path | str):
@@ -149,9 +469,9 @@ class SqliteStreamer:
                 f"SqliteStreamer.open: already open at {self._open_path!r}, "
                 f"refusing to reopen at {path_str!r}"
             )
-        # isolation_level=None means we manage BEGIN/COMMIT explicitly — the
-        # apply-entity and truncate-and-replay paths (Phase 1.2.4+) need
-        # explicit transaction frames.
+        # isolation_level=None means we manage BEGIN/COMMIT explicitly —
+        # the apply-entity and truncate-and-replay paths (Phase 1.2.4+)
+        # need explicit transaction frames.
         db = sqlite3.connect(path_str, isolation_level=None)
         for pragma in PRAGMAS:
             db.execute(f"PRAGMA {pragma}")
@@ -169,13 +489,9 @@ class SqliteStreamer:
             self._open_path = None
 
     def health_check(self) -> dict:
-        """Diagnostic snapshot of the index state. Used by tests verifying
-        the PRAGMAs took effect and by future CLI status commands.
-
-        For `:memory:` databases SQLite silently downgrades journal_mode
-        from `wal` to `memory` — WAL is a file-level mode. Treat both as
-        healthy.
-        """
+        """Diagnostic snapshot of the index state. For `:memory:` SQLite
+        silently downgrades journal_mode from `wal` to `memory` — treat
+        both as healthy."""
         if self.db is None:
             return {"open": False}
         journal_mode = self.db.execute("PRAGMA journal_mode").fetchone()[0]
@@ -187,6 +503,23 @@ class SqliteStreamer:
             "synchronous": synchronous,
             "schema_version": self._meta("schema_version"),
         }
+
+    def rebuild_from(
+        self, jsonl_path: Path | str, sqlite_path: Path | str | None = None
+    ) -> dict:
+        """Rebuild this index from `jsonl_path`. Defaults `sqlite_path` to
+        `self.path` so the common case (`idx.rebuild_from(jsonl)`) works
+        after a prior open(). Closes the current connection first; caller
+        re-opens when ready."""
+        target = sqlite_path if sqlite_path is not None else self.path
+        if target is None:
+            raise ValueError(
+                "SqliteStreamer.rebuild_from: sqlite_path required "
+                "(no instance path set)"
+            )
+        if self.db is not None:
+            self.close()
+        return rebuild(jsonl_path, target)
 
     def _meta(self, key: str) -> str | None:
         if self.db is None:

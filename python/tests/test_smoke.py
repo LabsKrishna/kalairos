@@ -12,7 +12,7 @@ from pathlib import Path
 import kalairos
 from kalairos import schema
 from kalairos.entity_normalizer import _SOURCE_TRUST_DEFAULTS, _VALID_MEMORY_TYPES
-from kalairos.sqlite_index import PRAGMAS, SCHEMA_V1_SQL
+from kalairos.sqlite_index import PRAGMAS, REBUILD_PRAGMAS, SCHEMA_V1_SQL
 from kalairos.versioning import ACTIONS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -91,6 +91,21 @@ def test_pragmas_match_js_source_of_truth():
         f"Python PRAGMAS drifted from JS source.\n"
         f"  JS:     {js_pragmas}\n"
         f"  Python: {PRAGMAS}"
+    )
+
+
+def test_rebuild_pragmas_match_js_source_of_truth():
+    """The rebuild-time PRAGMA set must match too. journal_mode=DELETE
+    (not WAL) is deliberate for rebuild — WAL leaves `-wal` and `-shm`
+    siblings that complicate the atomic rename swap."""
+    js_source = JS_SQLITE_INDEX.read_text()
+    m = re.search(r"const REBUILD_PRAGMAS\s*=\s*\[(.*?)\];", js_source, re.DOTALL)
+    assert m, f"Could not find REBUILD_PRAGMAS array in {JS_SQLITE_INDEX}"
+    js_pragmas = tuple(re.findall(r'"([^"]+)"', m.group(1)))
+    assert REBUILD_PRAGMAS == js_pragmas, (
+        f"Python REBUILD_PRAGMAS drifted from JS source.\n"
+        f"  JS:     {js_pragmas}\n"
+        f"  Python: {REBUILD_PRAGMAS}"
     )
 
 

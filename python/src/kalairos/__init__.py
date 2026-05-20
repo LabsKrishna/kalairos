@@ -9,6 +9,14 @@ from .__about__ import __version__
 from .jsonl import JsonlAppender
 from .ledger import Ledger
 from .schema import SCHEMA_VERSION
+from .server import LedgerServer
 from .sqlite_index import SqliteStreamer
 
-__all__ = ["JsonlAppender", "Ledger", "SCHEMA_VERSION", "SqliteStreamer", "__version__"]
+__all__ = [
+    "JsonlAppender",
+    "Ledger",
+    "LedgerServer",
+    "SCHEMA_VERSION",
+    "SqliteStreamer",
+    "__version__",
+]

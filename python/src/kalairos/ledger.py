@@ -121,10 +121,11 @@ class Ledger:
         """Get one fact by id. Returns `None` if not found or soft-deleted.
         Use `query(..., include_deleted=True)` to inspect tombstones."""
         self._require_open("get")
-        row = self.streamer.db.execute(
-            _SELECT_FACTS + " WHERE id = ? AND deleted_at IS NULL",
-            (entity_id,),
-        ).fetchone()
+        with self.streamer.lock:
+            row = self.streamer.db.execute(
+                _SELECT_FACTS + " WHERE id = ? AND deleted_at IS NULL",
+                (entity_id,),
+            ).fetchone()
         return _row_to_dict(row) if row else None
 
     def query(
@@ -156,7 +157,8 @@ class Ledger:
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
-        rows = self.streamer.db.execute(sql, params).fetchall()
+        with self.streamer.lock:
+            rows = self.streamer.db.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
 
     # ── Internal ───────────────────────────────────────────────────────

@@ -27,6 +27,7 @@ import logging
 import math
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -713,53 +714,68 @@ class SqliteStreamer:
         self.path = Path(path)
         self.db: sqlite3.Connection | None = None
         self._open_path: str | None = None
+        # Reentrant so methods can call helpers that re-take the lock
+        # (e.g. health_check → _meta). Guards every operation that
+        # touches `self.db` so the connection can be shared across
+        # threads (LedgerServer handles HTTP requests on worker threads
+        # but the connection was opened on the parent thread).
+        self.lock = threading.RLock()
 
     def open(self) -> None:
         """Open the SQLite index. Idempotent for the same path; raises if
         called with a different path while already open — there's only one
-        canonical SQLite file per Kalairos store."""
+        canonical SQLite file per Kalairos store.
+
+        `check_same_thread=False` is required because LedgerServer dispatches
+        HTTP requests onto worker threads, and the streamer connection
+        opened by the caller would otherwise be unusable from them.
+        Cross-thread safety is enforced by `self.lock`.
+        """
         path_str = str(self.path)
-        if self.db is not None:
-            if self._open_path == path_str:
-                return
-            raise RuntimeError(
-                f"SqliteStreamer.open: already open at {self._open_path!r}, "
-                f"refusing to reopen at {path_str!r}"
+        with self.lock:
+            if self.db is not None:
+                if self._open_path == path_str:
+                    return
+                raise RuntimeError(
+                    f"SqliteStreamer.open: already open at {self._open_path!r}, "
+                    f"refusing to reopen at {path_str!r}"
+                )
+            # isolation_level=None means we manage BEGIN/COMMIT explicitly.
+            db = sqlite3.connect(
+                path_str, isolation_level=None, check_same_thread=False
             )
-        # isolation_level=None means we manage BEGIN/COMMIT explicitly —
-        # the apply-entity and truncate-and-replay paths (Phase 1.2.4+)
-        # need explicit transaction frames.
-        db = sqlite3.connect(path_str, isolation_level=None)
-        for pragma in PRAGMAS:
-            db.execute(f"PRAGMA {pragma}")
-        apply_schema_v1(db)
-        self.db = db
-        self._open_path = path_str
+            for pragma in PRAGMAS:
+                db.execute(f"PRAGMA {pragma}")
+            apply_schema_v1(db)
+            self.db = db
+            self._open_path = path_str
 
     def close(self) -> None:
-        if self.db is None:
-            return
-        try:
-            self.db.close()
-        finally:
-            self.db = None
-            self._open_path = None
+        with self.lock:
+            if self.db is None:
+                return
+            try:
+                self.db.close()
+            finally:
+                self.db = None
+                self._open_path = None
 
     def health_check(self) -> dict:
         """Diagnostic snapshot of the index state. For `:memory:` SQLite
         silently downgrades journal_mode from `wal` to `memory` — treat
         both as healthy."""
-        if self.db is None:
-            return {"open": False}
-        journal_mode = self.db.execute("PRAGMA journal_mode").fetchone()[0]
-        synchronous = self.db.execute("PRAGMA synchronous").fetchone()[0]
-        return {
-            "open": True,
-            "path": self._open_path,
-            "journal_mode": journal_mode,
-            "synchronous": synchronous,
-            "schema_version": self._meta("schema_version"),
-        }
+        with self.lock:
+            if self.db is None:
+                return {"open": False}
+            journal_mode = self.db.execute("PRAGMA journal_mode").fetchone()[0]
+            synchronous = self.db.execute("PRAGMA synchronous").fetchone()[0]
+            return {
+                "open": True,
+                "path": self._open_path,
+                "journal_mode": journal_mode,
+                "synchronous": synchronous,
+                "schema_version": self._meta("schema_version"),
+            }
 
     def rebuild_from(
         self, jsonl_path: Path | str, sqlite_path: Path | str | None = None
@@ -798,25 +814,26 @@ class SqliteStreamer:
         failure the transaction is rolled back and the error re-raised so
         the caller can call mark_dirty() and reject the originating write.
         """
-        if self.db is None:
-            raise RuntimeError(
-                "SqliteStreamer.apply_entity: index is not open"
+        with self.lock:
+            if self.db is None:
+                raise RuntimeError(
+                    "SqliteStreamer.apply_entity: index is not open"
+                )
+            size_after = (
+                jsonl_size_after if jsonl_size_after is not None else jsonl_offset
             )
-        size_after = (
-            jsonl_size_after if jsonl_size_after is not None else jsonl_offset
-        )
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            _apply_entity(self.db, row, jsonl_offset)
-            _upsert_meta(self.db, META_KEY_JSONL_SIZE_BYTES, str(size_after))
-            _upsert_meta(self.db, META_KEY_LAST_JSONL_OFFSET, str(size_after))
-            self.db.execute("COMMIT")
-        except Exception:
+            self.db.execute("BEGIN IMMEDIATE")
             try:
-                self.db.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
-            raise
+                _apply_entity(self.db, row, jsonl_offset)
+                _upsert_meta(self.db, META_KEY_JSONL_SIZE_BYTES, str(size_after))
+                _upsert_meta(self.db, META_KEY_LAST_JSONL_OFFSET, str(size_after))
+                self.db.execute("COMMIT")
+            except Exception:
+                try:
+                    self.db.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
 
     def truncate_and_replay(self, jsonl_path: Path | str) -> None:
         """Wipe every row table and replay the JSONL into this connection
@@ -833,68 +850,70 @@ class SqliteStreamer:
         last_jsonl_offset, jsonl_sha256_first_4kb, dirty=0) so the next
         boot lands in branch f (READY).
         """
-        if self.db is None:
-            raise RuntimeError(
-                "SqliteStreamer.truncate_and_replay: index is not open"
+        with self.lock:
+            if self.db is None:
+                raise RuntimeError(
+                    "SqliteStreamer.truncate_and_replay: index is not open"
+                )
+            jsonl_path = Path(jsonl_path)
+            jsonl_exists = jsonl_path.exists()
+            jsonl_size = jsonl_path.stat().st_size if jsonl_exists else 0
+            jsonl_sha = (
+                _sha256_first_4kb(jsonl_path)
+                if (jsonl_exists and jsonl_size > 0)
+                else ""
             )
-        jsonl_path = Path(jsonl_path)
-        jsonl_exists = jsonl_path.exists()
-        jsonl_size = jsonl_path.stat().st_size if jsonl_exists else 0
-        jsonl_sha = (
-            _sha256_first_4kb(jsonl_path)
-            if (jsonl_exists and jsonl_size > 0)
-            else ""
-        )
 
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            # Wipe row tables. facts_fts is content-linked and auto-cleaned
-            # by the AFTER DELETE trigger on facts; we don't touch it.
-            self.db.execute("DELETE FROM facts")
-            self.db.execute("DELETE FROM fact_versions")
-            self.db.execute("DELETE FROM links")
-
-            if jsonl_exists and jsonl_size > 0:
-                with open(jsonl_path, "rb") as f:
-                    offset = 0
-                    for line_bytes in f:
-                        line_start = offset
-                        offset += len(line_bytes)
-                        line = line_bytes.rstrip(b"\n").decode("utf-8")
-                        if not line:
-                            continue
-                        try:
-                            raw = json.loads(line)
-                        except json.JSONDecodeError:
-                            log.warning(
-                                "SqliteStreamer.truncate_and_replay: "
-                                "skipping malformed JSONL line at offset %d",
-                                line_start,
-                            )
-                            continue
-                        try:
-                            entity = normalize_raw(raw)
-                            _apply_entity(self.db, entity, line_start)
-                        except Exception as e:
-                            log.warning(
-                                "SqliteStreamer.truncate_and_replay: "
-                                "skipping unindexable entity %r: %s",
-                                raw.get("id") if isinstance(raw, dict) else None,
-                                e,
-                            )
-
-            _upsert_meta(self.db, META_KEY_JSONL_SIZE_BYTES, str(jsonl_size))
-            _upsert_meta(self.db, META_KEY_LAST_JSONL_OFFSET, str(jsonl_size))
-            _upsert_meta(self.db, META_KEY_JSONL_SHA256_FIRST_4KB, jsonl_sha)
-            _upsert_meta(self.db, META_KEY_DIRTY, "0")
-
-            self.db.execute("COMMIT")
-        except Exception:
+            self.db.execute("BEGIN IMMEDIATE")
             try:
-                self.db.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
-            raise
+                # Wipe row tables. facts_fts is content-linked and
+                # auto-cleaned by the AFTER DELETE trigger on facts;
+                # we don't touch it directly.
+                self.db.execute("DELETE FROM facts")
+                self.db.execute("DELETE FROM fact_versions")
+                self.db.execute("DELETE FROM links")
+
+                if jsonl_exists and jsonl_size > 0:
+                    with open(jsonl_path, "rb") as f:
+                        offset = 0
+                        for line_bytes in f:
+                            line_start = offset
+                            offset += len(line_bytes)
+                            line = line_bytes.rstrip(b"\n").decode("utf-8")
+                            if not line:
+                                continue
+                            try:
+                                raw = json.loads(line)
+                            except json.JSONDecodeError:
+                                log.warning(
+                                    "SqliteStreamer.truncate_and_replay: "
+                                    "skipping malformed JSONL line at offset %d",
+                                    line_start,
+                                )
+                                continue
+                            try:
+                                entity = normalize_raw(raw)
+                                _apply_entity(self.db, entity, line_start)
+                            except Exception as e:
+                                log.warning(
+                                    "SqliteStreamer.truncate_and_replay: "
+                                    "skipping unindexable entity %r: %s",
+                                    raw.get("id") if isinstance(raw, dict) else None,
+                                    e,
+                                )
+
+                _upsert_meta(self.db, META_KEY_JSONL_SIZE_BYTES, str(jsonl_size))
+                _upsert_meta(self.db, META_KEY_LAST_JSONL_OFFSET, str(jsonl_size))
+                _upsert_meta(self.db, META_KEY_JSONL_SHA256_FIRST_4KB, jsonl_sha)
+                _upsert_meta(self.db, META_KEY_DIRTY, "0")
+
+                self.db.execute("COMMIT")
+            except Exception:
+                try:
+                    self.db.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
 
     def mark_dirty(self) -> None:
         """Best-effort `meta.dirty = "1"` flag. Called by the live-write
@@ -908,21 +927,23 @@ class SqliteStreamer:
         cost of false-negative dirty is the SQLite index drifts silently
         from JSONL. We pick the former.
         """
-        if self.db is None:
-            return
-        try:
-            self.db.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-                (META_KEY_DIRTY, "1"),
-            )
-        except sqlite3.Error:
-            # Intentional swallow — see docstring.
-            pass
+        with self.lock:
+            if self.db is None:
+                return
+            try:
+                self.db.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    (META_KEY_DIRTY, "1"),
+                )
+            except sqlite3.Error:
+                # Intentional swallow — see docstring.
+                pass
 
     def _meta(self, key: str) -> str | None:
-        if self.db is None:
-            return None
-        row = self.db.execute(
-            "SELECT value FROM meta WHERE key = ?", (key,)
-        ).fetchone()
-        return row[0] if row else None
+        with self.lock:
+            if self.db is None:
+                return None
+            row = self.db.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+            return row[0] if row else None

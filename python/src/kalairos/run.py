@@ -84,7 +84,7 @@ class Run:
                 f"Run.start: cannot start from status {self.status!r}"
             )
         self.status = STATUS_RUNNING
-        self._emit(
+        self.emit(
             EVENT_RUN_STARTED,
             {
                 "agent": self.agent.name,
@@ -98,21 +98,21 @@ class Run:
         self._require_running("finish")
         self.status = STATUS_COMPLETED
         self.result = result
-        self._emit(EVENT_RUN_COMPLETED, {"result": result})
+        self.emit(EVENT_RUN_COMPLETED, {"result": result})
 
     def fail(self, error: str) -> None:
         """Transition running → failed with an error message."""
         self._require_running("fail")
         self.status = STATUS_FAILED
         self.error = error
-        self._emit(EVENT_RUN_FAILED, {"error": error})
+        self.emit(EVENT_RUN_FAILED, {"error": error})
 
     # ── Stepping ───────────────────────────────────────────────────────
 
     def think(self, text: str) -> None:
         """Record a reasoning step without invoking a tool."""
         self._require_running("think")
-        self._emit(EVENT_THOUGHT, {"text": text})
+        self.emit(EVENT_THOUGHT, {"text": text})
 
     def call_tool(self, tool_name: str, **kwargs: Any) -> Any:
         """Invoke a tool by name. Emits tool_call_requested before, then
@@ -125,14 +125,14 @@ class Run:
         """
         self._require_running("call_tool")
         t = self.agent.tools.get(tool_name)  # KeyError if missing
-        self._emit(
+        self.emit(
             EVENT_TOOL_CALL_REQUESTED,
             {"tool": tool_name, "input": kwargs},
         )
         try:
             result = t.call(**kwargs)
         except Exception as e:
-            self._emit(
+            self.emit(
                 EVENT_TOOL_CALL_FAILED,
                 {
                     "tool": tool_name,
@@ -141,7 +141,7 @@ class Run:
                 },
             )
             raise
-        self._emit(
+        self.emit(
             EVENT_TOOL_CALL_RESULT,
             {"tool": tool_name, "result": result},
         )
@@ -155,15 +155,22 @@ class Run:
                 f"Run.{op}: not running (status={self.status!r})"
             )
 
-    def _emit(self, event_type: str, payload: dict) -> str:
+    def emit(self, event_type: str, payload: dict) -> str:
         """Append one event to the ledger as an entity record. Returns
         the event id so callers/tests can reference it.
 
+        Public because higher-level components (the Executor in 2.3,
+        the LLM loop in 2.4) need to record their own events into the
+        same trail. The standard Run events (start/finish/fail/think/
+        call_tool) call this internally; outside callers pick their own
+        `event_type` strings.
+
         Event records share a schema with v1.7 entities so they index
         cleanly: text is the JSON-encoded payload (the JSONL line stays
-        self-describing without consulting parsed metadata), namespace
-        is "trail", workspace is "agent-runs", and tags include the
-        run id, agent name, and event type for control-plane queries.
+        self-describing without consulting parsed metadata), memoryType
+        is the run namespace, workspace scopes to agent-runs, and tags
+        include the run id, agent name, and event type for control-
+        plane queries.
         """
         seq = self._seq
         self._seq += 1

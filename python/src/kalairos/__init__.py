@@ -10,6 +10,7 @@ from .agent import Agent
 from .executor import Executor
 from .jsonl import JsonlAppender
 from .ledger import Ledger
+from .llm import LLMLoop
 from .run import Run
 from .schema import SCHEMA_VERSION
 from .server import LedgerServer
@@ -22,6 +23,7 @@ __all__ = [
     "BranchNode",
     "Executor",
     "JsonlAppender",
+    "LLMLoop",
     "Ledger",
     "LedgerServer",
     "Run",

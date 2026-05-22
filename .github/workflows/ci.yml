@@ -95,3 +95,19 @@ jobs:
           python-version: "3.11"
       - run: pip install -e ".[dev]"
       - run: pytest -v
+
+  services:
+    # Node-side microservices that talk to the Python LedgerServer.
+    # Currently just dep-graph-builder (Phase 3.3's Node counterpart);
+    # future services run under the same job by adding to test:services.
+    # ubuntu + node 22 only — node:test was stabilized in 20, and the
+    # services are pure logic with no platform-specific I/O.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:services

@@ -19,3 +19,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# Node-side microservices that talk to the Python LedgerServer.
+# Not part of the npm package; each runs as a standalone process.
+services/

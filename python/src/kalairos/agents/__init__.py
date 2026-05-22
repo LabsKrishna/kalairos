@@ -9,6 +9,14 @@ WorkflowGraph on top; Phase 3.3 will add a HandoffNode that delegates
 dependency-graph construction to a Node service.
 """
 
-from .pr_risk import build_pr_risk_agent
+from .pr_risk import (
+    build_pr_risk_agent,
+    build_pr_risk_graph,
+    build_pr_risk_graph_agent,
+)
 
-__all__ = ["build_pr_risk_agent"]
+__all__ = [
+    "build_pr_risk_agent",
+    "build_pr_risk_graph",
+    "build_pr_risk_graph_agent",
+]

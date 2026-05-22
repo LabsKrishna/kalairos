@@ -16,12 +16,13 @@ from .schema import SCHEMA_VERSION
 from .server import LedgerServer
 from .sqlite_index import SqliteStreamer
 from .tool import Tool, ToolRegistry, tool
-from .workflow_graph import BranchNode, StepNode, WorkflowGraph
+from .workflow_graph import BranchNode, HandoffNode, StepNode, WorkflowGraph
 
 __all__ = [
     "Agent",
     "BranchNode",
     "Executor",
+    "HandoffNode",
     "JsonlAppender",
     "LLMLoop",
     "Ledger",

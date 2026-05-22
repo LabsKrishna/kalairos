@@ -78,7 +78,43 @@ class BranchNode:
             )
 
 
-Node = Union[StepNode, BranchNode]
+@dataclass(frozen=True)
+class HandoffNode:
+    """Cross-runtime handoff: delegate work to a Node service and wait
+    for the reply event to land in the Ledger.
+
+    Phase 2.5 wait-state — the Executor emits a handoff_requested event
+    (the Node service is expected to be subscribed via LedgerServer or
+    a poller), then blocks on a `threading.Event` until a matching
+    handoff_result event arrives. The reply's `result` value is stored
+    at `output_key` (if set) and execution continues to `next`.
+
+    Fields:
+      name: graph-unique identifier.
+      service: informational identifier for the target Node service
+        (carried in the handoff_requested payload so consumers can route).
+      inputs(state) -> dict: produces the payload sent to the service.
+      output_key: where to store the service's result in state.
+      timeout: seconds to wait for the reply event; `None` = wait
+        forever. Defaults to 30s so authoring mistakes don't hang runs.
+      next: name of the next node, or None for terminal.
+    """
+
+    name: str
+    service: str
+    inputs: Callable[[dict], dict] | None = None
+    output_key: str | None = None
+    timeout: float | None = 30.0
+    next: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.service:
+            raise ValueError(
+                f"HandoffNode {self.name!r}: `service` is required"
+            )
+
+
+Node = Union[StepNode, BranchNode, HandoffNode]
 
 
 class WorkflowGraph:
@@ -149,7 +185,7 @@ class WorkflowGraph:
                 f"WorkflowGraph {self.name!r}: no start node set"
             )
         for n in self._nodes.values():
-            if isinstance(n, StepNode):
+            if isinstance(n, (StepNode, HandoffNode)):
                 if n.next is not None and n.next not in self._nodes:
                     raise ValueError(
                         f"WorkflowGraph {self.name!r}: node {n.name!r} "

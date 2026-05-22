@@ -247,6 +247,44 @@ class LLMLoop:
         return results
 
 
+# ── One-shot helper for tools that wrap LLM reasoning ──────────────────────
+
+
+def llm_text_call(
+    client: Any,
+    *,
+    model: str = DEFAULT_MODEL,
+    system: str,
+    user_message: str,
+    max_tokens: int = 1024,
+) -> str:
+    """One-shot LLM call returning just the assistant text.
+
+    For tools that need quick LLM reasoning without the full LLMLoop
+    overhead — no message history, no tool dispatch, no event emission.
+    The system block carries cache_control so repeated calls from the
+    same tool (same system prompt) hit the cache.
+
+    Used by the Phase 3.2 WorkflowGraph PR analyzer: the
+    `summarize_pr_risk` tool wraps this so a deterministic graph
+    (StepNode + BranchNode) can still call into the LLM for the steps
+    that need it.
+    """
+    response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=[
+            {
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        messages=[{"role": "user", "content": user_message}],
+    )
+    return _extract_text(response.content)
+
+
 # ── Helpers ────────────────────────────────────────────────────────────
 
 

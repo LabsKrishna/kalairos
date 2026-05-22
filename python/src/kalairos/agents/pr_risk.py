@@ -18,10 +18,14 @@ in parallel and POST results back).
 
 from __future__ import annotations
 
+import re
 import subprocess
+from typing import Any
 
 from ..agent import Agent
-from ..tool import tool
+from ..llm import DEFAULT_MODEL, llm_text_call
+from ..tool import Tool, tool
+from ..workflow_graph import BranchNode, StepNode, WorkflowGraph
 
 
 # Timeouts on the `gh` subprocess calls. `pr diff` can be slow on huge
@@ -156,11 +160,10 @@ earn its place.
 
 
 def build_pr_risk_agent() -> Agent:
-    """Construct the canonical PR risk analyzer agent.
+    """Construct the canonical LLM-driven PR risk analyzer (Phase 3.1).
 
-    Returns a fresh `Agent` ready to pass to `LLMLoop` (Phase 3.1) or
-    `Executor` over a `WorkflowGraph` (Phase 3.2). The agent itself is
-    stateless — callers can reuse one instance across many runs since
+    Returns a fresh `Agent` ready to pass to `LLMLoop`. The agent itself
+    is stateless — callers can reuse one instance across many runs since
     tools and instructions are immutable.
     """
     return Agent(
@@ -168,3 +171,219 @@ def build_pr_risk_agent() -> Agent:
         instructions=PR_RISK_INSTRUCTIONS,
         tools=[fetch_pr_files, fetch_pr_diff],
     )
+
+
+# ── Phase 3.2 — declarative WorkflowGraph version ─────────────────────────
+
+
+# Classification rules. Critical = code/config/migrations that can break
+# behavior or security. Doc-only = markdown/RST/CHANGELOG/README.
+# A file matched by both wins critical (safe default — surface for review).
+_CRITICAL_PATTERNS = tuple(
+    re.compile(p)
+    for p in (
+        r"\.(py|js|ts|tsx|jsx|mjs|cjs|sql|sh|yaml|yml|toml|json|rs|go|java|kt|swift|rb|php|c|h|cpp|hpp)$",
+        r"(^|/)Dockerfile(\.|$)",
+        r"(^|/)\.github/workflows/",
+        r"(^|/)package\.json$",
+        r"(^|/)package-lock\.json$",
+        r"(^|/)pyproject\.toml$",
+        r"(^|/)Cargo\.toml$",
+        r"(^|/)go\.mod$",
+        r"(^|/)migrations?/",
+    )
+)
+_DOC_PATTERNS = tuple(
+    re.compile(p)
+    for p in (
+        r"\.(md|rst|txt|adoc)$",
+        r"(^|/)README(\.|$)",
+        r"(^|/)CHANGELOG(\.|$)",
+        r"(^|/)LICENSE(\.|$)",
+    )
+)
+
+
+def is_critical_file(path: str) -> bool:
+    """Whether one file path classifies as critical."""
+    return any(p.search(path) for p in _CRITICAL_PATTERNS)
+
+
+def is_doc_only_file(path: str) -> bool:
+    """Whether one file path classifies as doc-only."""
+    return any(p.search(path) for p in _DOC_PATTERNS)
+
+
+def classify_file_list(file_list_text: str) -> str:
+    """Classify a newline-separated file list as 'critical' or 'doc'.
+
+    Returns 'critical' if any file matches the critical patterns,
+    'doc' if every non-blank line matches doc-only patterns, else
+    'critical' as the safe default (unknown patterns get surfaced for
+    review rather than skipped).
+    """
+    paths = [
+        line.strip() for line in file_list_text.splitlines() if line.strip()
+    ]
+    if not paths:
+        # Empty file list — treat as doc so the graph short-circuits
+        # rather than running the deep-scan path on nothing.
+        return "doc"
+    if any(is_critical_file(p) for p in paths):
+        return "critical"
+    if all(is_doc_only_file(p) for p in paths):
+        return "doc"
+    # Unknown extensions (e.g. .env, .conf) — safer to scrutinize.
+    return "critical"
+
+
+# System prompt for the per-tool LLM summarize call. Distinct from
+# PR_RISK_INSTRUCTIONS (which steers the LLMLoop): this one is a tight
+# one-shot prompt for the cache-friendly llm_text_call helper.
+SUMMARIZE_SYSTEM = """\
+You are a terse PR risk reviewer. Given a list of changed files and
+optionally a diff, produce:
+  Line 1: VERDICT: LOW | MEDIUM | HIGH
+  Then 2-5 bullets explaining the verdict.
+  Then a "Look at:" line naming specific files/lines to scrutinize.
+
+Reference the diff; don't quote it back. Every word should earn its
+place — your reader does dozens of these per day.
+"""
+
+
+def _make_summarize_tool(client: Any, *, model: str) -> Tool:
+    """Build a `summarize_pr_risk` tool that wraps `llm_text_call`.
+
+    Factored as a tool factory (rather than a module-level
+    `@tool`-decorated function) so the LLM client is injected at
+    build time — production builds construct `anthropic.Anthropic()`,
+    tests inject a fake. The closed-over `client` is the only state.
+    """
+
+    @tool(
+        description=(
+            "Summarize the risk of a PR given its file list and (for "
+            "critical PRs) the unified diff. Returns a terse "
+            "VERDICT + bullets + 'Look at:' lines."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "string",
+                    "description": "Newline-separated changed file paths",
+                },
+                "diff": {
+                    "type": "string",
+                    "description": (
+                        "Unified diff of the PR; empty string for "
+                        "doc-only changes"
+                    ),
+                },
+            },
+            "required": ["files", "diff"],
+        },
+    )
+    def summarize_pr_risk(files: str, diff: str) -> str:
+        user_message = (
+            f"Files changed:\n{files}\n\n"
+            + (f"Diff:\n{diff}" if diff else "No diff (doc-only PR).")
+        )
+        return llm_text_call(
+            client,
+            model=model,
+            system=SUMMARIZE_SYSTEM,
+            user_message=user_message,
+        )
+
+    return summarize_pr_risk
+
+
+def build_pr_risk_graph_agent(
+    client: Any | None = None, *, model: str = DEFAULT_MODEL
+) -> Agent:
+    """Construct the Agent for the declarative WorkflowGraph version.
+
+    Carries three tools: the two `gh`-backed fetchers plus an
+    LLM-backed summarizer (wrapped with `llm_text_call` so it stays
+    cache-friendly across calls). If `client` is None, an
+    `anthropic.Anthropic()` is constructed from env at first use.
+    """
+    if client is None:
+        import anthropic
+
+        client = anthropic.Anthropic()
+    summarize = _make_summarize_tool(client, model=model)
+    return Agent(
+        name="pr-risk-analyzer-graph",
+        instructions="",  # graph drives flow; no system prompt needed
+        tools=[fetch_pr_files, fetch_pr_diff, summarize],
+    )
+
+
+def build_pr_risk_graph() -> WorkflowGraph:
+    """Build the declarative PR risk WorkflowGraph.
+
+    Topology:
+        fetch_files → classify(branch) → [critical] → fetch_diff → summarize
+                                       → [doc]      → skip_doc → summarize_doc
+
+    Both summarize paths produce a `verdict` in state. Repeatable: the
+    same PR will hit the same path; same path will produce the same
+    cached system prompt + (likely) the same final text within the
+    5-min TTL.
+    """
+    g = WorkflowGraph(name="pr-risk-analyzer-graph")
+
+    g.add(
+        StepNode(
+            name="fetch_files",
+            tool="fetch_pr_files",
+            inputs=lambda s: {"pr_number": s["pr_number"]},
+            output_key="files",
+            next="classify",
+        )
+    )
+    g.add(
+        BranchNode(
+            name="classify",
+            condition=lambda s: classify_file_list(s["files"]),
+            branches={"critical": "fetch_diff", "doc": "skip_doc"},
+        )
+    )
+    g.add(
+        StepNode(
+            name="fetch_diff",
+            tool="fetch_pr_diff",
+            inputs=lambda s: {"pr_number": s["pr_number"]},
+            output_key="diff",
+            next="summarize",
+        )
+    )
+    g.add(
+        StepNode(
+            name="summarize",
+            tool="summarize_pr_risk",
+            inputs=lambda s: {"files": s["files"], "diff": s["diff"]},
+            output_key="verdict",
+        )
+    )
+    g.add(
+        StepNode(
+            name="skip_doc",
+            think="No critical files changed — doc-only PR.",
+            next="summarize_doc",
+        )
+    )
+    g.add(
+        StepNode(
+            name="summarize_doc",
+            tool="summarize_pr_risk",
+            inputs=lambda s: {"files": s["files"], "diff": ""},
+            output_key="verdict",
+        )
+    )
+
+    g.set_start("fetch_files")
+    return g

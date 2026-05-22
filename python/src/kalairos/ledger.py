@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
+import threading
 from pathlib import Path
+from typing import Any, Callable
 
 from .entity_normalizer import normalize_raw
 from .jsonl import JsonlAppender
@@ -30,6 +33,8 @@ from .sqlite_index import (
     rebuild,
     replay_forward,
 )
+
+log = logging.getLogger(__name__)
 
 
 class Ledger:
@@ -45,6 +50,12 @@ class Ledger:
         self.sqlite_path = Path(sqlite_path)
         self.appender = JsonlAppender(self.jsonl_path)
         self.streamer = SqliteStreamer(self.sqlite_path)
+        # Pub/sub: subscribers get every successfully appended record.
+        # Used by the handoff wait-state in Phase 2.5 (executor blocks
+        # until a matching handoff_result event lands via this hook).
+        # The lock guards subscribe/unsubscribe; iteration uses a snapshot.
+        self._subscribers: list[Callable[[dict], None]] = []
+        self._subscribers_lock = threading.Lock()
 
     # ── Context manager ────────────────────────────────────────────────
 
@@ -113,7 +124,44 @@ class Ledger:
         except Exception:
             self.streamer.mark_dirty()
             raise
+
+        # Notify subscribers after both halves of the store have
+        # committed. Snapshot the list so a callback that unsubscribes
+        # mid-notify (or another thread that subscribes) doesn't trip
+        # iteration. Callback exceptions are swallowed and logged —
+        # one bad listener can't break the write path.
+        with self._subscribers_lock:
+            subs = list(self._subscribers)
+        for sub in subs:
+            try:
+                sub(record)
+            except Exception:
+                log.exception("Ledger: subscriber raised; continuing")
+
         return offset
+
+    # ── Subscription ───────────────────────────────────────────────────
+
+    def subscribe(self, callback: Callable[[dict], None]) -> Callable[[], None]:
+        """Register a callback that fires for every successfully appended
+        record. Returns an unsubscribe callable.
+
+        Callbacks run inline on the appending thread (caller-controlled
+        in Python embedded use, the HTTP worker thread when invoked via
+        `LedgerServer`). They must not block long or call back into
+        `append` synchronously — both would stall the write path. The
+        handoff wait-state in Phase 2.5 spawns a thread inside its
+        callback for both reasons.
+        """
+        with self._subscribers_lock:
+            self._subscribers.append(callback)
+
+        def unsubscribe() -> None:
+            with self._subscribers_lock:
+                if callback in self._subscribers:
+                    self._subscribers.remove(callback)
+
+        return unsubscribe
 
     # ── Read path ──────────────────────────────────────────────────────
 

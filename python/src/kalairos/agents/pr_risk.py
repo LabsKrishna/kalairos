@@ -25,7 +25,19 @@ from typing import Any
 from ..agent import Agent
 from ..llm import DEFAULT_MODEL, llm_text_call
 from ..tool import Tool, tool
-from ..workflow_graph import BranchNode, StepNode, WorkflowGraph
+from ..workflow_graph import BranchNode, HandoffNode, StepNode, WorkflowGraph
+
+# Name of the Node-side service that builds the file-relationship
+# dependency graph. Surfaced in the `handoff_requested` event payload
+# so a real service (or a test simulator) knows which handoffs to
+# answer. Keep this stable — production routing keys off it.
+DEP_GRAPH_SERVICE = "kalairos-dep-graph-builder"
+
+# Default timeout for the dep-graph handoff. Dep-graph construction on
+# a 50-file PR runs in seconds; 30s is the safety net so authoring
+# mistakes (Node service down, queue stuck) fail the run instead of
+# hanging it.
+DEP_GRAPH_TIMEOUT_S = 30.0
 
 
 # Timeouts on the `gh` subprocess calls. `pr diff` can be slow on huge
@@ -241,14 +253,17 @@ def classify_file_list(file_list_text: str) -> str:
 # PR_RISK_INSTRUCTIONS (which steers the LLMLoop): this one is a tight
 # one-shot prompt for the cache-friendly llm_text_call helper.
 SUMMARIZE_SYSTEM = """\
-You are a terse PR risk reviewer. Given a list of changed files and
-optionally a diff, produce:
+You are a terse PR risk reviewer. Given a list of changed files, the
+diff (for critical PRs), and a file-relationship dependency graph,
+produce:
   Line 1: VERDICT: LOW | MEDIUM | HIGH
-  Then 2-5 bullets explaining the verdict.
+  Then 2-5 bullets explaining the verdict. Use the dependency graph
+    to call out fan-out: which other files depend on what's changed,
+    and whether the diff likely breaks them.
   Then a "Look at:" line naming specific files/lines to scrutinize.
 
-Reference the diff; don't quote it back. Every word should earn its
-place — your reader does dozens of these per day.
+Reference the diff and dep graph; don't quote them back. Every word
+should earn its place — your reader does dozens of these per day.
 """
 
 
@@ -263,8 +278,9 @@ def _make_summarize_tool(client: Any, *, model: str) -> Tool:
 
     @tool(
         description=(
-            "Summarize the risk of a PR given its file list and (for "
-            "critical PRs) the unified diff. Returns a terse "
+            "Summarize the risk of a PR given its file list, (for "
+            "critical PRs) the unified diff, and a dependency graph "
+            "describing file relationships. Returns a terse "
             "VERDICT + bullets + 'Look at:' lines."
         ),
         parameters={
@@ -281,20 +297,31 @@ def _make_summarize_tool(client: Any, *, model: str) -> Tool:
                         "doc-only changes"
                     ),
                 },
+                "dep_graph": {
+                    "type": "string",
+                    "description": (
+                        "JSON-encoded dependency graph from the Node "
+                        "service, or empty string when not available "
+                        "(doc-only path, or handoff disabled)"
+                    ),
+                },
             },
-            "required": ["files", "diff"],
+            "required": ["files", "diff", "dep_graph"],
         },
     )
-    def summarize_pr_risk(files: str, diff: str) -> str:
-        user_message = (
-            f"Files changed:\n{files}\n\n"
-            + (f"Diff:\n{diff}" if diff else "No diff (doc-only PR).")
+    def summarize_pr_risk(files: str, diff: str, dep_graph: str) -> str:
+        parts = [f"Files changed:\n{files}"]
+        parts.append(f"Diff:\n{diff}" if diff else "No diff (doc-only PR).")
+        parts.append(
+            f"Dependency graph:\n{dep_graph}"
+            if dep_graph
+            else "No dependency graph available."
         )
         return llm_text_call(
             client,
             model=model,
             system=SUMMARIZE_SYSTEM,
-            user_message=user_message,
+            user_message="\n\n".join(parts),
         )
 
     return summarize_pr_risk
@@ -325,14 +352,30 @@ def build_pr_risk_graph_agent(
 def build_pr_risk_graph() -> WorkflowGraph:
     """Build the declarative PR risk WorkflowGraph.
 
-    Topology:
-        fetch_files → classify(branch) → [critical] → fetch_diff → summarize
-                                       → [doc]      → skip_doc → summarize_doc
+    Topology (Phase 3.3 — with cross-runtime dep-graph handoff):
 
-    Both summarize paths produce a `verdict` in state. Repeatable: the
-    same PR will hit the same path; same path will produce the same
-    cached system prompt + (likely) the same final text within the
-    5-min TTL.
+        fetch_files → classify(branch)
+                        ↓ critical
+                      fetch_diff
+                        ↓
+                      build_dep_graph (HANDOFF → Node service)
+                        ↓
+                      summarize
+                        ↓ doc
+                      skip_doc (think)
+                        ↓
+                      summarize_doc
+
+    The critical path hands off to a Node service that builds a
+    file-relationship dependency graph (which file imports which) by
+    parsing the changed files. The Python executor blocks until the
+    Node service POSTs a `handoff_result` event back to the Ledger;
+    the result is fed into `summarize` so the verdict can reason about
+    fan-out, not just the diff itself.
+
+    The doc-only path skips the handoff — no dep graph needed for
+    README/CHANGELOG changes — and feeds an empty `dep_graph` string
+    to `summarize_doc` so the same tool handles both paths.
     """
     g = WorkflowGraph(name="pr-risk-analyzer-graph")
 
@@ -358,6 +401,19 @@ def build_pr_risk_graph() -> WorkflowGraph:
             tool="fetch_pr_diff",
             inputs=lambda s: {"pr_number": s["pr_number"]},
             output_key="diff",
+            next="build_dep_graph",
+        )
+    )
+    g.add(
+        HandoffNode(
+            name="build_dep_graph",
+            service=DEP_GRAPH_SERVICE,
+            inputs=lambda s: {
+                "pr_number": s["pr_number"],
+                "files": s["files"],
+            },
+            output_key="dep_graph",
+            timeout=DEP_GRAPH_TIMEOUT_S,
             next="summarize",
         )
     )
@@ -365,7 +421,14 @@ def build_pr_risk_graph() -> WorkflowGraph:
         StepNode(
             name="summarize",
             tool="summarize_pr_risk",
-            inputs=lambda s: {"files": s["files"], "diff": s["diff"]},
+            inputs=lambda s: {
+                "files": s["files"],
+                "diff": s["diff"],
+                # JSON-encode the dep_graph dict so the tool receives a
+                # string (matches the parameter schema and the doc-only
+                # path's "" sentinel).
+                "dep_graph": _stringify_dep_graph(s.get("dep_graph")),
+            },
             output_key="verdict",
         )
     )
@@ -380,10 +443,31 @@ def build_pr_risk_graph() -> WorkflowGraph:
         StepNode(
             name="summarize_doc",
             tool="summarize_pr_risk",
-            inputs=lambda s: {"files": s["files"], "diff": ""},
+            inputs=lambda s: {
+                "files": s["files"],
+                "diff": "",
+                "dep_graph": "",
+            },
             output_key="verdict",
         )
     )
 
     g.set_start("fetch_files")
     return g
+
+
+def _stringify_dep_graph(dep_graph: Any) -> str:
+    """Render whatever the Node service returned into a string the
+    summarize tool can pass to the model. Dicts get JSON-encoded;
+    strings pass through; None/missing becomes empty so the model
+    sees the explicit 'No dependency graph available.' marker."""
+    if dep_graph is None or dep_graph == "":
+        return ""
+    if isinstance(dep_graph, str):
+        return dep_graph
+    try:
+        import json
+
+        return json.dumps(dep_graph, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return repr(dep_graph)

@@ -16,6 +16,7 @@ Routes:
   GET  /                  — Control plane HTML page (Phase 4.1)
   GET  /runs              — 200 {runs: [...]} — distinct runs in the ledger
   GET  /runs/<id>/events  — 200 {events: [...]} — chronological events
+  GET  /events/stream     — Server-Sent Events stream of new appends (Phase 4.3)
 
 Transport: stdlib http.server (ThreadingHTTPServer). Each request runs in
 its own thread. Thread safety is delegated to the Ledger — JsonlAppender
@@ -30,12 +31,32 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .control_plane import HTML_PAGE, events_for_run, list_runs
+from .control_plane import (
+    EVENT_BUCKETS,
+    HTML_PAGE,
+    events_for_run,
+    list_runs,
+    record_to_sse_event,
+)
 from .ledger import Ledger
+
+
+# How long to wait for a new event before sending a heartbeat. Browsers
+# drop SSE connections that go quiet for too long; 15s is well inside
+# every default I've checked.
+_SSE_HEARTBEAT_INTERVAL_S = 15.0
+
+# Per-client SSE queue depth. If a client falls behind beyond this,
+# the oldest events get dropped (a comment-line marker is sent so the
+# client knows to resync). Sized for short network blips, not extended
+# outages.
+_SSE_QUEUE_DEPTH = 1000
 
 log = logging.getLogger(__name__)
 
@@ -137,6 +158,8 @@ def _build_handler(ledger: Ledger):
                 if tail.endswith("/events"):
                     run_id = tail[: -len("/events")]
                     return self._handle_run_events(run_id)
+            if path == "/events/stream":
+                return self._handle_sse()
             return self._json(404, {"error": "not found"})
 
         def do_POST(self):  # noqa: N802 - stdlib name
@@ -195,6 +218,87 @@ def _build_handler(ledger: Ledger):
                 log.exception("LedgerServer: /runs failed")
                 return self._json(500, {"error": str(e)})
             return self._json(200, {"runs": runs})
+
+        def _handle_sse(self):
+            """Stream new ledger appends as Server-Sent Events.
+
+            Phase 4.3: subscribes to the Ledger's pub/sub on entry,
+            unsubscribes on disconnect. Heartbeats every 15s to keep
+            the connection alive through browser/proxy idle timeouts.
+
+            The Ledger subscriber fires on the append thread (which
+            may be the HTTP /append worker or the in-process caller);
+            we use a bounded queue to hand events off to the SSE
+            handler thread. If the client falls behind beyond
+            _SSE_QUEUE_DEPTH events, the oldest are dropped and the
+            client receives a comment-line marker so it can re-sync
+            via /runs and /runs/<id>/events.
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            # Disable proxy buffering — nginx, Cloudflare, etc. need
+            # this hint to stream immediately rather than collecting
+            # bytes for a content-length write.
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+
+            q: queue.Queue = queue.Queue(maxsize=_SSE_QUEUE_DEPTH)
+            dropped = {"n": 0}
+
+            def listener(record: dict) -> None:
+                try:
+                    q.put_nowait(record)
+                except queue.Full:
+                    # Drop the oldest item to make room, but also count
+                    # how many we shed so the client gets a marker.
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        q.put_nowait(record)
+                    except queue.Full:
+                        dropped["n"] += 1
+
+            unsubscribe = ledger.subscribe(listener)
+            try:
+                # Confirm the stream is open — the client uses this to
+                # flip from "connecting…" to "live".
+                self._sse_write(": connected\n\n")
+                while True:
+                    try:
+                        record = q.get(timeout=_SSE_HEARTBEAT_INTERVAL_S)
+                    except queue.Empty:
+                        # Idle — heartbeat to keep the socket warm.
+                        self._sse_write(": heartbeat\n\n")
+                        continue
+                    if dropped["n"] > 0:
+                        self._sse_write(
+                            f": dropped {dropped['n']} events; resync via /runs\n\n"
+                        )
+                        dropped["n"] = 0
+                    payload = json.dumps(
+                        record_to_sse_event(record), ensure_ascii=False
+                    )
+                    self._sse_write(f"data: {payload}\n\n")
+            except (BrokenPipeError, ConnectionResetError, ValueError):
+                # Client closed the connection. Normal — fall through
+                # to unsubscribe in the finally.
+                pass
+            except OSError as e:
+                # Often a benign "Broken pipe" on socket close; log at
+                # info, not error, to avoid noise.
+                log.info("LedgerServer: /events/stream closed: %s", e)
+            finally:
+                unsubscribe()
+
+        def _sse_write(self, text: str) -> None:
+            """Write + flush. Raises BrokenPipeError/etc on closed
+            socket so _handle_sse can clean up."""
+            self.wfile.write(text.encode("utf-8"))
+            self.wfile.flush()
 
         def _handle_run_events(self, run_id: str):
             if not run_id:

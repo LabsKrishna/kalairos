@@ -136,6 +136,30 @@ def list_runs(ledger: Ledger) -> list[dict]:
     return sorted(runs.values(), key=_sort_key)
 
 
+def record_to_sse_event(record: dict) -> dict:
+    """Render a raw ledger record into the SSE event shape the control
+    plane consumes. Same fields as `events_for_run` items plus
+    `run_id` + `agent_name` (so the client can route events to the
+    right run without consulting a separate index) but minus
+    `delta_ms` (which requires knowing the run's first-event time
+    and is recomputed client-side from `timestamp` if needed).
+
+    Records without `metadata` (raw entities, not run events) come
+    out with run_id=None — the client ignores those.
+    """
+    md = record.get(_META) or {}
+    event_type = md.get("event_type")
+    return {
+        "run_id": md.get("run_id"),
+        "agent_name": md.get("agent_name"),
+        "seq": md.get("seq"),
+        "event_type": event_type,
+        "bucket": EVENT_BUCKETS.get(event_type, "other") if event_type else None,
+        "timestamp": _record_timestamp(record),
+        "payload": md.get("payload") or {},
+    }
+
+
 def events_for_run(ledger: Ledger, run_id: str) -> list[dict]:
     """Return all events belonging to one run, ordered by sequence.
 
@@ -685,7 +709,52 @@ HTML_PAGE = r"""<!doctype html>
     if (selectedRunId) selectRun(selectedRunId);
   });
 
+  // ── Live updates via Server-Sent Events (Phase 4.3) ────────────────────
+  //
+  // EventSource auto-reconnects on transient failures. We ignore
+  // records without a run_id (raw entities, handoff results) since
+  // the run list is what the UI cares about; on lifecycle events
+  // (run_started / completed / failed) we refresh the run list, and
+  // on any event for the currently-selected run we re-render that
+  // run's events panel.
+
+  let sse = null;
+  function connectSSE() {
+    try {
+      sse = new EventSource('/events/stream');
+    } catch (err) {
+      connEl.textContent = `SSE error: ${err.message}`;
+      return;
+    }
+    sse.onmessage = (e) => {
+      let ev;
+      try { ev = JSON.parse(e.data); } catch { return; }
+      if (!ev.run_id) return; // ignore non-run records
+      if (
+        ev.event_type === 'run_started' ||
+        ev.event_type === 'run_completed' ||
+        ev.event_type === 'run_failed'
+      ) {
+        loadRuns();
+      }
+      if (ev.run_id === selectedRunId) {
+        // Full refetch is the simplest correct update. Phase 4.4 can
+        // optimize to append-only diffs if traces get huge.
+        selectRun(selectedRunId);
+      }
+    };
+    sse.onerror = () => {
+      // EventSource handles reconnect automatically; surface the
+      // transient state to the user via the header so they know.
+      connEl.textContent = 'reconnecting…';
+    };
+    sse.onopen = () => {
+      loadRuns();
+    };
+  }
+
   loadRuns();
+  connectSSE();
 </script>
 </body>
 </html>

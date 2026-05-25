@@ -173,6 +173,49 @@ class WorkflowGraph:
     def __iter__(self):
         return iter(self._nodes.values())
 
+    def to_dict(self) -> dict:
+        """Serialize the graph to a JSON-friendly dict for the control
+        plane's workflow-graph visualization (Phase 4.2).
+
+        Captures topology (nodes + edges, branches, handoffs) but NOT
+        the runtime callables (`condition`, `inputs`) — those are Python
+        functions and not meaningful to a browser. The visualization
+        reads node `kind` plus the per-kind topology fields.
+        """
+        nodes_out: list[dict] = []
+        for n in self._nodes.values():
+            entry: dict = {"name": n.name}
+            if isinstance(n, StepNode):
+                entry["kind"] = "step"
+                entry["next"] = n.next
+                # Distinguish tool steps from think steps so the UI
+                # can color them differently; tool name is part of the
+                # visible label.
+                if n.tool is not None:
+                    entry["tool"] = n.tool
+                    if n.output_key:
+                        entry["output_key"] = n.output_key
+                else:
+                    entry["think"] = n.think
+            elif isinstance(n, BranchNode):
+                entry["kind"] = "branch"
+                entry["branches"] = dict(n.branches)
+            elif isinstance(n, HandoffNode):
+                entry["kind"] = "handoff"
+                entry["next"] = n.next
+                entry["service"] = n.service
+                entry["timeout"] = n.timeout
+                if n.output_key:
+                    entry["output_key"] = n.output_key
+            else:
+                entry["kind"] = type(n).__name__.lower()
+            nodes_out.append(entry)
+        return {
+            "name": self.name,
+            "start": self._start,
+            "nodes": nodes_out,
+        }
+
     def validate(self) -> None:
         """Check graph integrity: start is set; every node referenced
         by a `next` pointer or branch target exists.

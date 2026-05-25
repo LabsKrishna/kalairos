@@ -50,6 +50,7 @@ EVENT_BUCKETS = {
     "llm_request": "llm",
     "llm_response": "llm",
     "llm_text": "llm",
+    "graph_defined": "node",
     "node_entered": "node",
     "node_completed": "node",
     "branch_chosen": "node",
@@ -236,6 +237,42 @@ HTML_PAGE = r"""<!doctype html>
   }
   header button:hover { background: var(--bg); }
   main { display: grid; grid-template-columns: 320px 1fr; height: calc(100% - 49px); }
+  #graph-panel {
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: var(--card);
+  }
+  #graph-panel h3 {
+    margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--muted); font-weight: 600;
+  }
+  #graph-svg { width: 100%; height: auto; display: block; }
+  #graph-svg .node rect, #graph-svg .node circle {
+    fill: var(--card); stroke: var(--border); stroke-width: 1.5;
+    transition: fill 0.15s, stroke 0.15s;
+  }
+  #graph-svg .node.traversed rect, #graph-svg .node.traversed circle {
+    fill: #dcfce7; stroke: var(--ok);
+  }
+  #graph-svg .node.failed rect, #graph-svg .node.failed circle {
+    fill: #fee2e2; stroke: var(--fail);
+  }
+  #graph-svg .node text { font: 11px ui-monospace, monospace; fill: var(--fg); }
+  #graph-svg .node .kind {
+    font: 9px -apple-system, sans-serif; fill: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  #graph-svg .node.handoff rect { stroke-dasharray: 4 3; stroke: var(--handoff); }
+  #graph-svg .node.branch circle { stroke: var(--node); }
+  #graph-svg .edge {
+    fill: none; stroke: var(--border); stroke-width: 1.5;
+    marker-end: url(#arrow);
+  }
+  #graph-svg .edge.traversed { stroke: var(--ok); stroke-width: 2; }
+  #graph-svg .edge.handoff   { stroke: var(--handoff); stroke-dasharray: 4 3; }
+  #graph-svg .edge-label {
+    font: 10px ui-monospace, monospace; fill: var(--muted);
+  }
+  #graph-svg .edge-label.traversed { fill: var(--ok); font-weight: 600; }
   #runs {
     overflow-y: auto; border-right: 1px solid var(--border);
     background: var(--card);
@@ -430,6 +467,7 @@ HTML_PAGE = r"""<!doctype html>
         ${run.error ? `<div class="run-result" style="color:#dc2626">${escapeHtml(run.error)}</div>` : ''}
       </div>
     `;
+    const graphPanel = renderGraphPanel(events, run);
     const rows = events.map(ev => `
       <div class="event">
         <div class="delta">+${fmt(ev.delta_ms)}</div>
@@ -444,7 +482,202 @@ HTML_PAGE = r"""<!doctype html>
         </div>
       </div>
     `).join('');
-    eventsEl.innerHTML = header + rows;
+    eventsEl.innerHTML = header + graphPanel + rows;
+  }
+
+  // ── Workflow-graph visualization (Phase 4.2) ───────────────────────────
+  //
+  // Rendered only for runs that emitted a `graph_defined` event (which
+  // means they were driven by the Executor over a WorkflowGraph;
+  // LLMLoop-driven runs have no graph, so this panel is hidden).
+  //
+  // Layout: layered DAG. Depth assigned by BFS from the start node;
+  // nodes at the same depth fan out horizontally. Edges drawn as
+  // straight lines with arrowheads; the chosen branch from a
+  // BranchNode is highlighted from the trail's branch_chosen events.
+
+  function renderGraphPanel(events, run) {
+    const defined = events.find(e => e.event_type === 'graph_defined');
+    if (!defined) return '';
+    const graph = (defined.payload || {}).graph;
+    if (!graph || !graph.nodes) return '';
+
+    const visited = new Set(
+      events.filter(e => e.event_type === 'node_entered')
+            .map(e => (e.payload || {}).node)
+    );
+    const branchChoices = new Map(
+      events.filter(e => e.event_type === 'branch_chosen').map(e => {
+        const p = e.payload || {};
+        return [p.node, { key: p.key, target: p.target }];
+      })
+    );
+    const failed = run.status === 'failed';
+
+    const svg = layoutAndRenderGraph(graph, visited, branchChoices, failed);
+    return `
+      <div id="graph-panel">
+        <h3>Workflow graph · ${escapeHtml(graph.name)}</h3>
+        ${svg}
+      </div>
+    `;
+  }
+
+  function layoutAndRenderGraph(graph, visited, branchChoices, failed) {
+    const nodes = graph.nodes;
+    const byName = new Map(nodes.map(n => [n.name, n]));
+
+    // Assign depth via BFS from start.
+    const depth = new Map();
+    const order = new Map(); // insertion order for tiebreak
+    nodes.forEach((n, i) => order.set(n.name, i));
+    const queue = [[graph.start, 0]];
+    while (queue.length) {
+      const [name, d] = queue.shift();
+      if (!byName.has(name)) continue;
+      if (depth.has(name) && depth.get(name) <= d) continue;
+      depth.set(name, d);
+      const n = byName.get(name);
+      const successors = n.kind === 'branch'
+        ? Object.values(n.branches || {})
+        : (n.next ? [n.next] : []);
+      for (const s of successors) {
+        queue.push([s, d + 1]);
+      }
+    }
+    // Any unreachable nodes go to depth 0 (shouldn't happen for a
+    // validated graph, but defensive).
+    for (const n of nodes) {
+      if (!depth.has(n.name)) depth.set(n.name, 0);
+    }
+
+    // Group by depth.
+    const byDepth = new Map();
+    for (const n of nodes) {
+      const d = depth.get(n.name);
+      if (!byDepth.has(d)) byDepth.set(d, []);
+      byDepth.get(d).push(n);
+    }
+    for (const [d, list] of byDepth) {
+      list.sort((a, b) => order.get(a.name) - order.get(b.name));
+    }
+
+    // Layout geometry.
+    const COL_W = 180;
+    const ROW_H = 90;
+    const PAD = 30;
+    const NODE_W = 140;
+    const NODE_H = 50;
+    const maxCols = Math.max(...[...byDepth.values()].map(l => l.length));
+    const width = PAD * 2 + maxCols * COL_W;
+    const height = PAD * 2 + byDepth.size * ROW_H;
+
+    const pos = new Map();
+    for (const [d, list] of byDepth) {
+      // Center the row within `width`.
+      const rowWidth = list.length * COL_W;
+      const xStart = (width - rowWidth) / 2 + COL_W / 2;
+      list.forEach((n, i) => {
+        pos.set(n.name, { x: xStart + i * COL_W, y: PAD + d * ROW_H + NODE_H / 2 });
+      });
+    }
+
+    // Build edges with metadata about whether they were traversed.
+    const edges = [];
+    for (const n of nodes) {
+      const fromName = n.name;
+      if (n.kind === 'branch') {
+        const choice = branchChoices.get(fromName);
+        for (const [key, target] of Object.entries(n.branches || {})) {
+          edges.push({
+            from: fromName, to: target, label: key,
+            traversed: choice && choice.target === target,
+          });
+        }
+      } else if (n.next) {
+        edges.push({
+          from: fromName, to: n.next,
+          // A linear next-edge is "traversed" iff both ends were entered.
+          traversed: visited.has(fromName) && visited.has(n.next),
+          handoff: n.kind === 'handoff',
+        });
+      }
+    }
+
+    // Render SVG.
+    const arrows = `
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+        </marker>
+      </defs>
+    `;
+
+    const edgeSvg = edges.map(e => {
+      const a = pos.get(e.from), b = pos.get(e.to);
+      if (!a || !b) return '';
+      // Start/end at node edges (rough).
+      const x1 = a.x, y1 = a.y + NODE_H / 2;
+      const x2 = b.x, y2 = b.y - NODE_H / 2;
+      const cls = [
+        'edge',
+        e.traversed ? 'traversed' : '',
+        e.handoff ? 'handoff' : '',
+      ].filter(Boolean).join(' ');
+      const labelSvg = e.label ? `
+        <text class="edge-label ${e.traversed ? 'traversed' : ''}"
+              x="${(x1 + x2) / 2 + 6}" y="${(y1 + y2) / 2}">${escapeHtml(e.label)}</text>
+      ` : '';
+      return `
+        <line class="${cls}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" />
+        ${labelSvg}
+      `;
+    }).join('');
+
+    const nodeSvg = nodes.map(n => {
+      const p = pos.get(n.name);
+      if (!p) return '';
+      const isLast = visited.has(n.name) && Array.from(visited).slice(-1)[0] === n.name;
+      const traversed = visited.has(n.name);
+      const classes = [
+        'node', n.kind,
+        traversed ? 'traversed' : '',
+        failed && isLast ? 'failed' : '',
+      ].filter(Boolean).join(' ');
+      const x = p.x - NODE_W / 2;
+      const y = p.y - NODE_H / 2;
+      // Branch nodes get a circle; everything else a rect.
+      const shape = n.kind === 'branch'
+        ? `<circle cx="${p.x}" cy="${p.y}" r="${NODE_H / 2 + 2}" />`
+        : `<rect x="${x}" y="${y}" width="${NODE_W}" height="${NODE_H}" rx="4" ry="4" />`;
+      const label = n.kind === 'step' && n.tool
+        ? `${n.name}\n${n.tool}()`
+        : n.kind === 'handoff'
+          ? `${n.name}\n↗ ${n.service}`
+          : n.kind === 'branch'
+            ? n.name
+            : n.kind === 'step' && n.think
+              ? `${n.name}\n(think)`
+              : n.name;
+      const lines = label.split('\n');
+      const textSvg = lines.map((line, i) => `
+        <text x="${p.x}" y="${p.y - (lines.length - 1) * 6 + i * 12 + 4}"
+              text-anchor="middle">${escapeHtml(line)}</text>
+      `).join('');
+      const kindLabel = `
+        <text class="kind" x="${p.x}" y="${y - 4}" text-anchor="middle">${n.kind}</text>
+      `;
+      return `<g class="${classes}">${shape}${textSvg}${kindLabel}</g>`;
+    }).join('');
+
+    return `
+      <svg id="graph-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMin meet">
+        ${arrows}
+        ${edgeSvg}
+        ${nodeSvg}
+      </svg>
+    `;
   }
 
   document.getElementById('refresh').addEventListener('click', () => {

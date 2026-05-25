@@ -30,6 +30,7 @@ from .workflow_graph import BranchNode, HandoffNode, Node, StepNode, WorkflowGra
 
 # Workflow-graph event types. Live alongside Run's event types so the
 # trail shows the full nested flow (graph nodes + tool calls + thoughts).
+EVENT_GRAPH_DEFINED = "graph_defined"
 EVENT_NODE_ENTERED = "node_entered"
 EVENT_NODE_COMPLETED = "node_completed"
 EVENT_BRANCH_CHOSEN = "branch_chosen"
@@ -74,6 +75,10 @@ class Executor:
         state: dict = dict(initial_state or {})
         r = Run(agent, ledger, run_id=run_id, goal=goal)
         r.start()
+        # Emit the graph topology so the control plane (Phase 4.2) can
+        # render the node graph for this run without needing access to
+        # the Python WorkflowGraph object — the JSONL is enough.
+        r.emit(EVENT_GRAPH_DEFINED, {"graph": self.graph.to_dict()})
 
         try:
             current: Node | None = self.graph.start_node()

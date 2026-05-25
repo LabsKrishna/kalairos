@@ -19,6 +19,7 @@ from kalairos import (
 )
 from kalairos.executor import (
     EVENT_BRANCH_CHOSEN,
+    EVENT_GRAPH_DEFINED,
     EVENT_NODE_COMPLETED,
     EVENT_NODE_ENTERED,
 )
@@ -183,17 +184,20 @@ def test_executor_emits_node_entered_and_completed(agent, ledger):
     g.set_start("t")
     run, _ = Executor(g).run(agent, ledger)
     events = _events_for_run(ledger, run.run_id)
-    # run_started, node_entered, thought, node_completed, run_completed
+    # run_started, graph_defined, node_entered, thought, node_completed,
+    # run_completed — graph_defined was added in Phase 4.2 so the control
+    # plane can render the topology.
     assert _event_types(events) == [
         EVENT_RUN_STARTED,
+        EVENT_GRAPH_DEFINED,
         EVENT_NODE_ENTERED,
         EVENT_THOUGHT,
         EVENT_NODE_COMPLETED,
         EVENT_RUN_COMPLETED,
     ]
-    # node_entered carries the node name
-    assert events[1]["metadata"]["payload"]["node"] == "t"
-    assert events[3]["metadata"]["payload"]["node"] == "t"
+    # node_entered carries the node name (now at index 2, not 1).
+    assert events[2]["metadata"]["payload"]["node"] == "t"
+    assert events[4]["metadata"]["payload"]["node"] == "t"
 
 
 # ── Branch ────────────────────────────────────────────────────────────────

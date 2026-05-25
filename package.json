@@ -33,6 +33,7 @@
     "start": "node server.js",
     "postinstall": "node scripts/download-model.js || true",
     "test": "node test-basic.js && node test-versioning.js && node test-agent-simulation.js && node test-scope.js && node test-sqlite-index.js && node test-sqlite-integration.js",
+    "test:services": "node --test services/dep-graph-builder/test.js",
     "test:coverage": "c8 --reporter=text --reporter=lcov npm test",
     "bench": "node bench/agent-memory/run-all.js",
     "bench:real": "node bench/agent-memory/bench-eval-real.js",

@@ -13,6 +13,9 @@ Routes:
   GET  /entities/<id>     — 200 record | 404
   GET  /entities          — query params: namespace, workspace,
                             include_deleted (true/false), limit (int)
+  GET  /                  — Control plane HTML page (Phase 4.1)
+  GET  /runs              — 200 {runs: [...]} — distinct runs in the ledger
+  GET  /runs/<id>/events  — 200 {events: [...]} — chronological events
 
 Transport: stdlib http.server (ThreadingHTTPServer). Each request runs in
 its own thread. Thread safety is delegated to the Ledger — JsonlAppender
@@ -31,6 +34,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from .control_plane import HTML_PAGE, events_for_run, list_runs
 from .ledger import Ledger
 
 log = logging.getLogger(__name__)
@@ -115,13 +119,24 @@ def _build_handler(ledger: Ledger):
 
         def do_GET(self):  # noqa: N802 - stdlib name
             parsed = urlparse(self.path)
-            if parsed.path == "/health":
+            path = parsed.path
+            if path == "/":
+                return self._handle_control_plane()
+            if path == "/health":
                 return self._json(200, _health(ledger))
-            if parsed.path == "/entities":
+            if path == "/entities":
                 return self._handle_list_entities(parsed.query)
-            if parsed.path.startswith("/entities/"):
-                eid = parsed.path[len("/entities/") :]
+            if path.startswith("/entities/"):
+                eid = path[len("/entities/") :]
                 return self._handle_get_entity(eid)
+            if path == "/runs":
+                return self._handle_list_runs()
+            # /runs/<id>/events — match without a trailing slash too.
+            if path.startswith("/runs/"):
+                tail = path[len("/runs/") :]
+                if tail.endswith("/events"):
+                    run_id = tail[: -len("/events")]
+                    return self._handle_run_events(run_id)
             return self._json(404, {"error": "not found"})
 
         def do_POST(self):  # noqa: N802 - stdlib name
@@ -162,6 +177,34 @@ def _build_handler(ledger: Ledger):
             if rec is None:
                 return self._json(404, {"error": "not found"})
             return self._json(200, rec)
+
+        def _handle_control_plane(self):
+            """Serve the inline control-plane HTML. Static — the JS in
+            the page fetches /runs and /runs/<id>/events for data."""
+            body = HTML_PAGE.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _handle_list_runs(self):
+            try:
+                runs = list_runs(ledger)
+            except Exception as e:
+                log.exception("LedgerServer: /runs failed")
+                return self._json(500, {"error": str(e)})
+            return self._json(200, {"runs": runs})
+
+        def _handle_run_events(self, run_id: str):
+            if not run_id:
+                return self._json(400, {"error": "run id required"})
+            try:
+                events = events_for_run(ledger, run_id)
+            except Exception as e:
+                log.exception("LedgerServer: /runs/<id>/events failed")
+                return self._json(500, {"error": str(e)})
+            return self._json(200, {"events": events})
 
         def _handle_list_entities(self, raw_query: str):
             params = parse_qs(raw_query)

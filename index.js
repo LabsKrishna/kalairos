@@ -473,6 +473,22 @@ function _persistAll() {
   }
 }
 
+// Run a batch of ingests as a single I/O transaction: suppress per-item
+// persistence via the _skipIO counter, always restore it (even on throw),
+// then flush once with _persistAll(). On error, the counter is restored but
+// the flush is skipped — matching the hand-rolled try/finally this replaces.
+async function _withBatchedIO(fn) {
+  _skipIO++;
+  let result;
+  try {
+    result = await fn();
+  } finally {
+    _skipIO--;
+  }
+  _persistAll();
+  return result;
+}
+
 function _appendEntity(entity) {
   if (_skipIO > 0) return;
   const row = _serializeForIO(entity);
@@ -940,18 +956,14 @@ async function ingestBatch(items, { allowedWorkspaces } = {}) {
     throw emitError(Err.validation("items must be a non-empty array"));
   }
 
-  _skipIO++;
-  const ids = [];
-  try {
+  return _withBatchedIO(async () => {
+    const ids = [];
     for (const item of items) {
       const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore } = item || {};
       ids.push(await ingest(text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, allowedWorkspaces }));
     }
-  } finally {
-    _skipIO--;
-  }
-  _persistAll(); // single write for the entire batch
-  return ids;
+    return ids;
+  });
 }
 
 // ─── Fact Extraction + Ingest ────────────────────────────────────────────────
@@ -975,20 +987,17 @@ async function extractFacts(text, opts = {}) {
   if (!facts.length) return { facts: [], ids: [] };
 
   // Ingest each fact as its own entity, batched for single persist
-  _skipIO++;
-  const ids = [];
-  try {
+  const ids = await _withBatchedIO(async () => {
+    const out = [];
     for (const fact of facts) {
-      ids.push(await ingest(fact, {
+      out.push(await ingest(fact, {
         ...opts,
         metadata: { ...(opts.metadata || {}), extractedFrom: safeText.slice(0, 200) },
         allowedWorkspaces: opts.allowedWorkspaces,
       }));
     }
-  } finally {
-    _skipIO--;
-  }
-  _persistAll();
+    return out;
+  });
 
   console.log(`[kalairos] Extracted ${facts.length} facts from raw text`);
   return { facts, ids };
@@ -1887,21 +1896,18 @@ async function importMarkdown(mdText, defaults = {}) {
   if (mode === "empty") return { imported: 0, ids: [] };
 
   const allowedWorkspaces = defaults.allowedWorkspaces;
-  _skipIO++;
-  const ids = [];
-  try {
+  const ids = await _withBatchedIO(async () => {
+    const out = [];
     for (const fact of facts) {
       // Structured sections carry their own type; bullet facts inherit it
       // from the caller's defaults.
       const opts = fact.type
         ? { ...defaults, type: fact.type, allowedWorkspaces }
         : { ...defaults, allowedWorkspaces };
-      ids.push(await ingest(fact.text, opts));
+      out.push(await ingest(fact.text, opts));
     }
-  } finally {
-    _skipIO--;
-  }
-  _persistAll();
+    return out;
+  });
   console.log(`[kalairos] Imported ${ids.length} entities from ${mode} markdown`);
   return { imported: ids.length, ids };
 }

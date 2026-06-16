@@ -12,6 +12,11 @@ const { Err, emitError, resetSignals } = require("./errors");
 const { AuthStore } = require("./auth");
 const { computeTrustSignals } = require("./trust");
 const { renderExport, parseMarkdownFacts } = require("./markdown");
+const {
+  parseNLFilters:    _parseNLFilters,
+  applyFilter:       _applyFilter,
+  computeImportance: _computeImportance,
+} = require("./filters");
 // Entity-shape normalization lives in store/entity-normalizer.js so the SQLite
 // rebuild path (KAL-104+) shares the same legacy-data defaulting and version
 // backfill as this in-memory hot-cache. Aliased to underscore-prefixed names
@@ -1077,78 +1082,9 @@ async function ingestFile(filePath, { tags = [], metadata: extra = {} } = {}) {
   });
 }
 
-// ─── NL Filter Extraction ─────────────────────────────────────────────────────
-
-const _TIME_RULES = [
-  { re: /\blast\s+hour\b/i,            ms: () => 3_600_000 },
-  { re: /\blast\s+(\d+)\s+hours?\b/i,  ms: m => +m[1] * 3_600_000 },
-  { re: /\btoday\b/i,                  ms: () => 86_400_000 },
-  { re: /\byesterday\b/i,              ms: () => 2 * 86_400_000 },
-  { re: /\bthis\s+week\b/i,            ms: () => 7 * 86_400_000 },
-  { re: /\blast\s+(\d+)\s+days?\b/i,   ms: m => +m[1] * 86_400_000 },
-  { re: /\blast\s+week\b/i,            ms: () => 7 * 86_400_000 },
-  { re: /\bthis\s+month\b/i,           ms: () => 30 * 86_400_000 },
-  { re: /\blast\s+month\b/i,           ms: () => 30 * 86_400_000 },
-  { re: /\blast\s+(\d+)\s+weeks?\b/i,  ms: m => +m[1] * 7 * 86_400_000 },
-  { re: /\blast\s+(\d+)\s+months?\b/i, ms: m => +m[1] * 30 * 86_400_000 },
-  { re: /\brecent(ly)?\b/i,            ms: () => 7 * 86_400_000 },
-];
-
-const _TYPE_RULES = [
-  { re: /\bimages?\b|\bphotos?\b/i,       type: "image" },
-  { re: /\baudios?\b|\brecordings?\b/i,   type: "audio" },
-  { re: /\bvideos?\b|\bclips?\b/i,        type: "video" },
-  { re: /\btime.?series\b|\bmetrics?\b/i, type: "timeseries" },
-  { re: /\bdocuments?\b|\bnotes?\b/i,     type: "document" },
-];
-
-function _parseNLFilters(text) {
-  const filter = {}, now = Date.now();
-  for (const r of _TIME_RULES) {
-    const m = text.match(r.re);
-    if (m) { filter.since = now - r.ms(m); break; }
-  }
-  for (const r of _TYPE_RULES) {
-    if (r.re.test(text)) { filter.type = r.type; break; }
-  }
-  return filter;
-}
-
-// ─── Filter ───────────────────────────────────────────────────────────────────
-
-function _applyFilter(entities, { type, since, until, tags, memoryType, workspaceId } = {}) {
-  return entities.filter(e => {
-    if (type        && e.type      !== type)        return false;
-    if (since       && e.updatedAt <  since)        return false;
-    if (until       && e.updatedAt >  until)        return false;
-    if (memoryType  && (e.memoryType || "long-term") !== memoryType) return false;
-    if (workspaceId && (e.workspaceId || "default")  !== workspaceId) return false;
-    if (tags  && tags.length) {
-      if (!tags.some(t => (e.tags || []).includes(t))) return false;
-    }
-    return true;
-  });
-}
-
-// ─── Importance Heuristic ────────────────────────────────────────────────────
-// When no explicit importance is set and no LLM enrichment exists, derive a
-// heuristic score from structural signals so that importance scoring always
-// has a meaningful signal. Frequently updated, well-connected, and contradicted
-// entities are considered more important.
-
-function _computeImportance(entity) {
-  // 1. Explicit importance (set via ingest { importance } or agent.remember)
-  if (entity.importance != null && Number.isFinite(entity.importance)) return entity.importance;
-
-  // 2. LLM-derived importance
-  if (entity.metadata?.llm?.importance != null) return entity.metadata.llm.importance;
-
-  // 3. Heuristic: version count (0.4) + link count (0.3) + contradiction (0.3)
-  const versionSignal = Math.min((entity.versions?.length || 1) - 1, 10) / 10;
-  const linkSignal    = Math.min(entity.links?.size || 0, 10) / 10;
-  const hasContradiction = (entity.versions || []).some(v => v.delta?.contradicts) ? 1 : 0;
-  return Math.min(1, versionSignal * 0.4 + linkSignal * 0.3 + hasContradiction * 0.3);
-}
+// NL filter extraction, structured filtering, and the importance heuristic
+// live in filters.js (pure helpers). Imported above as _parseNLFilters /
+// _applyFilter / _computeImportance.
 
 // ─── Parallel Hybrid Query ────────────────────────────────────────────────────
 

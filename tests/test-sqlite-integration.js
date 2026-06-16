@@ -19,8 +19,8 @@ const fs     = require("fs");
 const os     = require("os");
 const path   = require("path");
 
-const lib = require("./index");
-const { SqliteIndex } = require("./store/sqlite-index");
+const lib = require("../index");
+const { SqliteIndex } = require("../store/sqlite-index");
 
 let passed = 0, failed = 0;
 async function test(name, fn) {

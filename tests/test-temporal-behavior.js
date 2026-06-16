@@ -13,7 +13,7 @@
 "use strict";
 
 const assert = require("assert/strict");
-const lib    = require("./index");
+const lib    = require("../index");
 
 let passed = 0, failed = 0;
 async function test(name, fn) {

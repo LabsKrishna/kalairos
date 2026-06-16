@@ -3,7 +3,7 @@
 "use strict";
 
 const assert = require("assert/strict");
-const lib = require("./index");
+const lib = require("../index");
 
 // ─── Mock embedder ─────────────────────────────────────
 function makeMockEmbedder(dim = 64) {

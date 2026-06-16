@@ -7,7 +7,11 @@
 [![codecov](https://codecov.io/gh/LabsKrishna/kalairos/graph/badge.svg)](https://codecov.io/gh/LabsKrishna/kalairos)
 [![CI](https://github.com/LabsKrishna/kalairos/actions/workflows/ci.yml/badge.svg)](https://github.com/LabsKrishna/kalairos/actions/workflows/ci.yml)
 
-> **Most systems store what is true. Kalairos stores what was true when decisions were made.**
+> **Kalairos — the agent platform for AI that needs to act at the right moment.**
+>
+> Bitemporal memory at its foundation. Live observability through a control plane that traces every fact, every action, every decision. Local-first. JSONL canonical, SQLite derived. MIT.
+>
+> *Most systems store what is true. Kalairos stores what was true when decisions were made — and shows you why your agent acted on it.*
 
 ---
 

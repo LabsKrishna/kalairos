@@ -11,6 +11,7 @@ const { MemoryScope, AgentMemory } = require("./agent");
 const { Err, emitError, resetSignals } = require("./errors");
 const { AuthStore } = require("./auth");
 const { computeTrustSignals } = require("./trust");
+const { renderExport, parseMarkdownFacts } = require("./markdown");
 // Entity-shape normalization lives in store/entity-normalizer.js so the SQLite
 // rebuild path (KAL-104+) shares the same legacy-data defaulting and version
 // backfill as this in-memory hot-cache. Aliased to underscore-prefixed names
@@ -1930,45 +1931,7 @@ async function exportMarkdown({ filter, includeHistory = false, allowedWorkspace
   if (allowedWorkspaces) entities = entities.filter(e => _wsAllowed(e, allowedWorkspaces));
   if (filter && Object.keys(filter).length) entities = _applyFilter(entities, filter);
   entities.sort((a, b) => b.updatedAt - a.updatedAt);
-
-  const lines = ["# Kalairos — Memory Export", ""];
-  lines.push(`> Exported ${entities.length} entities at ${new Date().toISOString()}`, "");
-
-  for (const e of entities) {
-    lines.push(`## [${e.id}] ${(e.type || "text").toUpperCase()}`);
-    lines.push("");
-    lines.push(e.text);
-    lines.push("");
-    lines.push(`- **ID:** ${e.id}`);
-    lines.push(`- **Type:** ${e.type || "text"}`);
-    lines.push(`- **Memory type:** ${e.memoryType || "long-term"}`);
-    lines.push(`- **Workspace:** ${e.workspaceId || "default"}`);
-    lines.push(`- **Classification:** ${e.classification || "internal"}`);
-    lines.push(`- **Tags:** ${(e.tags || []).join(", ") || "none"}`);
-    lines.push(`- **Source:** ${e.source?.type || "user"}${e.source?.actor ? " (" + e.source.actor + ")" : ""}`);
-    lines.push(`- **Created:** ${new Date(e.createdAt).toISOString()}`);
-    lines.push(`- **Updated:** ${new Date(e.updatedAt).toISOString()}`);
-    lines.push(`- **Versions:** ${e.versions?.length || 1}`);
-
-    if (includeHistory && e.versions?.length > 1) {
-      lines.push("");
-      lines.push("### Version History");
-      lines.push("");
-      const versionsOldest = [...e.versions].reverse();
-      for (let i = 0; i < versionsOldest.length; i++) {
-        const v = versionsOldest[i];
-        const delta = v.delta ? ` [${v.delta.type}] ${v.delta.summary}` : " (initial)";
-        lines.push(`${i + 1}. **${new Date(v.timestamp).toISOString()}**${delta}`);
-        if (v.text !== e.text) lines.push(`   > ${v.text.slice(0, 120)}`);
-      }
-    }
-
-    lines.push("");
-    lines.push("---");
-    lines.push("");
-  }
-
-  return lines.join("\n");
+  return renderExport(entities, { includeHistory });
 }
 
 /**
@@ -1984,70 +1947,26 @@ async function exportMarkdown({ filter, includeHistory = false, allowedWorkspace
  */
 async function importMarkdown(mdText, defaults = {}) {
   _assertInit();
-  const text = String(mdText || "");
-  if (!text.trim()) return { imported: 0, ids: [] };
+  const { mode, facts } = parseMarkdownFacts(mdText);
+  if (mode === "empty") return { imported: 0, ids: [] };
 
-  const sections = [];
   const allowedWorkspaces = defaults.allowedWorkspaces;
-
-  // Try structured format first: split on ## headers
-  const headerRe = /^##\s+\[(\d+)\]\s+(.+)/;
-  const lines = text.split("\n");
-  let currentSection = null;
-
-  for (const line of lines) {
-    const headerMatch = line.match(headerRe);
-    if (headerMatch) {
-      if (currentSection) sections.push(currentSection);
-      currentSection = { type: headerMatch[2].trim().toLowerCase(), lines: [] };
-      continue;
-    }
-    if (currentSection) {
-      // Skip metadata lines (start with "- **")
-      if (/^- \*\*/.test(line.trim()) || /^###/.test(line.trim()) || /^---$/.test(line.trim()) || /^>/.test(line.trim())) continue;
-      const trimmed = line.trim();
-      if (trimmed) currentSection.lines.push(trimmed);
-    }
-  }
-  if (currentSection) sections.push(currentSection);
-
-  // If we found structured sections, ingest each
-  if (sections.length > 0) {
-    _skipIO++;
-    const ids = [];
-    try {
-      for (const sec of sections) {
-        const factText = sec.lines.join(" ").trim();
-        if (!factText) continue;
-        const type = sec.type === "text" ? "text" : sec.type;
-        ids.push(await ingest(factText, { ...defaults, type, allowedWorkspaces }));
-      }
-    } finally {
-      _skipIO--;
-    }
-    _persistAll();
-    console.log(`[kalairos] Imported ${ids.length} entities from structured markdown`);
-    return { imported: ids.length, ids };
-  }
-
-  // Fallback: treat bullet points or plain lines as individual facts
-  const bullets = lines
-    .map(l => l.replace(/^[\s]*[-*]\s+/, "").trim())
-    .filter(l => l.length > 0 && !l.startsWith("#") && !l.startsWith(">"));
-
-  if (!bullets.length) return { imported: 0, ids: [] };
-
   _skipIO++;
   const ids = [];
   try {
-    for (const fact of bullets) {
-      ids.push(await ingest(fact, { ...defaults, allowedWorkspaces }));
+    for (const fact of facts) {
+      // Structured sections carry their own type; bullet facts inherit it
+      // from the caller's defaults.
+      const opts = fact.type
+        ? { ...defaults, type: fact.type, allowedWorkspaces }
+        : { ...defaults, allowedWorkspaces };
+      ids.push(await ingest(fact.text, opts));
     }
   } finally {
     _skipIO--;
   }
   _persistAll();
-  console.log(`[kalairos] Imported ${ids.length} entities from markdown bullets`);
+  console.log(`[kalairos] Imported ${ids.length} entities from ${mode} markdown`);
   return { imported: ids.length, ids };
 }
 

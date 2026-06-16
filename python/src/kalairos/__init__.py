@@ -11,6 +11,7 @@ from .executor import Executor
 from .jsonl import JsonlAppender
 from .ledger import Ledger
 from .llm import LLMLoop
+from .replay import ReplayResult, replay
 from .run import Run
 from .schema import SCHEMA_VERSION
 from .server import LedgerServer
@@ -27,6 +28,7 @@ __all__ = [
     "LLMLoop",
     "Ledger",
     "LedgerServer",
+    "ReplayResult",
     "Run",
     "SCHEMA_VERSION",
     "SqliteStreamer",
@@ -34,6 +36,7 @@ __all__ = [
     "Tool",
     "ToolRegistry",
     "WorkflowGraph",
+    "replay",
     "tool",
     "__version__",
 ]

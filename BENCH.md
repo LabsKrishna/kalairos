@@ -1,6 +1,11 @@
-# Kalairos — Latency Budget & Measurements
+# Kalairos — Benchmarks (Latency & Observability)
 
-This document records **reproducible** query-latency measurements against the JSONL file store. It exists to back the Stage 1 latency budget in `CLAUDE.md §5`:
+This document records **reproducible** platform measurements and the floors CI gates against. Two families live here:
+
+- **Latency** (this first section) — query latency against the JSONL store, backing the Stage 1 budget in `CLAUDE.md §5`.
+- **Observability** ([jump](#observability-completeness--cross-agent-trace-coverage)) — observability completeness and cross-agent trace coverage, the platform benchmarks named in `CLAUDE.md §17`.
+
+## Latency budget
 
 > **Latency budget: p95 `query` under 50ms on JSONL with ≤ 10k entities.**
 
@@ -79,6 +84,48 @@ These are engineering directions; none are promised in Stage 1 unless the budget
 4. **Embedding cache for hot queries.** Voice-agent territory (Stage 5), but the plumbing is the same.
 
 Before shipping any of the above, we measure the **delta against this file** and amend the table. No "improves retrieval latency" claim ships without a new row here.
+
+## Observability completeness & cross-agent trace coverage
+
+The platform half of `CLAUDE.md §17`. Memory benchmarks ask "did we recall the right fact?"; these ask "could you *see* what the agent did, and trace a handoff end-to-end?" — the headline promises of §11.7 ("No silent execution") and §11.8 (cross-agent handoffs are first-class).
+
+> **Observability completeness** — the fraction of agent actions (lifecycle, node transitions, tool calls, branch decisions, handoffs) that surface as ledger events the control plane can read back.
+>
+> **Cross-agent trace coverage** — the fraction of handoffs reconstructible end-to-end from the ledger alone: **caller, callee, payload, outcome** (§11.8).
+
+### Method
+
+- Runner: `python/bench/observability.py`. No real LLM, no network — fully deterministic.
+- Reference workload: an `Executor` walking a fixed `WorkflowGraph` (the same shape as the Phase 3 PR-risk analyzer — fetch → assess → route → handoff to the Node dep-graph service → summarize) plus a hand-driven run whose tool raises, so the failure path is measured too.
+- The cross-runtime handoff is answered by an in-process auto-reply thread that mimics a Node service POSTing a `handoff_result` to `LedgerServer` — so the handoff and its trace are exercised for real, not stubbed past.
+- **Completeness is not computed circularly.** The *expected* action set is derived from the graph topology + the declared execution path (the workload's definition); the *present* set is derived from what `control_plane.events_for_run` actually surfaces. Completeness = `|present ∩ expected| / |expected|`.
+
+Run it yourself:
+
+```bash
+cd python
+python bench/observability.py          # print the table
+python bench/observability.py --check   # assert floors, exit 1 on a miss
+```
+
+Output is printed as a table and persisted to `python/bench/observability-results.json`.
+
+### Current measurements & floors
+
+| Metric | Floor | Current |
+| ------ | ----- | ------- |
+| Observability completeness | 1.000 | **1.000 — PASS** |
+| Cross-agent trace coverage | 1.000 | **1.000 — PASS** |
+
+### Why the floor is 1.0 (and how it relates to §25's 95%)
+
+On our **own reference fixture** the platform emits every action it takes — so the floor is exactly `1.0`. Anything below it is a silent-execution *bug*, not a tuning knob; the benchmark's sensitivity check (drop one event → score falls below the floor) proves the metric can actually catch that.
+
+`CLAUDE.md §25`'s *"observability completeness ≥ 95%"* is a different, looser target measured against a **customer's** workload, where the customer's own agent code may do work the platform never instruments and therefore can't see. Our reference fixture must be exact; the 95% is the bar for a real design-partner deployment.
+
+### CI enforcement
+
+The `python` job in `.github/workflows/ci.yml` enforces this two ways: `pytest` runs `tests/test_observability_bench.py` (which asserts both floors plus the sensitivity checks), and a named `python bench/observability.py --check` step prints the table and fails the build on a miss. Per §17, a merge that drops either metric below its floor requires written justification on the PR.
 
 ## What this is **not**
 

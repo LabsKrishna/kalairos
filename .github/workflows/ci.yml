@@ -95,6 +95,12 @@ jobs:
           python-version: "3.11"
       - run: pip install -e ".[dev]"
       - run: pytest -v
+      # CLAUDE.md §17: observability completeness + cross-agent trace
+      # coverage are platform benchmarks that gate every PR. pytest
+      # already asserts the floors; this prints the table in the logs
+      # and makes the gate a named, visible step. See BENCH.md.
+      - name: Observability benchmark (§17 platform gate)
+        run: python bench/observability.py --check
 
   services:
     # Node-side microservices that talk to the Python LedgerServer.

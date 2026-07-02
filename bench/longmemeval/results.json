@@ -1,5 +1,5 @@
 {
-  "runAt": "2026-04-23T20:37:17.368Z",
+  "runAt": "2026-07-02T23:33:47.972Z",
   "dataset": "/Users/birajthapa/Desktop/kalairos/bench/longmemeval/sample.json",
   "node": "v23.7.0",
   "embedder": "deterministic bag-of-words, dim=64",

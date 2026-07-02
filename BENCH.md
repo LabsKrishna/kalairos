@@ -29,24 +29,26 @@ Output is printed as a table and persisted to `bench/latency-results.json`.
 
 ## Current measurements
 
-Captured on an M-series macOS laptop, Node.js v23.
+Captured 2026-07-02 on an M-series macOS laptop (arm64), Node.js v23.7.0.
 
 | Scale              | Queries | p50      | p95       | p99       | Mean     | Max       |
 | ------------------ | ------- | -------- | --------- | --------- | -------- | --------- |
-| 1,000 entities     | 500     | **10 ms**  | **25 ms**   | 35 ms    | 11 ms    | 54 ms     |
-| 10,000 entities    | 300     | 117 ms   | 321 ms    | 1,378 ms | 153 ms   | 2,202 ms  |
+| 1,000 entities     | 500     | **4.9 ms** | **5.2 ms** | 5.4 ms   | 4.3 ms   | 5.7 ms    |
+| 10,000 entities    | 300     | 54.7 ms  | 64.8 ms   | 69.4 ms  | 49.8 ms  | 70.6 ms   |
 
 Ingest throughput (for context, not budgeted):
 
-- 1k entities: 0.39 ms/entity (389 ms total)
-- 10k entities: 2.37 ms/entity (23.7 s total)
+- 1k entities: 0.15 ms/entity (145 ms total)
+- 10k entities: 0.96 ms/entity (9.6 s total)
+
+Previous measurement (pre-SQLite-index, kept for the delta per the rule below): 1k p95 25 ms; 10k p95 321 ms with a p99 above 1 s. The hybrid SQLite index (v1.7) cut p95 at 10k by ~5× and collapsed the GC-driven long tail (max fell from 2,202 ms to 71 ms).
 
 ## Budget status
 
 | Scale             | Target  | Current | Status |
 | ----------------- | ------- | ------- | ------ |
-| p95 at 1k         | < 50 ms | 25 ms   | **PASS** |
-| p95 at 10k        | < 50 ms | 321 ms  | **MISS — ~6.4× over** |
+| p95 at 1k         | < 50 ms | 5.2 ms  | **PASS** |
+| p95 at 10k        | < 50 ms | 64.8 ms | **MISS — ~1.3× over** (was 6.4× pre-v1.7) |
 
 ### CI enforcement
 
@@ -70,9 +72,9 @@ The 10k row is **not** gated — it's a known unmet aspiration tracked in the
 
 ### Interpretation
 
-- **At Persona-A scale (1k entities)**, Kalairos comfortably meets the target. This is the scale that covers most indie / OSS-dev use cases today — a single agent accumulating memory across days or weeks.
-- **At 10k**, query latency scales approximately linearly with corpus size — consistent with the current full-scan hybrid scorer (semantic + graph + keyword + recency) over every alive entity. The long tail (p99 > 1 s) is dominated by V8 JIT re-optimization and garbage collection on large candidate sets.
-- **The 50ms-at-10k budget is therefore an unmet goal, not a regression.** Tracking it here makes the gap visible and prevents silent drift.
+- **At Persona-A scale (1k entities)**, Kalairos meets the target with an order of magnitude to spare. This is the scale that covers most indie / OSS-dev use cases today — a single agent accumulating memory across days or weeks.
+- **At 10k**, latency still scales with corpus size — the hybrid scorer (semantic + graph + keyword + recency) ranks every alive candidate the index returns — but the SQLite index removed the pathological tail: p99 is now within 7% of p50 instead of 25× above it.
+- **The 50ms-at-10k budget remains a near-miss (64.8 ms), not a regression.** Tracking it here makes the gap visible and prevents silent drift; the candidate-pruning work below is what's expected to close the last ~15 ms.
 
 ## Work queued against this budget
 
@@ -131,4 +133,4 @@ The `python` job in `.github/workflows/ci.yml` enforces this two ways: `pytest` 
 
 - Not a *quality* benchmark. Recall / precision / contradiction numbers live in `bench/agent-memory/` and are run via `npm run bench`.
 - Not a claim about neural embedders. With real embeddings, ingest time is dominated by API round-trips; query time depends on whether embeddings are precomputed.
-- Not a comparison to Mem0 / Zep / Letta. That lives in `bench/poisoning/` and `bench/longmemeval/`.
+- Not a competitor comparison. Kalairos benchmarks report Kalairos's own numbers on reproducible workloads (`bench/poisoning/`, `bench/longmemeval/`); we position by differentiation, not "vs. X" scorecards.

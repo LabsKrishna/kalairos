@@ -66,6 +66,18 @@ That's it. Same memory. Two answers. Both correct — for their moment in time.
 
 ---
 
+## Why this matters
+
+For a hobby agent, losing history is an annoyance. For an agent that touches **legal, medical, financial, or HR decisions**, it's disqualifying:
+
+- A compliance reviewer doesn't ask what your policy *is* — they ask what it was **on the date of the event**, and how you know.
+- An agent that acted on a fact must be able to show **where that fact came from**, who wrote it, and how much it was trusted at the time.
+- When a stored fact changes or contradicts an earlier one, someone has to **see the conflict** — silent overwrites are how agents get poisoned and how audits get failed.
+
+Kalairos makes those properties structural, not bolted on. Every returned fact carries its **event time, ingest time, version id, provenance chain, data classification, and an explainable trust score**. Every mutation lands in a read-only **audit trail** (`trail()`), and any moment can be frozen as a named **checkpoint**. If your agent has to survive the question *"why did it do that, and what did it know at the time?"* — that's the platform's job, and this is the platform.
+
+---
+
 ## Install
 
 ```bash
@@ -205,6 +217,82 @@ If your product makes promises that outlive the moment, you need memory that doe
 
 ---
 
+## A compliance audit, end to end
+
+The scenarios above, as one runnable script. A policy pipeline records a regulated retention rule; the regulation changes; an auditor asks about a date in between. Provenance, classification, contradiction flagging, human review, audit trail, and a frozen checkpoint — all against the same store the 3-call quickstart uses.
+
+```js
+const kalairos = require('kalairos');
+
+async function main() {
+  const embed = async (t) => [...t].map(c => c.charCodeAt(0) / 255).slice(0, 64); // toy embedder
+  await kalairos.init({ embedFn: embed, dataFile: ':memory:' });
+
+  // Every write from this pipeline carries provenance + data classification.
+  const policy = kalairos.scope({
+    source: { type: 'agent', actor: 'policy-sync' },
+    classification: 'regulated',
+    tags: ['retention-policy'],
+  });
+
+  // January: the policy on the books.
+  const id = await policy.remember('Customer records are retained for 5 years', {
+    timestamp: new Date('2026-01-05').getTime(),
+  });
+
+  // April: the regulation changes. Same entity, new version — the old rule is not gone.
+  await policy.remember('Customer records are retained for 7 years', {
+    timestamp: new Date('2026-04-01').getTime(),
+    why: 'Reg update 2026-113',
+    effectiveAt: '2026-04-01',
+  });
+
+  // The auditor asks: "What was your retention rule on March 12?"
+  const march12 = new Date('2026-03-12').getTime();
+  const audit = await kalairos.queryAt('customer record retention rule', march12);
+  console.log(audit.results[0].text);
+  // → "Customer records are retained for 5 years"
+
+  // Today's answer comes with explainable trust — the change was flagged, not silently absorbed.
+  const today = await kalairos.query('customer record retention rule');
+  console.log(today.results[0].text);
+  console.log(today.results[0].trustBreakdown.formula);
+  // → "Customer records are retained for 7 years"
+  // → "Trust 0.30 = base 0.75 -0.16 contradictions ×0.50 recency"
+
+  // A human reviews the flagged change and confirms it — on the record.
+  await kalairos.annotate(id, {
+    trustScore: 0.9,
+    verified: true,
+    notes: 'Confirmed against Reg update 2026-113 by compliance review',
+  });
+
+  // Evidence, not assertion: who changed what, when, and why.
+  const events = await kalairos.trail({ entity: id });
+  events.forEach(e => console.log(e.action, e.who, e.why ?? ''));
+  // → remembered { agent: 'policy-sync' }
+  // → superseded { agent: 'policy-sync' } Reg update 2026-113
+  // → contested  { agent: 'policy-sync' } Reg update 2026-113
+  // → annotated  ...
+
+  // Freeze the audit window: reviewers see the same slice forever.
+  await kalairos.checkpoint('fy26-q1-audit', {
+    during: ['2026-01-01', '2026-04-01'],
+    why: 'Q1 retention audit reference',
+  });
+  const q1 = await kalairos.trail({ checkpoint: 'fy26-q1-audit' });
+  console.log(`${q1.length} events in the frozen Q1 window`);
+
+  await kalairos.shutdown();
+}
+
+main().catch(e => { console.error(e); process.exit(1); });
+```
+
+Note the trust formula: the 5-year → 7-year change **contradicts** the prior version, so Kalairos flags it and cuts trust until a human confirms it. That's deliberate — a policy that changes without anyone noticing is exactly the failure mode a regulated deployment cannot have.
+
+---
+
 ## Layer 3 — Advanced maintenance
 
 Reach for these only when you need them. The 3-function path covers most agents.
@@ -276,7 +364,7 @@ Kalairos follows semver. Within the `1.x` line, the signatures of **`init`, `rem
 
 ## Benchmarks
 
-All numbers from `npm run bench` — deterministic bag-of-words embedder, no API key needed. Reproducible on any machine.
+All numbers reproducible on any machine — deterministic bag-of-words embedder, no API key needed. Last full run: **2026-07-02** (M-series macOS, Node v23.7.0); the dated snapshot lives in [bench/RESULTS.md](bench/RESULTS.md).
 
 | Metric                      | Score                            | What it measures                                      |
 | --------------------------- | -------------------------------- | ----------------------------------------------------- |
@@ -284,17 +372,23 @@ All numbers from `npm run bench` — deterministic bag-of-words embedder, no API
 | **Precision@3**             | 100% (health)                    | Fraction of top-3 results that are relevant           |
 | **MRR**                     | 1.0                              | First relevant result appears at rank 1               |
 | **Temporal accuracy**       | 100%                             | `queryAt` time-travel returns correct historical version |
-| **Contradiction detection** | 100%                             | Value changes flagged across all scenarios            |
-| **Cross-session recall**    | 100%                             | Memories persist across agent sessions                |
+| **Contradiction detection** | 100%                             | Conflicting facts flagged; metric drift correctly exempted |
+| **Cross-session recall**    | 100%                             | Memories persist across agent sessions and agents     |
+| **Poisoning defense**       | 5/5 attacks defended             | Injected facts flagged, trust-penalized, `asOf`-recoverable |
+| **Query latency (p95)**     | 5.2 ms @ 1k · 64.8 ms @ 10k entities | End-to-end `query()` on the JSONL + SQLite store |
+| **Observability completeness** | 1.000                         | Fraction of agent actions visible in the control-plane ledger |
+| **Cross-agent trace coverage** | 1.000                         | Handoffs reconstructible end-to-end (caller, callee, payload, outcome) |
 
 These numbers use a bag-of-words embedder (no neural model). With OpenAI `text-embedding-3-small` or Cohere embeddings, expect recall@5 > 90%.
 
 ```bash
-npm run bench          # full suite
-npm run bench:real     # real embeddings (requires OPENAI_API_KEY)
+npm run bench            # memory suite (75 assertions, 10 constitution goals)
+npm run bench:poisoning  # adversarial ingest fixtures
+npm run bench:latency    # latency at 1k / 10k entities
+npm run bench:real       # real embeddings (requires OPENAI_API_KEY)
 ```
 
-See [BENCH.md](BENCH.md) for the full suite.
+See [BENCH.md](BENCH.md) for method, budgets, and CI gates — including the one number we publish while missing it (10k p95 is 64.8 ms against a 50 ms budget, down from 321 ms pre-v1.7).
 
 ---
 

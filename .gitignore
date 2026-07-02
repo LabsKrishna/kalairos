@@ -8,6 +8,7 @@ data.kalairos.tmp
 data.dbx
 data.dbx.tmp
 CLAUDE.md
+STATE.md
 
 # Internal planning docs — development-only, not shipped
 docs/storage-architecture-jsonl-sqlite-hybrid.md

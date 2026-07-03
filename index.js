@@ -17,6 +17,15 @@ const {
   applyFilter:       _applyFilter,
   computeImportance: _computeImportance,
 } = require("./filters");
+// Read-side observability projection + checkpoint filtering. Pure helpers;
+// the stateful trail()/checkpoint() orchestration below injects the store
+// lookup and timestamp normalizer they need.
+const {
+  collectTrailEvents:       _collectTrailEvents,
+  matchesWho:               _matchesWho,
+  normalizeCheckpointFilter: _normalizeCheckpointFilter,
+  applyCheckpointFilter:    _applyCheckpointFilter,
+} = require("./trail");
 // Entity-shape normalization lives in store/entity-normalizer.js so the SQLite
 // rebuild path (KAL-104+) shares the same legacy-data defaulting and version
 // backfill as this in-memory hot-cache. Aliased to underscore-prefixed names
@@ -253,24 +262,6 @@ function _buildVersionRecord({
     action,
     who:  who || null,
     why:  (typeof why === "string" && why.length) ? why : null,
-  };
-}
-
-// Snapshot an entity version into a trail-event projection.
-function _versionToTrailEvent(entity, v) {
-  return {
-    entityId:          entity.id,
-    versionId:         v.versionId,
-    action:            v.action,
-    who:               v.who || null,
-    why:               v.why ?? null,
-    effectiveAt:       v.effectiveAt ?? v.timestamp,
-    ingestAt:          v.ingestAt    ?? v.timestamp,
-    previousVersionId: v.previousVersionId || null,
-    source:            v.source || entity.source || { type: "user" },
-    contentChanged:    true,
-    deltaSummary:      v.delta?.summary || null,
-    classification:    v.classification || entity.classification || "internal",
   };
 }
 
@@ -2213,28 +2204,6 @@ async function getStartupSummary({
 // are NOT trail events. Only explicit annotate({ trustScore }) calls and
 // contradiction-flagging produce trail entries.
 
-function _matchesWho(eventWho, filterWho) {
-  if (!filterWho) return true;
-  if (!eventWho) return false;
-  if (filterWho.agent && eventWho.agent !== filterWho.agent) return false;
-  if (filterWho.user  && eventWho.user  !== filterWho.user)  return false;
-  return true;
-}
-
-function _collectTrailEvents(entity, allowedWorkspaces) {
-  if (allowedWorkspaces && !_wsAllowed(entity, allowedWorkspaces)) return [];
-  const out = [];
-  // Content versions → events (oldest-first within the entity)
-  const versionsOldestFirst = [...(entity.versions || [])].reverse();
-  for (const v of versionsOldestFirst) {
-    out.push(_versionToTrailEvent(entity, v));
-  }
-  // Metadata-only trail events (oldest-first)
-  const trailOldestFirst = [...(entity.trailEvents || [])].reverse();
-  for (const ev of trailOldestFirst) out.push({ ...ev });
-  return out;
-}
-
 /**
  * Read-only projection of every memory mutation across the store. Sorted by
  * ingestAt ascending; stable across restarts.
@@ -2283,7 +2252,8 @@ async function trail(opts = {}) {
   let events = [];
   for (const e of entities) {
     if (workspace && (e.workspaceId || "default") !== workspace) continue;
-    events.push(..._collectTrailEvents(e, allowedWorkspaces));
+    if (allowedWorkspaces && !_wsAllowed(e, allowedWorkspaces)) continue;
+    events.push(..._collectTrailEvents(e));
   }
 
   if (sinceMs   != null) events = events.filter(ev => ev.ingestAt >= sinceMs);
@@ -2299,7 +2269,7 @@ async function trail(opts = {}) {
       const ids = new Set(cp.eventIds || []);
       events = events.filter(ev => ids.has(ev.versionId));
     } else {
-      events = _applyCheckpointFilter(events, cp.filter);
+      events = _applyCheckpointFilter(events, cp.filter, id => store.get(id));
     }
   }
 
@@ -2345,63 +2315,6 @@ function _persistCheckpoint(cp) {
   fs.appendFileSync(file, JSON.stringify(cp) + "\n");
 }
 
-function _normalizeCheckpointFilter(opts) {
-  const filter = {};
-  if (opts.during) {
-    if (!Array.isArray(opts.during) || opts.during.length !== 2) {
-      throw emitError(Err.validation("checkpoint.during must be a [from, to] pair"));
-    }
-    filter.during = [
-      _normalizeTimestampInput(opts.during[0], "checkpoint.during[0]"),
-      _normalizeTimestampInput(opts.during[1], "checkpoint.during[1]"),
-    ];
-  }
-  if (opts.entity != null) {
-    filter.entity = Array.isArray(opts.entity)
-      ? opts.entity.map(x => Number(x) || x)
-      : [Number(opts.entity) || opts.entity];
-  }
-  if (Array.isArray(opts.tags) && opts.tags.length) {
-    filter.tags = opts.tags.map(String);
-  }
-  if (opts.workspace) filter.workspace = String(opts.workspace);
-  if (opts.action) {
-    filter.action = Array.isArray(opts.action) ? opts.action.map(String) : [String(opts.action)];
-  }
-  return filter;
-}
-
-function _applyCheckpointFilter(events, filter) {
-  let out = events;
-  if (filter.during) {
-    const [from, to] = filter.during;
-    out = out.filter(ev => ev.ingestAt >= from && ev.ingestAt <= to);
-  }
-  if (filter.entity) {
-    const ids = new Set(filter.entity);
-    out = out.filter(ev => ids.has(ev.entityId));
-  }
-  if (filter.action) {
-    const actions = new Set(filter.action);
-    out = out.filter(ev => actions.has(ev.action));
-  }
-  if (filter.tags) {
-    const wanted = new Set(filter.tags);
-    out = out.filter(ev => {
-      const ent = store.get(ev.entityId);
-      if (!ent) return false;
-      return (ent.tags || []).some(t => wanted.has(t));
-    });
-  }
-  if (filter.workspace) {
-    out = out.filter(ev => {
-      const ent = store.get(ev.entityId);
-      return ent && (ent.workspaceId || "default") === filter.workspace;
-    });
-  }
-  return out;
-}
-
 /**
  * Create a named checkpoint over the trail. Frozen-by-default — the matching
  * event-id set is captured at creation time, so future backdated events do
@@ -2425,7 +2338,7 @@ async function checkpoint(name, opts = {}) {
       }
     }
 
-    const filter = _normalizeCheckpointFilter(opts);
+    const filter = _normalizeCheckpointFilter(opts, _normalizeTimestampInput);
     const live   = !!opts.live;
     const why    = (typeof opts.why === "string" && opts.why.trim()) ? opts.why.trim().slice(0, 500) : null;
 
@@ -2434,7 +2347,7 @@ async function checkpoint(name, opts = {}) {
     if (!live) {
       const all = [];
       for (const e of store.values()) all.push(..._collectTrailEvents(e));
-      const matched = _applyCheckpointFilter(all, filter);
+      const matched = _applyCheckpointFilter(all, filter, id => store.get(id));
       eventIds = matched.map(ev => ev.versionId).filter(Boolean);
     }
 

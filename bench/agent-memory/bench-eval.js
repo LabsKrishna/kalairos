@@ -167,10 +167,14 @@ async function run() {
     assert.ok(h.versions.length >= 3, `expected >= 3 versions, got ${h.versions.length}`);
   });
 
-  await suite.run("contradiction detection flags value changes", async () => {
+  await suite.run("metric value changes supersede without contradiction", async () => {
+    // Time-separated value changes on a metric are legitimate drift: they must
+    // be recorded as supersessions, never contradictions (see test-series-supersession.js).
     const h = await lib.getHistory(priceId);
+    const superseded = h.versions.filter(v => v.delta?.supersedes);
+    assert.ok(superseded.length >= 1, "should record at least one supersession");
     const contradictions = h.versions.filter(v => v.delta?.contradicts);
-    assert.ok(contradictions.length >= 1, "should detect at least one contradiction");
+    assert.strictEqual(contradictions.length, 0, "metric drift must not be flagged as contradiction");
   });
 
   // ── Scenario 3: Token-Budget Efficiency ───────────────────────────────────

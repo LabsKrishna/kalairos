@@ -758,7 +758,19 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
         return mergeTarget.id;
       }
 
-      const delta = buildDelta(mergeTarget.text, mergeTarget.vector, safeText, vector);
+      // Series supersession: for metric/series entities, a value that becomes
+      // effective strictly later than the prior reading opens a NEW valid
+      // interval rather than contradicting it. Apple $200 on Jun-22 and $190 on
+      // Jun-23 are both true — the new reading retires the old one's interval.
+      // A same- or earlier-time value change is still a genuine conflict and
+      // stays flagged (the "was it 210 on Jun-23?" case). Opt-in by type so the
+      // poisoning defense on text/fact entities is untouched.
+      const newEffectiveAt     = effectiveAtMs ?? ts;
+      const priorEffectiveAt   = latest?.effectiveAt ?? latest?.timestamp ?? 0;
+      const isSeriesType       = type === "metric" || type === "series";
+      const seriesSupersession = isSeriesType && newEffectiveAt > priorEffectiveAt;
+
+      const delta = buildDelta(mergeTarget.text, mergeTarget.vector, safeText, vector, { seriesSupersession });
       if (isConsolidation) delta.type = "consolidation";
 
       // Action selection: correction → corrected, anything else → superseded.
@@ -769,7 +781,6 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
 
       // Close validTo on the prior latest version — its valid interval ends
       // when this new one becomes effective.
-      const newEffectiveAt = effectiveAtMs ?? ts;
       if (latest) latest.validTo = newEffectiveAt;
 
       const versionRecord = _buildVersionRecord({

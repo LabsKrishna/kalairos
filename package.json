@@ -1,7 +1,7 @@
 {
   "name": "kalairos",
   "version": "1.7.0",
-  "description": "Durable, private, time-aware memory engine for long-running AI agents",
+  "description": "Agent platform with bitemporal memory, live observability, and audit-grade traceability — for AI that needs to act at the right moment",
   "main": "./index.js",
   "exports": {
     ".": {
@@ -32,7 +32,7 @@
   "scripts": {
     "start": "node server.js",
     "postinstall": "node scripts/download-model.js || true",
-    "test": "node test-basic.js && node test-versioning.js && node test-agent-simulation.js && node test-scope.js && node test-sqlite-index.js && node test-sqlite-integration.js",
+    "test": "node tests/test-basic.js && node tests/test-versioning.js && node tests/test-temporal-behavior.js && node tests/test-series-supersession.js && node tests/test-markdown-trail.js && node tests/test-agent-simulation.js && node tests/test-scope.js && node tests/test-sqlite-index.js && node tests/test-sqlite-integration.js",
     "test:services": "node --test services/dep-graph-builder/test.js",
     "test:coverage": "c8 --reporter=text --reporter=lcov npm test",
     "bench": "node bench/agent-memory/run-all.js",
@@ -42,17 +42,23 @@
     "bench:longmemeval": "node bench/longmemeval/run.js"
   },
   "keywords": [
-    "ai-memory",
+    "agent-platform",
+    "ai-agent",
+    "agent-runtime",
+    "agent-observability",
+    "control-plane",
+    "bitemporal",
+    "audit-trail",
+    "provenance",
     "agent-memory",
+    "ai-memory",
     "llm-memory",
-    "memory-engine",
     "memory-layer",
     "versioned-memory",
     "temporal-memory",
     "semantic-memory",
     "long-term-memory",
     "knowledge-graph",
-    "ai-agent",
     "autonomous-agent",
     "mcp",
     "mcp-server",
@@ -75,7 +81,7 @@
   "homepage": "https://github.com/LabsKrishna/kalairos#readme",
   "type": "commonjs",
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "funding": {
     "type": "github",

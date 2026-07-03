@@ -1,7 +1,7 @@
 {
   "suite": "Memory Evaluation Benchmarks",
-  "generatedAt": "2026-04-24T01:03:25.626Z",
-  "totalMs": 4068,
+  "generatedAt": "2026-07-02T23:32:53.927Z",
+  "totalMs": 127,
   "passed": 15,
   "failed": 0,
   "total": 15,
@@ -37,7 +37,7 @@
     {
       "name": "recall@5 for finance queries >= 0.50",
       "pass": true,
-      "ms": 477,
+      "ms": 19,
       "measured": 0.75,
       "threshold": 0.5,
       "comparator": ">=",
@@ -46,7 +46,7 @@
     {
       "name": "recall@5 for engineering queries >= 0.50",
       "pass": true,
-      "ms": 36,
+      "ms": 1,
       "measured": 0.5,
       "threshold": 0.5,
       "comparator": ">=",
@@ -55,7 +55,7 @@
     {
       "name": "precision@3 for health queries >= 0.33",
       "pass": true,
-      "ms": 16,
+      "ms": 0,
       "measured": 1,
       "threshold": 0.33,
       "comparator": ">=",
@@ -64,7 +64,7 @@
     {
       "name": "MRR for targeted finance query >= 0.50",
       "pass": true,
-      "ms": 11,
+      "ms": 1,
       "measured": 1,
       "threshold": 0.5,
       "comparator": ">=",
@@ -73,7 +73,7 @@
     {
       "name": "noise separation: finance query ranks finance above noise",
       "pass": true,
-      "ms": 11,
+      "ms": 0,
       "measured": 3,
       "threshold": 2,
       "comparator": ">=",
@@ -82,52 +82,52 @@
     {
       "name": "asOf returns correct historical version (stock price 30 days ago)",
       "pass": true,
-      "ms": 258
+      "ms": 18
     },
     {
       "name": "asOf returns correct version (stock price 10 days ago)",
       "pass": true,
-      "ms": 20
+      "ms": 1
     },
     {
       "name": "current query returns latest version",
       "pass": true,
-      "ms": 15
+      "ms": 0
     },
     {
       "name": "version history tracks all temporal changes",
       "pass": true,
-      "ms": 1
+      "ms": 0
     },
     {
-      "name": "contradiction detection flags value changes",
+      "name": "metric value changes supersede without contradiction",
       "pass": true,
       "ms": 0
     },
     {
       "name": "token budget returns tokenUsage metadata",
       "pass": true,
-      "ms": 93
+      "ms": 14
     },
     {
       "name": "small token budget returns fewer results than large",
       "pass": true,
-      "ms": 14
+      "ms": 4
     },
     {
       "name": "token budget preserves score ordering",
       "pass": true,
-      "ms": 7
+      "ms": 1
     },
     {
       "name": "cross-domain: ML query ranks ML fact first",
       "pass": true,
-      "ms": 140
+      "ms": 22
     },
     {
       "name": "cross-domain: contract query ranks contract fact first",
       "pass": true,
-      "ms": 3
+      "ms": 1
     }
   ]
 }

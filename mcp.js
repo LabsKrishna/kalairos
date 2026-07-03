@@ -74,16 +74,17 @@ server.tool(
   "Store a memory. If similar content already exists, it is updated in-place (version history preserved). Returns the stable entity ID.",
   {
     text:           z.string().describe("The memory content to store (max 5000 chars)"),
-    type:           z.string().optional().describe("Entity type (default: 'text'). Use 'fact', 'metric', etc. for typed recall"),
+    type:           z.string().optional().describe("Entity type (default: 'text'). Use 'metric' or 'series' for time-varying values: a later effectiveAt supersedes the prior reading as a new valid interval instead of flagging a contradiction"),
     tags:           z.array(z.string()).optional().describe("Filterable tags"),
     metadata:       z.object({}).passthrough().optional().describe("Arbitrary metadata object"),
     importance:     z.number().min(0).max(1).optional().describe("Importance score (0-1). Higher = prioritized in tight token budgets. Auto-derived if not set"),
     memoryType:     z.enum(["short-term", "long-term", "working"]).optional().describe("Memory durability class (default: 'long-term')"),
     workspaceId:    z.string().optional().describe("Workspace/tenant isolation key (default: 'default')"),
+    effectiveAt:    z.union([z.number(), z.string()]).optional().describe("Event time this value became true (Unix ms or ISO-8601 string). Defaults to ingest time. For metric/series types, a strictly later effectiveAt retires the previous value into a closed valid interval — both readings stay queryable via recall(asOf)"),
   },
-  async ({ text, type, tags, metadata, importance, memoryType, workspaceId }) => {
+  async ({ text, type, tags, metadata, importance, memoryType, workspaceId, effectiveAt }) => {
     try {
-      const id = await dbx.remember(text, { type, tags, metadata, importance, memoryType, workspaceId });
+      const id = await dbx.remember(text, { type, tags, metadata, importance, memoryType, workspaceId, effectiveAt });
       return ok({ id });
     } catch (err) { return fail(err); }
   },

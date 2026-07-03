@@ -3,7 +3,7 @@
 "use strict";
 
 const assert = require("assert/strict");
-const lib    = require("./index");
+const lib    = require("../index");
 
 // ─── Minimal test runner ──────────────────────────────────────────────────────
 let passed = 0, failed = 0;
@@ -724,7 +724,7 @@ const INIT_OPTS = {
   console.log("\n── multi-signal trust (trust.js) ────────────────────────────────");
 
   // Unit tests against trust.js directly — pure function, no init needed
-  const { computeTrustSignals } = require("./trust");
+  const { computeTrustSignals } = require("../trust");
 
   await test("base = stored trustScore when present", async () => {
     const e = { trustScore: 0.8, updatedAt: Date.now(), versions: [] };

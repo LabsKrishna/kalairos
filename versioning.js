@@ -136,15 +136,26 @@ function detectContradiction(type, addedTerms, removedTerms, semanticShift) {
   return classifyContradiction(type, addedTerms, removedTerms, semanticShift) > 0;
 }
 
-// Main — builds a full intelligent delta between two versions
-function buildDelta(oldText, oldVector, newText, newVector) {
+// Main — builds a full intelligent delta between two versions.
+//
+// opts.seriesSupersession — set by the ingest path for metric/series entities
+// when the new value becomes effective strictly later than the prior one. A
+// forward-in-time value change is a NEW valid interval, not a contradiction:
+// "Apple $200 on Jun-22" and "Apple $190 on Jun-23" are BOTH true. The old
+// reading is retired, not proven wrong, so no contradiction signal (and thus no
+// trust penalty downstream) is recorded. Negation/value flips at the SAME or an
+// EARLIER effective time are genuine conflicts and the caller leaves this false.
+function buildDelta(oldText, oldVector, newText, newVector, opts = {}) {
+  const { seriesSupersession = false } = opts;
   const similarity    = cosine(oldVector, newVector);
   const semanticShift = Number((1 - similarity).toFixed(4));
 
   const { added, removed } = diffTerms(oldText, newText);
   const type                  = detectDeltaType(semanticShift, added, removed);
   const summary               = buildSummary(type, added, removed, semanticShift);
-  const contradictionSeverity = classifyContradiction(type, added, removed, semanticShift);
+  const contradictionSeverity = seriesSupersession
+    ? 0
+    : classifyContradiction(type, added, removed, semanticShift);
 
   return {
     type,
@@ -154,6 +165,7 @@ function buildDelta(oldText, oldVector, newText, newVector) {
     summary,
     contradicts:            contradictionSeverity > 0,
     contradictionSeverity:  +contradictionSeverity.toFixed(2),
+    supersedes:             seriesSupersession === true,
   };
 }
 

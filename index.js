@@ -11,6 +11,21 @@ const { MemoryScope, AgentMemory } = require("./agent");
 const { Err, emitError, resetSignals } = require("./errors");
 const { AuthStore } = require("./auth");
 const { computeTrustSignals } = require("./trust");
+const { renderExport, parseMarkdownFacts } = require("./markdown");
+const {
+  parseNLFilters:    _parseNLFilters,
+  applyFilter:       _applyFilter,
+  computeImportance: _computeImportance,
+} = require("./filters");
+// Read-side observability projection + checkpoint filtering. Pure helpers;
+// the stateful trail()/checkpoint() orchestration below injects the store
+// lookup and timestamp normalizer they need.
+const {
+  collectTrailEvents:       _collectTrailEvents,
+  matchesWho:               _matchesWho,
+  normalizeCheckpointFilter: _normalizeCheckpointFilter,
+  applyCheckpointFilter:    _applyCheckpointFilter,
+} = require("./trail");
 // Entity-shape normalization lives in store/entity-normalizer.js so the SQLite
 // rebuild path (KAL-104+) shares the same legacy-data defaulting and version
 // backfill as this in-memory hot-cache. Aliased to underscore-prefixed names
@@ -250,24 +265,6 @@ function _buildVersionRecord({
   };
 }
 
-// Snapshot an entity version into a trail-event projection.
-function _versionToTrailEvent(entity, v) {
-  return {
-    entityId:          entity.id,
-    versionId:         v.versionId,
-    action:            v.action,
-    who:               v.who || null,
-    why:               v.why ?? null,
-    effectiveAt:       v.effectiveAt ?? v.timestamp,
-    ingestAt:          v.ingestAt    ?? v.timestamp,
-    previousVersionId: v.previousVersionId || null,
-    source:            v.source || entity.source || { type: "user" },
-    contentChanged:    true,
-    deltaSummary:      v.delta?.summary || null,
-    classification:    v.classification || entity.classification || "internal",
-  };
-}
-
 // ─── Shared Entity Serialization ─────────────────────────────────────────────
 // Single source of truth for entity → DTO conversion. Fields are already
 // normalized at write-time, so no re-normalization needed on read.
@@ -465,6 +462,22 @@ function _persistAll() {
       console.error(`[kalairos] SQLite truncate+replay failed: ${err.message}`);
     }
   }
+}
+
+// Run a batch of ingests as a single I/O transaction: suppress per-item
+// persistence via the _skipIO counter, always restore it (even on throw),
+// then flush once with _persistAll(). On error, the counter is restored but
+// the flush is skipped — matching the hand-rolled try/finally this replaces.
+async function _withBatchedIO(fn) {
+  _skipIO++;
+  let result;
+  try {
+    result = await fn();
+  } finally {
+    _skipIO--;
+  }
+  _persistAll();
+  return result;
 }
 
 function _appendEntity(entity) {
@@ -745,7 +758,19 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
         return mergeTarget.id;
       }
 
-      const delta = buildDelta(mergeTarget.text, mergeTarget.vector, safeText, vector);
+      // Series supersession: for metric/series entities, a value that becomes
+      // effective strictly later than the prior reading opens a NEW valid
+      // interval rather than contradicting it. Apple $200 on Jun-22 and $190 on
+      // Jun-23 are both true — the new reading retires the old one's interval.
+      // A same- or earlier-time value change is still a genuine conflict and
+      // stays flagged (the "was it 210 on Jun-23?" case). Opt-in by type so the
+      // poisoning defense on text/fact entities is untouched.
+      const newEffectiveAt     = effectiveAtMs ?? ts;
+      const priorEffectiveAt   = latest?.effectiveAt ?? latest?.timestamp ?? 0;
+      const isSeriesType       = type === "metric" || type === "series";
+      const seriesSupersession = isSeriesType && newEffectiveAt > priorEffectiveAt;
+
+      const delta = buildDelta(mergeTarget.text, mergeTarget.vector, safeText, vector, { seriesSupersession });
       if (isConsolidation) delta.type = "consolidation";
 
       // Action selection: correction → corrected, anything else → superseded.
@@ -756,7 +781,6 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
 
       // Close validTo on the prior latest version — its valid interval ends
       // when this new one becomes effective.
-      const newEffectiveAt = effectiveAtMs ?? ts;
       if (latest) latest.validTo = newEffectiveAt;
 
       const versionRecord = _buildVersionRecord({
@@ -934,18 +958,14 @@ async function ingestBatch(items, { allowedWorkspaces } = {}) {
     throw emitError(Err.validation("items must be a non-empty array"));
   }
 
-  _skipIO++;
-  const ids = [];
-  try {
+  return _withBatchedIO(async () => {
+    const ids = [];
     for (const item of items) {
       const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore } = item || {};
       ids.push(await ingest(text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, allowedWorkspaces }));
     }
-  } finally {
-    _skipIO--;
-  }
-  _persistAll(); // single write for the entire batch
-  return ids;
+    return ids;
+  });
 }
 
 // ─── Fact Extraction + Ingest ────────────────────────────────────────────────
@@ -969,20 +989,17 @@ async function extractFacts(text, opts = {}) {
   if (!facts.length) return { facts: [], ids: [] };
 
   // Ingest each fact as its own entity, batched for single persist
-  _skipIO++;
-  const ids = [];
-  try {
+  const ids = await _withBatchedIO(async () => {
+    const out = [];
     for (const fact of facts) {
-      ids.push(await ingest(fact, {
+      out.push(await ingest(fact, {
         ...opts,
         metadata: { ...(opts.metadata || {}), extractedFrom: safeText.slice(0, 200) },
         allowedWorkspaces: opts.allowedWorkspaces,
       }));
     }
-  } finally {
-    _skipIO--;
-  }
-  _persistAll();
+    return out;
+  });
 
   console.log(`[kalairos] Extracted ${facts.length} facts from raw text`);
   return { facts, ids };
@@ -1076,78 +1093,9 @@ async function ingestFile(filePath, { tags = [], metadata: extra = {} } = {}) {
   });
 }
 
-// ─── NL Filter Extraction ─────────────────────────────────────────────────────
-
-const _TIME_RULES = [
-  { re: /\blast\s+hour\b/i,            ms: () => 3_600_000 },
-  { re: /\blast\s+(\d+)\s+hours?\b/i,  ms: m => +m[1] * 3_600_000 },
-  { re: /\btoday\b/i,                  ms: () => 86_400_000 },
-  { re: /\byesterday\b/i,              ms: () => 2 * 86_400_000 },
-  { re: /\bthis\s+week\b/i,            ms: () => 7 * 86_400_000 },
-  { re: /\blast\s+(\d+)\s+days?\b/i,   ms: m => +m[1] * 86_400_000 },
-  { re: /\blast\s+week\b/i,            ms: () => 7 * 86_400_000 },
-  { re: /\bthis\s+month\b/i,           ms: () => 30 * 86_400_000 },
-  { re: /\blast\s+month\b/i,           ms: () => 30 * 86_400_000 },
-  { re: /\blast\s+(\d+)\s+weeks?\b/i,  ms: m => +m[1] * 7 * 86_400_000 },
-  { re: /\blast\s+(\d+)\s+months?\b/i, ms: m => +m[1] * 30 * 86_400_000 },
-  { re: /\brecent(ly)?\b/i,            ms: () => 7 * 86_400_000 },
-];
-
-const _TYPE_RULES = [
-  { re: /\bimages?\b|\bphotos?\b/i,       type: "image" },
-  { re: /\baudios?\b|\brecordings?\b/i,   type: "audio" },
-  { re: /\bvideos?\b|\bclips?\b/i,        type: "video" },
-  { re: /\btime.?series\b|\bmetrics?\b/i, type: "timeseries" },
-  { re: /\bdocuments?\b|\bnotes?\b/i,     type: "document" },
-];
-
-function _parseNLFilters(text) {
-  const filter = {}, now = Date.now();
-  for (const r of _TIME_RULES) {
-    const m = text.match(r.re);
-    if (m) { filter.since = now - r.ms(m); break; }
-  }
-  for (const r of _TYPE_RULES) {
-    if (r.re.test(text)) { filter.type = r.type; break; }
-  }
-  return filter;
-}
-
-// ─── Filter ───────────────────────────────────────────────────────────────────
-
-function _applyFilter(entities, { type, since, until, tags, memoryType, workspaceId } = {}) {
-  return entities.filter(e => {
-    if (type        && e.type      !== type)        return false;
-    if (since       && e.updatedAt <  since)        return false;
-    if (until       && e.updatedAt >  until)        return false;
-    if (memoryType  && (e.memoryType || "long-term") !== memoryType) return false;
-    if (workspaceId && (e.workspaceId || "default")  !== workspaceId) return false;
-    if (tags  && tags.length) {
-      if (!tags.some(t => (e.tags || []).includes(t))) return false;
-    }
-    return true;
-  });
-}
-
-// ─── Importance Heuristic ────────────────────────────────────────────────────
-// When no explicit importance is set and no LLM enrichment exists, derive a
-// heuristic score from structural signals so that importance scoring always
-// has a meaningful signal. Frequently updated, well-connected, and contradicted
-// entities are considered more important.
-
-function _computeImportance(entity) {
-  // 1. Explicit importance (set via ingest { importance } or agent.remember)
-  if (entity.importance != null && Number.isFinite(entity.importance)) return entity.importance;
-
-  // 2. LLM-derived importance
-  if (entity.metadata?.llm?.importance != null) return entity.metadata.llm.importance;
-
-  // 3. Heuristic: version count (0.4) + link count (0.3) + contradiction (0.3)
-  const versionSignal = Math.min((entity.versions?.length || 1) - 1, 10) / 10;
-  const linkSignal    = Math.min(entity.links?.size || 0, 10) / 10;
-  const hasContradiction = (entity.versions || []).some(v => v.delta?.contradicts) ? 1 : 0;
-  return Math.min(1, versionSignal * 0.4 + linkSignal * 0.3 + hasContradiction * 0.3);
-}
+// NL filter extraction, structured filtering, and the importance heuristic
+// live in filters.js (pure helpers). Imported above as _parseNLFilters /
+// _applyFilter / _computeImportance.
 
 // ─── Parallel Hybrid Query ────────────────────────────────────────────────────
 
@@ -1930,45 +1878,7 @@ async function exportMarkdown({ filter, includeHistory = false, allowedWorkspace
   if (allowedWorkspaces) entities = entities.filter(e => _wsAllowed(e, allowedWorkspaces));
   if (filter && Object.keys(filter).length) entities = _applyFilter(entities, filter);
   entities.sort((a, b) => b.updatedAt - a.updatedAt);
-
-  const lines = ["# Kalairos — Memory Export", ""];
-  lines.push(`> Exported ${entities.length} entities at ${new Date().toISOString()}`, "");
-
-  for (const e of entities) {
-    lines.push(`## [${e.id}] ${(e.type || "text").toUpperCase()}`);
-    lines.push("");
-    lines.push(e.text);
-    lines.push("");
-    lines.push(`- **ID:** ${e.id}`);
-    lines.push(`- **Type:** ${e.type || "text"}`);
-    lines.push(`- **Memory type:** ${e.memoryType || "long-term"}`);
-    lines.push(`- **Workspace:** ${e.workspaceId || "default"}`);
-    lines.push(`- **Classification:** ${e.classification || "internal"}`);
-    lines.push(`- **Tags:** ${(e.tags || []).join(", ") || "none"}`);
-    lines.push(`- **Source:** ${e.source?.type || "user"}${e.source?.actor ? " (" + e.source.actor + ")" : ""}`);
-    lines.push(`- **Created:** ${new Date(e.createdAt).toISOString()}`);
-    lines.push(`- **Updated:** ${new Date(e.updatedAt).toISOString()}`);
-    lines.push(`- **Versions:** ${e.versions?.length || 1}`);
-
-    if (includeHistory && e.versions?.length > 1) {
-      lines.push("");
-      lines.push("### Version History");
-      lines.push("");
-      const versionsOldest = [...e.versions].reverse();
-      for (let i = 0; i < versionsOldest.length; i++) {
-        const v = versionsOldest[i];
-        const delta = v.delta ? ` [${v.delta.type}] ${v.delta.summary}` : " (initial)";
-        lines.push(`${i + 1}. **${new Date(v.timestamp).toISOString()}**${delta}`);
-        if (v.text !== e.text) lines.push(`   > ${v.text.slice(0, 120)}`);
-      }
-    }
-
-    lines.push("");
-    lines.push("---");
-    lines.push("");
-  }
-
-  return lines.join("\n");
+  return renderExport(entities, { includeHistory });
 }
 
 /**
@@ -1984,70 +1894,23 @@ async function exportMarkdown({ filter, includeHistory = false, allowedWorkspace
  */
 async function importMarkdown(mdText, defaults = {}) {
   _assertInit();
-  const text = String(mdText || "");
-  if (!text.trim()) return { imported: 0, ids: [] };
+  const { mode, facts } = parseMarkdownFacts(mdText);
+  if (mode === "empty") return { imported: 0, ids: [] };
 
-  const sections = [];
   const allowedWorkspaces = defaults.allowedWorkspaces;
-
-  // Try structured format first: split on ## headers
-  const headerRe = /^##\s+\[(\d+)\]\s+(.+)/;
-  const lines = text.split("\n");
-  let currentSection = null;
-
-  for (const line of lines) {
-    const headerMatch = line.match(headerRe);
-    if (headerMatch) {
-      if (currentSection) sections.push(currentSection);
-      currentSection = { type: headerMatch[2].trim().toLowerCase(), lines: [] };
-      continue;
+  const ids = await _withBatchedIO(async () => {
+    const out = [];
+    for (const fact of facts) {
+      // Structured sections carry their own type; bullet facts inherit it
+      // from the caller's defaults.
+      const opts = fact.type
+        ? { ...defaults, type: fact.type, allowedWorkspaces }
+        : { ...defaults, allowedWorkspaces };
+      out.push(await ingest(fact.text, opts));
     }
-    if (currentSection) {
-      // Skip metadata lines (start with "- **")
-      if (/^- \*\*/.test(line.trim()) || /^###/.test(line.trim()) || /^---$/.test(line.trim()) || /^>/.test(line.trim())) continue;
-      const trimmed = line.trim();
-      if (trimmed) currentSection.lines.push(trimmed);
-    }
-  }
-  if (currentSection) sections.push(currentSection);
-
-  // If we found structured sections, ingest each
-  if (sections.length > 0) {
-    _skipIO++;
-    const ids = [];
-    try {
-      for (const sec of sections) {
-        const factText = sec.lines.join(" ").trim();
-        if (!factText) continue;
-        const type = sec.type === "text" ? "text" : sec.type;
-        ids.push(await ingest(factText, { ...defaults, type, allowedWorkspaces }));
-      }
-    } finally {
-      _skipIO--;
-    }
-    _persistAll();
-    console.log(`[kalairos] Imported ${ids.length} entities from structured markdown`);
-    return { imported: ids.length, ids };
-  }
-
-  // Fallback: treat bullet points or plain lines as individual facts
-  const bullets = lines
-    .map(l => l.replace(/^[\s]*[-*]\s+/, "").trim())
-    .filter(l => l.length > 0 && !l.startsWith("#") && !l.startsWith(">"));
-
-  if (!bullets.length) return { imported: 0, ids: [] };
-
-  _skipIO++;
-  const ids = [];
-  try {
-    for (const fact of bullets) {
-      ids.push(await ingest(fact, { ...defaults, allowedWorkspaces }));
-    }
-  } finally {
-    _skipIO--;
-  }
-  _persistAll();
-  console.log(`[kalairos] Imported ${ids.length} entities from markdown bullets`);
+    return out;
+  });
+  console.log(`[kalairos] Imported ${ids.length} entities from ${mode} markdown`);
   return { imported: ids.length, ids };
 }
 
@@ -2352,28 +2215,6 @@ async function getStartupSummary({
 // are NOT trail events. Only explicit annotate({ trustScore }) calls and
 // contradiction-flagging produce trail entries.
 
-function _matchesWho(eventWho, filterWho) {
-  if (!filterWho) return true;
-  if (!eventWho) return false;
-  if (filterWho.agent && eventWho.agent !== filterWho.agent) return false;
-  if (filterWho.user  && eventWho.user  !== filterWho.user)  return false;
-  return true;
-}
-
-function _collectTrailEvents(entity, allowedWorkspaces) {
-  if (allowedWorkspaces && !_wsAllowed(entity, allowedWorkspaces)) return [];
-  const out = [];
-  // Content versions → events (oldest-first within the entity)
-  const versionsOldestFirst = [...(entity.versions || [])].reverse();
-  for (const v of versionsOldestFirst) {
-    out.push(_versionToTrailEvent(entity, v));
-  }
-  // Metadata-only trail events (oldest-first)
-  const trailOldestFirst = [...(entity.trailEvents || [])].reverse();
-  for (const ev of trailOldestFirst) out.push({ ...ev });
-  return out;
-}
-
 /**
  * Read-only projection of every memory mutation across the store. Sorted by
  * ingestAt ascending; stable across restarts.
@@ -2422,7 +2263,8 @@ async function trail(opts = {}) {
   let events = [];
   for (const e of entities) {
     if (workspace && (e.workspaceId || "default") !== workspace) continue;
-    events.push(..._collectTrailEvents(e, allowedWorkspaces));
+    if (allowedWorkspaces && !_wsAllowed(e, allowedWorkspaces)) continue;
+    events.push(..._collectTrailEvents(e));
   }
 
   if (sinceMs   != null) events = events.filter(ev => ev.ingestAt >= sinceMs);
@@ -2438,7 +2280,7 @@ async function trail(opts = {}) {
       const ids = new Set(cp.eventIds || []);
       events = events.filter(ev => ids.has(ev.versionId));
     } else {
-      events = _applyCheckpointFilter(events, cp.filter);
+      events = _applyCheckpointFilter(events, cp.filter, id => store.get(id));
     }
   }
 
@@ -2484,63 +2326,6 @@ function _persistCheckpoint(cp) {
   fs.appendFileSync(file, JSON.stringify(cp) + "\n");
 }
 
-function _normalizeCheckpointFilter(opts) {
-  const filter = {};
-  if (opts.during) {
-    if (!Array.isArray(opts.during) || opts.during.length !== 2) {
-      throw emitError(Err.validation("checkpoint.during must be a [from, to] pair"));
-    }
-    filter.during = [
-      _normalizeTimestampInput(opts.during[0], "checkpoint.during[0]"),
-      _normalizeTimestampInput(opts.during[1], "checkpoint.during[1]"),
-    ];
-  }
-  if (opts.entity != null) {
-    filter.entity = Array.isArray(opts.entity)
-      ? opts.entity.map(x => Number(x) || x)
-      : [Number(opts.entity) || opts.entity];
-  }
-  if (Array.isArray(opts.tags) && opts.tags.length) {
-    filter.tags = opts.tags.map(String);
-  }
-  if (opts.workspace) filter.workspace = String(opts.workspace);
-  if (opts.action) {
-    filter.action = Array.isArray(opts.action) ? opts.action.map(String) : [String(opts.action)];
-  }
-  return filter;
-}
-
-function _applyCheckpointFilter(events, filter) {
-  let out = events;
-  if (filter.during) {
-    const [from, to] = filter.during;
-    out = out.filter(ev => ev.ingestAt >= from && ev.ingestAt <= to);
-  }
-  if (filter.entity) {
-    const ids = new Set(filter.entity);
-    out = out.filter(ev => ids.has(ev.entityId));
-  }
-  if (filter.action) {
-    const actions = new Set(filter.action);
-    out = out.filter(ev => actions.has(ev.action));
-  }
-  if (filter.tags) {
-    const wanted = new Set(filter.tags);
-    out = out.filter(ev => {
-      const ent = store.get(ev.entityId);
-      if (!ent) return false;
-      return (ent.tags || []).some(t => wanted.has(t));
-    });
-  }
-  if (filter.workspace) {
-    out = out.filter(ev => {
-      const ent = store.get(ev.entityId);
-      return ent && (ent.workspaceId || "default") === filter.workspace;
-    });
-  }
-  return out;
-}
-
 /**
  * Create a named checkpoint over the trail. Frozen-by-default — the matching
  * event-id set is captured at creation time, so future backdated events do
@@ -2564,7 +2349,7 @@ async function checkpoint(name, opts = {}) {
       }
     }
 
-    const filter = _normalizeCheckpointFilter(opts);
+    const filter = _normalizeCheckpointFilter(opts, _normalizeTimestampInput);
     const live   = !!opts.live;
     const why    = (typeof opts.why === "string" && opts.why.trim()) ? opts.why.trim().slice(0, 500) : null;
 
@@ -2573,7 +2358,7 @@ async function checkpoint(name, opts = {}) {
     if (!live) {
       const all = [];
       for (const e of store.values()) all.push(..._collectTrailEvents(e));
-      const matched = _applyCheckpointFilter(all, filter);
+      const matched = _applyCheckpointFilter(all, filter, id => store.get(id));
       eventIds = matched.map(ev => ev.versionId).filter(Boolean);
     }
 

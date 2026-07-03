@@ -14,7 +14,7 @@ const {
   decideOnBoot,
   replayForward,
   SCHEMA_VERSION,
-} = require("./store/sqlite-index");
+} = require("../store/sqlite-index");
 
 // ── Minimal async test runner (mirrors test-basic.js) ───────────────────────
 let passed = 0, failed = 0;

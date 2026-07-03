@@ -6,6 +6,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Series supersession** for `metric`/`series` entities: a value with a
+  strictly later `effectiveAt` retires the prior reading into a closed valid
+  interval instead of flagging a contradiction (no trust penalty for
+  legitimate drift). Same- or earlier-time value flips still contradict.
+  `effectiveAt` is now accepted by the MCP `kalairos_remember` tool.
+
+### Changed
+
+- **Node.js >= 20 required** (`engines` was `>=18`). Node 18 is EOL
+  (April 2025) and better-sqlite3 v12 — the hybrid-index engine since
+  1.7.0 — supports Node 20+ only, so 1.7.0 already failed to install on
+  Node 18 wherever a source build wasn't possible (e.g. Windows). CI now
+  tests Node 20/22/24.
+
 ## [1.7.0] — 2026-05-11
 
 Headline: **hybrid storage v1** — a SQLite index derived from the canonical

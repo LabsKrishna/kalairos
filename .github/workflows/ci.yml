@@ -16,7 +16,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node-version: [18, 20, 22]
+        # Node 18 dropped (EOL Apr 2025): better-sqlite3 v12 — the hybrid-index
+        # engine — supports 20+ only and ships no 18 prebuilds, so 18 could
+        # only ever install via fragile source builds. engines: >=20 matches.
+        node-version: [20, 22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

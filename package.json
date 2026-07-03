@@ -81,7 +81,7 @@
   "homepage": "https://github.com/LabsKrishna/kalairos#readme",
   "type": "commonjs",
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "funding": {
     "type": "github",

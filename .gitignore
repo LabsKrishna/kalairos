@@ -10,13 +10,12 @@ data.dbx.tmp
 CLAUDE.md
 STATE.md
 
-# Personal-agent example — runtime state (per-machine, not shipped)
-examples/personal-agent/agent-data.kalairos*
-examples/personal-agent/users.jsonl
-examples/personal-agent/.env
-
 # Standalone apps developed in-place — separate deployables with their own
 # repos/histories, not library examples. Kept out of the npm package repo.
+# personal-agent (vanilla, DEPRECATED 2026-07-14): lives deployed in the
+#   kalairos.com repo's agent/personal-agent branch; all new work happens in
+#   LabsKrishna/kalairos-personal-agent (Next.js).
+examples/personal-agent/
 examples/personal-agent-next/
 examples/agent-platform/
 

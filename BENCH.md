@@ -97,7 +97,7 @@ The platform half of `CLAUDE.md §17`. Memory benchmarks ask "did we recall the 
 
 ### Method
 
-- Runner: `python/bench/observability.py`. No real LLM, no network — fully deterministic.
+- Runner: `python/bench/observability.py` in the [kalairos_agent_platform](https://github.com/LabsKrishna/kalairos_agent_platform) repo (platform code moved there 2026-07-14). No real LLM, no network — fully deterministic.
 - Reference workload: an `Executor` walking a fixed `WorkflowGraph` (the same shape as the Phase 3 PR-risk analyzer — fetch → assess → route → handoff to the Node dep-graph service → summarize) plus a hand-driven run whose tool raises, so the failure path is measured too.
 - The cross-runtime handoff is answered by an in-process auto-reply thread that mimics a Node service POSTing a `handoff_result` to `LedgerServer` — so the handoff and its trace are exercised for real, not stubbed past.
 - **Completeness is not computed circularly.** The *expected* action set is derived from the graph topology + the declared execution path (the workload's definition); the *present* set is derived from what `control_plane.events_for_run` actually surfaces. Completeness = `|present ∩ expected| / |expected|`.
@@ -110,7 +110,7 @@ python bench/observability.py          # print the table
 python bench/observability.py --check   # assert floors, exit 1 on a miss
 ```
 
-Output is printed as a table and persisted to `python/bench/observability-results.json`.
+Output is printed as a table and persisted to `python/bench/observability-results.json` (platform repo).
 
 ### Current measurements & floors
 

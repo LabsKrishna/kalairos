@@ -1,7 +1,7 @@
 {
   "name": "kalairos",
   "version": "1.7.0",
-  "description": "Agent platform with bitemporal memory, live observability, and audit-grade traceability — for AI that needs to act at the right moment",
+  "description": "Agent platform with bitemporal memory, live observability, and audit-grade traceability \u2014 for AI that needs to act at the right moment",
   "main": "./index.js",
   "exports": {
     ".": {
@@ -33,7 +33,6 @@
     "start": "node server.js",
     "postinstall": "node scripts/download-model.js || true",
     "test": "node tests/test-basic.js && node tests/test-versioning.js && node tests/test-temporal-behavior.js && node tests/test-series-supersession.js && node tests/test-markdown-trail.js && node tests/test-agent-simulation.js && node tests/test-scope.js && node tests/test-sqlite-index.js && node tests/test-sqlite-integration.js",
-    "test:services": "node --test services/dep-graph-builder/test.js",
     "test:coverage": "c8 --reporter=text --reporter=lcov npm test",
     "bench": "node bench/agent-memory/run-all.js",
     "bench:real": "node bench/agent-memory/bench-eval-real.js",

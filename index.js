@@ -88,6 +88,52 @@ let store       = null;        // StoreAdapter (FileStore or PgStore)
 let _pool       = null;        // persistent WorkerPool
 let _initialized = false;
 let _skipIO        = 0;    // ref-counted; > 0 suppresses per-item I/O during batch ops
+
+// ─── Built-in Bag-of-Words Embedder (fallback) ────────────────────────────────
+
+const BOW_DIM = 128;
+
+function _bowEmbed(text) {
+  const vec = new Float64Array(BOW_DIM);
+  const tokens = String(text).toLowerCase().match(/[a-z0-9]{2,}/g) || [];
+  for (const tok of tokens) {
+    let h = 2166136261;
+    for (let i = 0; i < tok.length; i++) {
+      h ^= tok.charCodeAt(i);
+      h = (h * 16777619) >>> 0;
+    }
+    vec[h % BOW_DIM] += 1;
+  }
+  let norm = 0;
+  for (let i = 0; i < BOW_DIM; i++) norm += vec[i] * vec[i];
+  norm = Math.sqrt(norm) || 1;
+  const out = new Array(BOW_DIM);
+  for (let i = 0; i < BOW_DIM; i++) out[i] = vec[i] / norm;
+  return out;
+}
+
+// Try to load neural embedder; fall back to bag-of-words if unavailable.
+// Returns { embedFn, embeddingDim, loaded } where loaded is 'neural' or 'bow'.
+async function _tryLoadNeuralEmbedder() {
+  try {
+    const neuralEmbedder = require("./embedder");
+    const loaded = await neuralEmbedder.load();
+    if (loaded) {
+      return {
+        embedFn: (text) => neuralEmbedder.embed(text),
+        embeddingDim: neuralEmbedder.DIM,
+        loaded: "neural",
+      };
+    }
+  } catch (err) {
+    // embedder.js or onnxruntime-node not available — BoW fallback
+  }
+  return {
+    embedFn: (text) => _bowEmbed(text),
+    embeddingDim: BOW_DIM,
+    loaded: "bow",
+  };
+}
 let _pendingWrites = [];   // { fn, resolve, reject } — drain-based write queue
 let _draining      = false;// true while _drainWrites() is scheduled or running
 let _sqliteIdx     = null; // SqliteIndex instance when KALAIROS_INDEX_SQLITE=1; else null
@@ -334,6 +380,18 @@ async function init(overrides = {}) {
   _skipIO        = 0;      // reset batch-suppress counter
   _pendingWrites = [];     // drop any queued mutations from previous session
   _draining      = false;  // drain state reset
+
+  // Auto-detect embedder if not provided
+  if (!CFG.embedFn) {
+    const embedderResult = await _tryLoadNeuralEmbedder();
+    CFG.embedFn = embedderResult.embedFn;
+    CFG.embeddingDim = embedderResult.embeddingDim;
+    if (embedderResult.loaded === "neural") {
+      console.log("[kalairos] neural embedder loaded (768-dim)");
+    } else {
+      console.log("[kalairos] neural embedder unavailable; using built-in bag-of-words (128-dim)");
+    }
+  }
 
   // ── Choose backing store ───────────────────────────────────────────────────
   const storeType = (overrides.store || process.env.KALAIROS_STORE || "file").toLowerCase();

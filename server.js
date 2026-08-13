@@ -502,10 +502,17 @@ app.get("/auth/audit", _wrap(async (req) => {
 }));
 
 // ─── Start ────────────────────────────────────────────────────────────────────
+// init() auto-detects the embedder (neural ONNX when the model is cached in
+// ~/.kalairos, built-in bag-of-words otherwise), so POST /query works on a
+// bare `npm start` instead of failing with ERR_EMBEDDING_FAILED. Callers who
+// want a specific embedder still pass embedFn — this is only the default.
 
-lib.init().then(() => {
+lib.init({ strictEmbeddings: false }).then(() => {
   const PORT = Number(process.env.KALAIROS_PORT) || 3000;
-  const server = app.listen(PORT, () => {
+  // KALAIROS_HOST=127.0.0.1 restricts the listener to loopback — recommended
+  // when the server backs a local agent stack rather than serving remotely.
+  const HOST = process.env.KALAIROS_HOST || "0.0.0.0";
+  const server = app.listen(PORT, HOST, () => {
     console.log(`Kalairos running on http://localhost:${PORT}`);
     console.log(`Dashboard: http://localhost:${PORT}/`);
     console.log("Endpoints:");

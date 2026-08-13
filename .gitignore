@@ -16,8 +16,10 @@ STATE.md
 #   kalairos.com repo's agent/personal-agent branch; all new work happens in
 #   LabsKrishna/kalairos-personal-agent (Next.js).
 examples/personal-agent/
-examples/personal-agent-next/
 examples/agent-platform/
+# The agent platform (private LabsKrishna/kalairos_agent_platform repo, its own
+# .git) mounted in-place: kernel/ (Python) + api/ (Node) + web/ (Next.js app).
+services/
 
 # Internal planning docs — development-only, not shipped
 docs/storage-architecture-jsonl-sqlite-hybrid.md

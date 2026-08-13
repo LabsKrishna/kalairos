@@ -17,33 +17,6 @@ const z                        = require("zod");
 const path                     = require("path");
 const dbx                      = require("./index");
 
-// ─── Built-in Bag-of-Words Embedder ──────────────────────────────────────────
-// Lightweight hash-based embedder so the MCP server works zero-config.
-// Not production quality — users should supply a real embedFn for serious use.
-
-const BOW_DIM = 128;
-
-function _bowEmbed(text) {
-  const vec = new Float64Array(BOW_DIM);
-  const tokens = String(text).toLowerCase().match(/[a-z0-9]{2,}/g) || [];
-  for (const tok of tokens) {
-    // FNV-1a inspired hash → deterministic bucket
-    let h = 2166136261;
-    for (let i = 0; i < tok.length; i++) {
-      h ^= tok.charCodeAt(i);
-      h = (h * 16777619) >>> 0;
-    }
-    vec[h % BOW_DIM] += 1;
-  }
-  // L2 normalize
-  let norm = 0;
-  for (let i = 0; i < BOW_DIM; i++) norm += vec[i] * vec[i];
-  norm = Math.sqrt(norm) || 1;
-  const out = new Array(BOW_DIM);
-  for (let i = 0; i < BOW_DIM; i++) out[i] = vec[i] / norm;
-  return out;
-}
-
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function ok(data) {
@@ -325,26 +298,13 @@ server.tool(
 async function main() {
   const dataFile = process.env.KALAIROS_DATA_FILE || path.join(process.cwd(), "data.kalairos");
 
-  let embedFn      = async (text) => _bowEmbed(text);
-  let embeddingDim = BOW_DIM;
-
-  try {
-    const neuralEmbedder = require("./embedder");
-    const loaded = await neuralEmbedder.load();
-    if (loaded) {
-      embedFn      = (text) => neuralEmbedder.embed(text);
-      embeddingDim = neuralEmbedder.DIM;
-      process.stderr.write("kalairos: neural embedder loaded (768-dim)\n");
-    }
-  } catch {
-    // embedder.js or onnxruntime-node not available — BoW fallback
-  }
-
+  // No embedFn: init() auto-detects (neural ONNX when the model is cached,
+  // built-in bag-of-words otherwise) and logs that choice to stderr, which
+  // keeps stdout clean for JSON-RPC. The built-in BoW is bit-identical to the
+  // copy this file used to carry, so existing stores need no reindexing.
   await dbx.init({
     dataFile,
     strictEmbeddings: false,
-    embedFn,
-    embeddingDim,
   });
 
   const transport = new StdioServerTransport();

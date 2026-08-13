@@ -381,15 +381,20 @@ async function init(overrides = {}) {
   _pendingWrites = [];     // drop any queued mutations from previous session
   _draining      = false;  // drain state reset
 
-  // Auto-detect embedder if not provided
+  // Auto-detect embedder if not provided.
+  //
+  // Diagnostics go to stderr, never stdout: mcp.js speaks JSON-RPC 2.0 over
+  // stdout, so a stray console.log here lands mid-protocol and breaks the
+  // handshake for every stdio MCP client. stderr is the right channel for
+  // boot chatter regardless — stdout belongs to the program's output.
   if (!CFG.embedFn) {
     const embedderResult = await _tryLoadNeuralEmbedder();
     CFG.embedFn = embedderResult.embedFn;
     CFG.embeddingDim = embedderResult.embeddingDim;
     if (embedderResult.loaded === "neural") {
-      console.log("[kalairos] neural embedder loaded (768-dim)");
+      console.error("[kalairos] neural embedder loaded (768-dim)");
     } else {
-      console.log("[kalairos] neural embedder unavailable; using built-in bag-of-words (128-dim)");
+      console.error("[kalairos] neural embedder unavailable; using built-in bag-of-words (128-dim)");
     }
   }
 
@@ -473,7 +478,7 @@ async function _loadStore() {
       console.warn("[kalairos] Skipping malformed entity during load");
     }
   }
-  console.log(`[kalairos] Loaded ${store.size} entities`);
+  console.error(`[kalairos] Loaded ${store.size} entities`);
 }
 
 // Serialise entity for backing store I/O (links Set → Array).
@@ -812,7 +817,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
         mergeTarget.updatedAt = ts;
         if (Number.isFinite(trustScore)) mergeTarget.trustScore = Math.max(0, Math.min(1, trustScore));
         _persistAll();
-        console.log(`[kalairos] Reaffirmed entity ${mergeTarget.id} (no content change)`);
+        console.error(`[kalairos] Reaffirmed entity ${mergeTarget.id} (no content change)`);
         return mergeTarget.id;
       }
 
@@ -907,7 +912,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       _persistAll();
       const flag = delta.contradicts ? " ⚠ CONTRADICTS prior version" : "";
       const verb = isConsolidation ? "Consolidated into" : "Updated";
-      console.log(`[kalairos] ${verb} entity ${mergeTarget.id} → v${mergeTarget.versions.length} [${delta.type}]${flag} ${delta.summary}`);
+      console.error(`[kalairos] ${verb} entity ${mergeTarget.id} → v${mergeTarget.versions.length} [${delta.type}]${flag} ${delta.summary}`);
       return mergeTarget.id;
     }
 
@@ -961,7 +966,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     store.set(id, entity);
     _relinkEntity(entity);
     _appendEntity(entity);
-    console.log(`[kalairos] Created entity ${id} [${type}]`);
+    console.error(`[kalairos] Created entity ${id} [${type}]`);
     return id;
   });
 }
@@ -1059,7 +1064,7 @@ async function extractFacts(text, opts = {}) {
     return out;
   });
 
-  console.log(`[kalairos] Extracted ${facts.length} facts from raw text`);
+  console.error(`[kalairos] Extracted ${facts.length} facts from raw text`);
   return { facts, ids };
 }
 
@@ -1540,7 +1545,7 @@ async function remove(id, { deletedBy, allowedWorkspaces, reason, who } = {}) {
     });
 
     _persistAll();
-    console.log(`[kalairos] Soft-deleted entity ${numId}`);
+    console.error(`[kalairos] Soft-deleted entity ${numId}`);
   });
 }
 
@@ -1610,7 +1615,7 @@ async function restore(id, { reason, who, allowedWorkspaces } = {}) {
     });
 
     _persistAll();
-    console.log(`[kalairos] Restored entity ${numId}`);
+    console.error(`[kalairos] Restored entity ${numId}`);
     return _serializeEntity(e);
   });
 }
@@ -1634,7 +1639,7 @@ async function purge(id, { allowedWorkspaces } = {}) {
     _unlinkEntity(e, numId);
     store.delete(numId);
     _persistAll();
-    console.log(`[kalairos] Purged entity ${numId} (permanent)`);
+    console.error(`[kalairos] Purged entity ${numId} (permanent)`);
   });
 }
 
@@ -1725,7 +1730,7 @@ async function consolidate({ threshold, dryRun = false, type, allowedWorkspaces 
     if (!dryRun && merged.length) _persistAll();
 
     const verb = dryRun ? "Would merge" : "Merged";
-    console.log(`[kalairos] ${verb} ${merged.length} duplicate(s) across ${clusters.size} cluster(s)`);
+    console.error(`[kalairos] ${verb} ${merged.length} duplicate(s) across ${clusters.size} cluster(s)`);
     return { merged, totalMerged: merged.length };
   });
 }
@@ -1968,7 +1973,7 @@ async function importMarkdown(mdText, defaults = {}) {
     }
     return out;
   });
-  console.log(`[kalairos] Imported ${ids.length} entities from ${mode} markdown`);
+  console.error(`[kalairos] Imported ${ids.length} entities from ${mode} markdown`);
   return { imported: ids.length, ids };
 }
 
@@ -2142,7 +2147,7 @@ async function annotate(id, { trustScore, verified, notes, memoryType, classific
     }
 
     _persistAll();
-    console.log(`[kalairos] Annotated entity ${numId} (trust=${e.trustScore?.toFixed(2)}, verified=${e.metadata?.verified ?? "–"})`);
+    console.error(`[kalairos] Annotated entity ${numId} (trust=${e.trustScore?.toFixed(2)}, verified=${e.metadata?.verified ?? "–"})`);
     return _serializeEntity(e);
   });
 }
@@ -2431,7 +2436,7 @@ async function checkpoint(name, opts = {}) {
 
     _checkpoints.set(cpName, record);
     _persistCheckpoint(record);
-    console.log(`[kalairos] Created checkpoint "${cpName}" (${live ? "live" : `frozen, ${eventIds.length} events`})`);
+    console.error(`[kalairos] Created checkpoint "${cpName}" (${live ? "live" : `frozen, ${eventIds.length} events`})`);
     return { ...record };
   });
 }
@@ -2470,7 +2475,7 @@ async function shutdown() {
   if (store?.shutdown) await store.shutdown();
   if (_sqliteIdx) { _sqliteIdx.close(); _sqliteIdx = null; }
   _initialized = false;
-  console.log("[kalairos] Shutdown complete");
+  console.error("[kalairos] Shutdown complete");
 }
 
 // ─── Scoped Memory Helper ────────────────────────────────────────────────────

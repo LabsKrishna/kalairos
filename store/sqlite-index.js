@@ -656,7 +656,7 @@ function _readBootMeta(db) {
 }
 
 function _logDecision(d, quiet) {
-  if (!quiet) console.log(`[kalairos] sqlite-index: decision=${JSON.stringify(d)}`);
+  if (!quiet) console.error(`[kalairos] sqlite-index: decision=${JSON.stringify(d)}`);
   return d;
 }
 

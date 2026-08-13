@@ -1,7 +1,7 @@
 {
   "name": "kalairos",
   "version": "1.7.0",
-  "description": "Agent platform with bitemporal memory, live observability, and audit-grade traceability \u2014 for AI that needs to act at the right moment",
+  "description": "Agent platform with bitemporal memory, live observability, and audit-grade traceability — for AI that needs to act at the right moment",
   "main": "./index.js",
   "exports": {
     ".": {

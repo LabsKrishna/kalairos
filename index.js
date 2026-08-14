@@ -484,6 +484,8 @@ async function _loadStore() {
       console.warn("[kalairos] Skipping malformed entity during load");
     }
   }
+  // Runs once every row is in the store — a link's other end may load later.
+  _pruneCrossWorkspaceLinks();
   console.error(`[kalairos] Loaded ${store.size} entities`);
 }
 
@@ -692,6 +694,15 @@ async function _extractFacts(text, type) {
 
 // ─── Graph Linking ────────────────────────────────────────────────────────────
 
+// Recompute an entity's semantic edges by cosine similarity.
+//
+// Edges never cross a workspace: the graph is a per-tenant structure, and a
+// link is an assertion that two memories are about the same thing. Linking
+// across tenants leaks — `traverse()` returns the neighbour, and `linkCount`
+// counts edges the caller can never resolve — and the read-path
+// `_wsAllowed()` gates only help callers that pass `allowedWorkspaces`, which
+// is not the default. Confining at write time makes the isolation hold for
+// every caller. Sibling of the ingest()/consolidate() candidate scans.
 function _relinkEntity(entity) {
   // Remove stale back-links from other entities before clearing own links
   for (const linkedId of entity.links) {
@@ -699,13 +710,41 @@ function _relinkEntity(entity) {
   }
   entity.links.clear();
 
+  const ws = _wsOf(entity);
   for (const [otherId, other] of store) {
     if (otherId === entity.id) continue;
+    if (_wsOf(other) !== ws) continue;
     if (cosine(entity.vector, other.vector) >= CFG.linkThreshold) {
       entity.links.add(otherId);
       other.links.add(entity.id);
     }
   }
+}
+
+// One-time repair for stores written before links were workspace-confined:
+// drop any edge whose other end lives in a different workspace. Runs at load,
+// in memory only — the next write rewrites the JSONL (and replays the SQLite
+// index) without them, and a read-only deployment simply re-prunes each boot.
+// Idempotent: a store written by this version prunes nothing.
+//
+// Edges pointing at an id that isn't in the store are left alone. Their
+// workspace is unknowable, they are already inert on every read path, and
+// repairing them is a different concern than tenant isolation.
+function _pruneCrossWorkspaceLinks() {
+  let pruned = 0;
+  for (const entity of store.values()) {
+    if (!entity.links?.size) continue;
+    const ws = _wsOf(entity);
+    for (const linkedId of entity.links) {
+      const other = store.get(linkedId);
+      if (other && _wsOf(other) !== ws) {
+        entity.links.delete(linkedId);
+        pruned++;
+      }
+    }
+  }
+  if (pruned) console.error(`[kalairos] Pruned ${pruned} cross-workspace graph link(s)`);
+  return pruned;
 }
 
 // ─── Ingest ───────────────────────────────────────────────────────────────────

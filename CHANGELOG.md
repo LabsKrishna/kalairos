@@ -23,6 +23,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Candidate scans in `ingest()` and the clustering pass in `consolidate()` are
   now confined to a single workspace. Single-workspace deployments (everything
   on `default`) are unaffected.
+- **Cross-workspace graph links.** Semantic auto-linking scored every stored
+  entity, so the graph held edges spanning tenants: `traverse()` returned a
+  neighbour from another workspace, and `linkCount` counted edges the caller
+  could not resolve. The read-path `allowedWorkspaces` gates only helped
+  callers that passed them, which is not the default. Links are now confined
+  to one workspace at write time. Stores written by earlier versions are
+  repaired on load — cross-workspace edges are dropped in memory at `init()`
+  and disappear from the JSONL (and the SQLite index) on the next write; no
+  manual migration is needed. Same-workspace edges are untouched, so
+  single-workspace deployments are unaffected.
 
 ### Changed
 

@@ -129,6 +129,93 @@ const INIT_OPTS = {
     assert.ok(await lib.get(b), "tenant-b entity must survive");
   });
 
+  console.log("\n── workspace isolation on the graph path ────────────────────────");
+
+  // Thresholds pulled apart so the two texts below land in the band that only
+  // links: similar enough to clear linkThreshold, far enough apart to stay two
+  // entities instead of versioning or consolidating into one.
+  const GRAPH_OPTS = {
+    ...INIT_OPTS,
+    embedFn:                makeMockEmbedder(64),
+    linkThreshold:          0.50,
+    versionThreshold:       0.90,
+    consolidationThreshold: 0.88,
+  };
+  const LINKABLE_A = "the payroll ledger reconciles every friday morning";
+  const LINKABLE_B = "the payroll ledger reconciles every monday";
+
+  await test("same workspace still links semantically similar entities", async () => {
+    await lib.init(GRAPH_OPTS);
+    const a = await lib.ingest(LINKABLE_A, { workspaceId: "tenant-a" });
+    const b = await lib.ingest(LINKABLE_B, { workspaceId: "tenant-a" });
+    assert.notStrictEqual(a, b, "precondition: the two writes must be separate entities");
+    assert.strictEqual((await lib.get(a)).linkCount, 1, "same-workspace neighbours must still link");
+    assert.strictEqual((await lib.get(b)).linkCount, 1, "links must be bidirectional");
+    assert.strictEqual((await lib.getGraph()).edges.length, 1);
+  });
+
+  await test("links never cross a workspace boundary", async () => {
+    await lib.init(GRAPH_OPTS);
+    const a = await lib.ingest(LINKABLE_A, { workspaceId: "tenant-a" });
+    const b = await lib.ingest(LINKABLE_B, { workspaceId: "tenant-b" });
+    assert.notStrictEqual(a, b, "precondition: the two writes must be separate entities");
+    assert.strictEqual((await lib.get(a)).linkCount, 0, "linkCount must not count another tenant's entity");
+    assert.strictEqual((await lib.get(b)).linkCount, 0, "the back-link must not be written either");
+    assert.strictEqual((await lib.getGraph()).edges.length, 0, "the graph must hold no cross-workspace edge");
+  });
+
+  await test("traverse() leaks no neighbour when the caller omits allowedWorkspaces", async () => {
+    await lib.init(GRAPH_OPTS);
+    const a = await lib.ingest(LINKABLE_A, { workspaceId: "tenant-a" });
+    await lib.ingest(LINKABLE_B, { workspaceId: "tenant-b" });
+    const out = await lib.traverse(a, 2);
+    assert.deepStrictEqual(out.nodes.map(n => n.id), [a], "an unscoped traversal must stay inside the root's workspace");
+    assert.strictEqual(out.edges.length, 0, "no edge may point at another tenant's entity");
+  });
+
+  await test("re-linking on the update path stays workspace-confined", async () => {
+    // _relinkEntity runs again when a write versions an existing entity; that
+    // pass must confine the same way the create path does.
+    await lib.init(GRAPH_OPTS);
+    const a = await lib.ingest(LINKABLE_A, { workspaceId: "tenant-a" });
+    const b = await lib.ingest(LINKABLE_B, { workspaceId: "tenant-b" });
+    const again = await lib.ingest(LINKABLE_A + " sharp", { workspaceId: "tenant-a" });
+    assert.strictEqual(again, a, "precondition: the third write must version tenant-a's entity");
+    assert.strictEqual((await lib.get(a)).versionCount, 2, "precondition: the update path must have run");
+    assert.strictEqual((await lib.get(a)).linkCount, 0, "the relink on update must not reach into tenant-b");
+    assert.strictEqual((await lib.get(b)).linkCount, 0, "no back-link may appear on tenant-b's entity");
+  });
+
+  await test("legacy cross-workspace links are pruned on load", async () => {
+    const os   = require("os");
+    const path = require("path");
+    const fs   = require("fs");
+    const dir  = fs.mkdtempSync(path.join(os.tmpdir(), "kal-wslinks-"));
+    const file = path.join(dir, "data.jsonl");
+
+    // Rows in the pre-fix shape: 1 and 2 share a workspace, 3 is another
+    // tenant that the old relink pass wired into both.
+    const t    = Date.now();
+    const row  = (id, workspaceId, links) => ({
+      id, type: "text", text: `entity ${id}`, vector: [1, 0, 0], workspaceId, links,
+      createdAt: t, updatedAt: t,
+      versions: [{ text: `entity ${id}`, vector: [1, 0, 0], timestamp: t, delta: null }],
+    });
+    fs.writeFileSync(file, [row(1, "tenant-a", [2, 3]), row(2, "tenant-a", [1, 3]), row(3, "tenant-b", [1, 2])]
+      .map(r => JSON.stringify(r)).join("\n") + "\n");
+
+    try {
+      await lib.init({ ...GRAPH_OPTS, dataFile: file });
+      assert.strictEqual((await lib.get(3)).linkCount, 0, "the other tenant's edges must be gone");
+      assert.strictEqual((await lib.get(1)).linkCount, 1, "the same-workspace edge must survive the prune");
+      const graph = await lib.getGraph();
+      assert.deepStrictEqual(graph.edges, [{ source: 1, target: 2 }], "only the tenant-a edge may remain");
+    } finally {
+      await lib.shutdown?.();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   console.log("\n── version count & ordering ─────────────────────────────────────");
 
   await lib.init(INIT_OPTS);

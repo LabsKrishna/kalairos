@@ -354,11 +354,24 @@ function _assertInit() {
   if (!_initialized) throw emitError(Err.notInitialized());
 }
 
+// Canonical workspace of a stored entity. Rows written before workspaces
+// existed have no field and belong to "default".
+function _wsOf(entity) {
+  return entity.workspaceId || "default";
+}
+
 // Returns true if the entity's workspace is in the allowed set.
 // When allowedWorkspaces is null/undefined, no restriction is applied.
 function _wsAllowed(entity, allowedWorkspaces) {
   if (!allowedWorkspaces) return true;
-  return allowedWorkspaces.includes(entity.workspaceId || "default");
+  return allowedWorkspaces.includes(_wsOf(entity));
+}
+
+// Can this caller see the entity as a graph node? Missing (a link pointing at
+// an id no longer in the store), soft-deleted, and out-of-workspace all answer
+// no. The graph readers use it for both endpoints of every edge they report.
+function _isVisibleNode(entity, allowedWorkspaces) {
+  return !!entity && _isAlive(entity) && _wsAllowed(entity, allowedWorkspaces);
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -478,6 +491,8 @@ async function _loadStore() {
       console.warn("[kalairos] Skipping malformed entity during load");
     }
   }
+  // Runs once every row is in the store — a link's other end may load later.
+  _pruneCrossWorkspaceLinks();
   console.error(`[kalairos] Loaded ${store.size} entities`);
 }
 
@@ -686,6 +701,15 @@ async function _extractFacts(text, type) {
 
 // ─── Graph Linking ────────────────────────────────────────────────────────────
 
+// Recompute an entity's semantic edges by cosine similarity.
+//
+// Edges never cross a workspace: the graph is a per-tenant structure, and a
+// link is an assertion that two memories are about the same thing. Linking
+// across tenants leaks — `traverse()` returns the neighbour, and `linkCount`
+// counts edges the caller can never resolve — and the read-path
+// `_wsAllowed()` gates only help callers that pass `allowedWorkspaces`, which
+// is not the default. Confining at write time makes the isolation hold for
+// every caller. Sibling of the ingest()/consolidate() candidate scans.
 function _relinkEntity(entity) {
   // Remove stale back-links from other entities before clearing own links
   for (const linkedId of entity.links) {
@@ -693,13 +717,41 @@ function _relinkEntity(entity) {
   }
   entity.links.clear();
 
+  const ws = _wsOf(entity);
   for (const [otherId, other] of store) {
     if (otherId === entity.id) continue;
+    if (_wsOf(other) !== ws) continue;
     if (cosine(entity.vector, other.vector) >= CFG.linkThreshold) {
       entity.links.add(otherId);
       other.links.add(entity.id);
     }
   }
+}
+
+// One-time repair for stores written before links were workspace-confined:
+// drop any edge whose other end lives in a different workspace. Runs at load,
+// in memory only — the next write rewrites the JSONL (and replays the SQLite
+// index) without them, and a read-only deployment simply re-prunes each boot.
+// Idempotent: a store written by this version prunes nothing.
+//
+// Edges pointing at an id that isn't in the store are left alone. Their
+// workspace is unknowable, they are already inert on every read path, and
+// repairing them is a different concern than tenant isolation.
+function _pruneCrossWorkspaceLinks() {
+  let pruned = 0;
+  for (const entity of store.values()) {
+    if (!entity.links?.size) continue;
+    const ws = _wsOf(entity);
+    for (const linkedId of entity.links) {
+      const other = store.get(linkedId);
+      if (other && _wsOf(other) !== ws) {
+        entity.links.delete(linkedId);
+        pruned++;
+      }
+    }
+  }
+  if (pruned) console.error(`[kalairos] Pruned ${pruned} cross-workspace graph link(s)`);
+  return pruned;
 }
 
 // ─── Ingest ───────────────────────────────────────────────────────────────────
@@ -762,6 +814,9 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     // Two tiers: versionThreshold for direct updates, consolidationThreshold for
     // near-duplicate detection so the same fact expressed differently merges
     // instead of creating a separate entity.
+    // Candidates are confined to the target workspace: similar wording in a
+    // different tenant is a different fact, and merging across that boundary
+    // would silently overwrite another tenant's memory.
     // forceNew=true bypasses this scan entirely — guarantees a new entity row.
     let bestMatch = null, bestSim = 0;
     let consolidateMatch = null, consolidateSim = 0;
@@ -769,6 +824,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       for (const entity of store.values()) {
         if (!_isAlive(entity)) continue;
         if (entity.type !== type) continue;
+        if (_wsOf(entity) !== ws) continue;
         const sim = cosine(vector, entity.vector);
         if (sim >= CFG.versionThreshold && sim > bestSim) {
           bestSim   = sim;
@@ -897,7 +953,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       mergeTarget.classification = cls;
       mergeTarget.retention = retention ? ret : mergeTarget.retention || _normalizeRetention();
       mergeTarget.memoryType  = memoryType ? mt : mergeTarget.memoryType || _normalizeMemoryType();
-      mergeTarget.workspaceId = workspaceId ? ws : mergeTarget.workspaceId || _normalizeWorkspaceId();
+      mergeTarget.workspaceId = ws; // the candidate scan guarantees this already matches
       mergeTarget.metadata  = { ...mergeTarget.metadata, ...metadata };
       if (llmEnrichment) mergeTarget.metadata.llm = llmEnrichment;
       mergeTarget.tags      = Array.from(new Set([...(mergeTarget.tags || []), ...tags]));
@@ -1682,6 +1738,7 @@ async function consolidate({ threshold, dryRun = false, type, allowedWorkspaces 
     for (let i = 0; i < alive.length; i++) {
       for (let j = i + 1; j < alive.length; j++) {
         if (alive[i].type !== alive[j].type) continue;
+        if (_wsOf(alive[i]) !== _wsOf(alive[j])) continue;
         const sim = cosine(alive[i].vector, alive[j].vector);
         if (sim >= thresh) {
           union(alive[i].id, alive[j].id);
@@ -1744,9 +1801,13 @@ async function consolidate({ threshold, dryRun = false, type, allowedWorkspaces 
 async function getGraph({ allowedWorkspaces } = {}) {
   _assertInit();
   const nodes = [], edgeSet = new Set();
+  // Edges are collected as candidates and emitted only between two nodes the
+  // caller can see: an edge names its far end, so one dangling off the visible
+  // set both leaks that id and renders as an edge to nowhere.
+  const visible = new Set(), candidates = [];
   for (const e of store.values()) {
-    if (!_isAlive(e)) continue;
-    if (!_wsAllowed(e, allowedWorkspaces)) continue;
+    if (!_isVisibleNode(e, allowedWorkspaces)) continue;
+    visible.add(e.id);
     nodes.push({
       id: e.id, type: e.type || "text",
       label: e.text.slice(0, 40) + (e.text.length > 40 ? "…" : ""),
@@ -1755,9 +1816,11 @@ async function getGraph({ allowedWorkspaces } = {}) {
       tags:         e.tags || [],
       createdAt:    e.createdAt,
     });
-    for (const lid of (e.links || [])) {
-      edgeSet.add([e.id, lid].sort((a, b) => a - b).join(":"));
-    }
+    for (const lid of (e.links || [])) candidates.push([e.id, lid]);
+  }
+  for (const [src, dst] of candidates) {
+    if (!visible.has(dst)) continue;
+    edgeSet.add([src, dst].sort((a, b) => a - b).join(":"));
   }
   return {
     nodes,
@@ -1790,8 +1853,7 @@ async function traverse(id, depth = 1, { allowedWorkspaces } = {}) {
     if (visited.has(eid)) return;
     visited.add(eid);
     const e = store.get(eid);
-    if (!e || !_isAlive(e)) return;
-    if (!_wsAllowed(e, allowedWorkspaces)) return;
+    if (!_isVisibleNode(e, allowedWorkspaces)) return;
     result.nodes.push({
       id: e.id, type: e.type || "text",
       label: e.text.slice(0, 60) + (e.text.length > 60 ? "…" : ""),
@@ -1800,6 +1862,11 @@ async function traverse(id, depth = 1, { allowedWorkspaces } = {}) {
     });
     if (d < depth) {
       for (const lid of (e.links || [])) {
+        // Report an edge only once its far end is known to be visible. The
+        // edge itself carries the neighbour's id, so emitting it before the
+        // check hands out the id of an entity the caller is not allowed to
+        // see — and leaves an edge pointing at no node in `nodes`.
+        if (!_isVisibleNode(store.get(lid), allowedWorkspaces)) continue;
         result.edges.push({ source: e.id, target: lid });
         bfs(lid, d + 1);
       }

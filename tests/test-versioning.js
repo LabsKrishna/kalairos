@@ -77,6 +77,58 @@ const INIT_OPTS = {
     assert.notStrictEqual(id1, id2, "same text with different type must be separate entities");
   });
 
+  console.log("\n── workspace isolation on the write path ────────────────────────");
+
+  // Fresh embedder: the shared one in INIT_OPTS assigns vector slots by vocab
+  // insertion order, so introducing new words here would shift every other
+  // test's similarity scores.
+  const WS_OPTS = { ...INIT_OPTS, embedFn: makeMockEmbedder(64) };
+
+  await test("different workspace → different entity even if text is identical", async () => {
+    await lib.init(WS_OPTS);
+    const a = await lib.ingest("deploy target is the staging cluster", { workspaceId: "kernel-agent" });
+    const b = await lib.ingest("deploy target is the staging cluster", { workspaceId: "web-chat" });
+    assert.notStrictEqual(a, b, "identical text in another workspace must not version the first workspace's entity");
+    assert.strictEqual((await lib.get(a)).workspaceId, "kernel-agent");
+    assert.strictEqual((await lib.get(b)).workspaceId, "web-chat");
+  });
+
+  await test("near-duplicate across workspaces does not consolidate or overwrite", async () => {
+    await lib.init({ ...WS_OPTS, consolidationThreshold: 0.50 });
+    const a = await lib.ingest("Alice prefers hiking in the mountains on weekends", { workspaceId: "tenant-a" });
+    const b = await lib.ingest("Alice enjoys hiking the mountains each weekend", { workspaceId: "tenant-b" });
+    assert.notStrictEqual(a, b, "near-duplicates in different workspaces must stay separate entities");
+    const ea = await lib.get(a);
+    assert.strictEqual(ea.versionCount, 1, "tenant-a entity must not gain a version from tenant-b's write");
+    assert.match(ea.text, /prefers/, "tenant-a content must not be overwritten by tenant-b");
+    assert.strictEqual((await lib.get(b)).workspaceId, "tenant-b");
+  });
+
+  await test("same workspace still versions near-duplicates", async () => {
+    await lib.init(WS_OPTS);
+    const a = await lib.ingest("raw material cost is two hundred dollars per unit", { workspaceId: "tenant-a" });
+    const b = await lib.ingest("raw material cost is two hundred and ten dollars per unit", { workspaceId: "tenant-a" });
+    assert.strictEqual(a, b, "same-workspace variants must still version one entity");
+  });
+
+  await test("omitted workspaceId is the same workspace as an explicit \"default\"", async () => {
+    await lib.init(WS_OPTS);
+    const a = await lib.ingest("the release train ships on friday");
+    const b = await lib.ingest("the release train ships on friday", { workspaceId: "default" });
+    assert.strictEqual(a, b, "unscoped writes must keep merging with the default workspace");
+  });
+
+  await test("consolidate() does not merge across workspaces", async () => {
+    await lib.init({ ...WS_OPTS, consolidationThreshold: 0.50 });
+    const a = await lib.ingest("quarterly revenue for the northern region grew sharply", { workspaceId: "tenant-a" });
+    const b = await lib.ingest("quarterly revenue for the northern region grew", { workspaceId: "tenant-b" });
+    assert.notStrictEqual(a, b, "precondition: the two writes must be separate entities");
+    const report = await lib.consolidate({ threshold: 0.50 });
+    assert.strictEqual(report.totalMerged, 0, "cross-workspace duplicates must never be merged");
+    assert.ok(await lib.get(a), "tenant-a entity must survive");
+    assert.ok(await lib.get(b), "tenant-b entity must survive");
+  });
+
   console.log("\n── version count & ordering ─────────────────────────────────────");
 
   await lib.init(INIT_OPTS);

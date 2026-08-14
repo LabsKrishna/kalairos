@@ -354,11 +354,17 @@ function _assertInit() {
   if (!_initialized) throw emitError(Err.notInitialized());
 }
 
+// Canonical workspace of a stored entity. Rows written before workspaces
+// existed have no field and belong to "default".
+function _wsOf(entity) {
+  return entity.workspaceId || "default";
+}
+
 // Returns true if the entity's workspace is in the allowed set.
 // When allowedWorkspaces is null/undefined, no restriction is applied.
 function _wsAllowed(entity, allowedWorkspaces) {
   if (!allowedWorkspaces) return true;
-  return allowedWorkspaces.includes(entity.workspaceId || "default");
+  return allowedWorkspaces.includes(_wsOf(entity));
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -762,6 +768,9 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     // Two tiers: versionThreshold for direct updates, consolidationThreshold for
     // near-duplicate detection so the same fact expressed differently merges
     // instead of creating a separate entity.
+    // Candidates are confined to the target workspace: similar wording in a
+    // different tenant is a different fact, and merging across that boundary
+    // would silently overwrite another tenant's memory.
     // forceNew=true bypasses this scan entirely — guarantees a new entity row.
     let bestMatch = null, bestSim = 0;
     let consolidateMatch = null, consolidateSim = 0;
@@ -769,6 +778,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       for (const entity of store.values()) {
         if (!_isAlive(entity)) continue;
         if (entity.type !== type) continue;
+        if (_wsOf(entity) !== ws) continue;
         const sim = cosine(vector, entity.vector);
         if (sim >= CFG.versionThreshold && sim > bestSim) {
           bestSim   = sim;
@@ -897,7 +907,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       mergeTarget.classification = cls;
       mergeTarget.retention = retention ? ret : mergeTarget.retention || _normalizeRetention();
       mergeTarget.memoryType  = memoryType ? mt : mergeTarget.memoryType || _normalizeMemoryType();
-      mergeTarget.workspaceId = workspaceId ? ws : mergeTarget.workspaceId || _normalizeWorkspaceId();
+      mergeTarget.workspaceId = ws; // the candidate scan guarantees this already matches
       mergeTarget.metadata  = { ...mergeTarget.metadata, ...metadata };
       if (llmEnrichment) mergeTarget.metadata.llm = llmEnrichment;
       mergeTarget.tags      = Array.from(new Set([...(mergeTarget.tags || []), ...tags]));
@@ -1682,6 +1692,7 @@ async function consolidate({ threshold, dryRun = false, type, allowedWorkspaces 
     for (let i = 0; i < alive.length; i++) {
       for (let j = i + 1; j < alive.length; j++) {
         if (alive[i].type !== alive[j].type) continue;
+        if (_wsOf(alive[i]) !== _wsOf(alive[j])) continue;
         const sim = cosine(alive[i].vector, alive[j].vector);
         if (sim >= thresh) {
           union(alive[i].id, alive[j].id);

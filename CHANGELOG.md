@@ -14,6 +14,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   legitimate drift). Same- or earlier-time value flips still contradict.
   `effectiveAt` is now accepted by the MCP `kalairos_remember` tool.
 
+### Fixed
+
+- **Cross-workspace entity merging.** `ingest()` scored every stored entity of
+  the same `type` for version/consolidation matching, ignoring `workspaceId`.
+  Two workspaces holding similarly-worded facts could collide: a write from one
+  tenant would version-update — and overwrite — an entity belonging to another.
+  Candidate scans in `ingest()` and the clustering pass in `consolidate()` are
+  now confined to a single workspace. Single-workspace deployments (everything
+  on `default`) are unaffected.
+
 ### Changed
 
 - **Node.js >= 20 required** (`engines` was `>=18`). Node 18 is EOL

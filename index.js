@@ -367,6 +367,13 @@ function _wsAllowed(entity, allowedWorkspaces) {
   return allowedWorkspaces.includes(_wsOf(entity));
 }
 
+// Can this caller see the entity as a graph node? Missing (a link pointing at
+// an id no longer in the store), soft-deleted, and out-of-workspace all answer
+// no. The graph readers use it for both endpoints of every edge they report.
+function _isVisibleNode(entity, allowedWorkspaces) {
+  return !!entity && _isAlive(entity) && _wsAllowed(entity, allowedWorkspaces);
+}
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -1794,9 +1801,13 @@ async function consolidate({ threshold, dryRun = false, type, allowedWorkspaces 
 async function getGraph({ allowedWorkspaces } = {}) {
   _assertInit();
   const nodes = [], edgeSet = new Set();
+  // Edges are collected as candidates and emitted only between two nodes the
+  // caller can see: an edge names its far end, so one dangling off the visible
+  // set both leaks that id and renders as an edge to nowhere.
+  const visible = new Set(), candidates = [];
   for (const e of store.values()) {
-    if (!_isAlive(e)) continue;
-    if (!_wsAllowed(e, allowedWorkspaces)) continue;
+    if (!_isVisibleNode(e, allowedWorkspaces)) continue;
+    visible.add(e.id);
     nodes.push({
       id: e.id, type: e.type || "text",
       label: e.text.slice(0, 40) + (e.text.length > 40 ? "…" : ""),
@@ -1805,9 +1816,11 @@ async function getGraph({ allowedWorkspaces } = {}) {
       tags:         e.tags || [],
       createdAt:    e.createdAt,
     });
-    for (const lid of (e.links || [])) {
-      edgeSet.add([e.id, lid].sort((a, b) => a - b).join(":"));
-    }
+    for (const lid of (e.links || [])) candidates.push([e.id, lid]);
+  }
+  for (const [src, dst] of candidates) {
+    if (!visible.has(dst)) continue;
+    edgeSet.add([src, dst].sort((a, b) => a - b).join(":"));
   }
   return {
     nodes,
@@ -1840,8 +1853,7 @@ async function traverse(id, depth = 1, { allowedWorkspaces } = {}) {
     if (visited.has(eid)) return;
     visited.add(eid);
     const e = store.get(eid);
-    if (!e || !_isAlive(e)) return;
-    if (!_wsAllowed(e, allowedWorkspaces)) return;
+    if (!_isVisibleNode(e, allowedWorkspaces)) return;
     result.nodes.push({
       id: e.id, type: e.type || "text",
       label: e.text.slice(0, 60) + (e.text.length > 60 ? "…" : ""),
@@ -1850,6 +1862,11 @@ async function traverse(id, depth = 1, { allowedWorkspaces } = {}) {
     });
     if (d < depth) {
       for (const lid of (e.links || [])) {
+        // Report an edge only once its far end is known to be visible. The
+        // edge itself carries the neighbour's id, so emitting it before the
+        // check hands out the id of an entity the caller is not allowed to
+        // see — and leaves an edge pointing at no node in `nodes`.
+        if (!_isVisibleNode(store.get(lid), allowedWorkspaces)) continue;
         result.edges.push({ source: e.id, target: lid });
         bfs(lid, d + 1);
       }

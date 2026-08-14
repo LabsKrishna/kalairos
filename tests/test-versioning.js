@@ -186,34 +186,68 @@ const INIT_OPTS = {
     assert.strictEqual((await lib.get(b)).linkCount, 0, "no back-link may appear on tenant-b's entity");
   });
 
-  await test("legacy cross-workspace links are pruned on load", async () => {
+  // A row in the pre-fix on-disk shape, for the load-path tests below.
+  const legacyRow = (id, workspaceId, links) => {
+    const t = Date.now();
+    return {
+      id, type: "text", text: `entity ${id}`, vector: [1, 0, 0], workspaceId, links,
+      createdAt: t, updatedAt: t,
+      versions: [{ text: `entity ${id}`, vector: [1, 0, 0], timestamp: t, delta: null }],
+    };
+  };
+
+  async function withLegacyStore(rows, fn) {
     const os   = require("os");
     const path = require("path");
     const fs   = require("fs");
     const dir  = fs.mkdtempSync(path.join(os.tmpdir(), "kal-wslinks-"));
     const file = path.join(dir, "data.jsonl");
-
-    // Rows in the pre-fix shape: 1 and 2 share a workspace, 3 is another
-    // tenant that the old relink pass wired into both.
-    const t    = Date.now();
-    const row  = (id, workspaceId, links) => ({
-      id, type: "text", text: `entity ${id}`, vector: [1, 0, 0], workspaceId, links,
-      createdAt: t, updatedAt: t,
-      versions: [{ text: `entity ${id}`, vector: [1, 0, 0], timestamp: t, delta: null }],
-    });
-    fs.writeFileSync(file, [row(1, "tenant-a", [2, 3]), row(2, "tenant-a", [1, 3]), row(3, "tenant-b", [1, 2])]
-      .map(r => JSON.stringify(r)).join("\n") + "\n");
-
+    fs.writeFileSync(file, rows.map(r => JSON.stringify(r)).join("\n") + "\n");
     try {
       await lib.init({ ...GRAPH_OPTS, dataFile: file });
-      assert.strictEqual((await lib.get(3)).linkCount, 0, "the other tenant's edges must be gone");
-      assert.strictEqual((await lib.get(1)).linkCount, 1, "the same-workspace edge must survive the prune");
-      const graph = await lib.getGraph();
-      assert.deepStrictEqual(graph.edges, [{ source: 1, target: 2 }], "only the tenant-a edge may remain");
+      await fn();
     } finally {
       await lib.shutdown?.();
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  }
+
+  await test("legacy cross-workspace links are pruned on load", async () => {
+    // 1 and 2 share a workspace; 3 is another tenant the old relink pass
+    // wired into both.
+    await withLegacyStore(
+      [legacyRow(1, "tenant-a", [2, 3]), legacyRow(2, "tenant-a", [1, 3]), legacyRow(3, "tenant-b", [1, 2])],
+      async () => {
+        assert.strictEqual((await lib.get(3)).linkCount, 0, "the other tenant's edges must be gone");
+        assert.strictEqual((await lib.get(1)).linkCount, 1, "the same-workspace edge must survive the prune");
+        const graph = await lib.getGraph();
+        assert.deepStrictEqual(graph.edges, [{ source: 1, target: 2 }], "only the tenant-a edge may remain");
+      });
+  });
+
+  await test("traverse() reports no edge to a node it will not return", async () => {
+    // A link to an id that is no longer in the store: the prune leaves these
+    // alone (their workspace is unknowable), so the reader has to keep them
+    // out of the result rather than emitting an edge to nothing.
+    await withLegacyStore(
+      [legacyRow(1, "tenant-a", [2, 99]), legacyRow(2, "tenant-a", [1])],
+      async () => {
+        const out = await lib.traverse(1, 2);
+        assert.deepStrictEqual(out.nodes.map(n => n.id), [1, 2], "only resolvable nodes may be returned");
+        assert.ok(!out.edges.some(e => e.source === 99 || e.target === 99), "no edge may name the absent id");
+        assert.deepStrictEqual(out.edges, [{ source: 1, target: 2 }, { source: 2, target: 1 }],
+          "the surviving pair stays reported in both directions, as before");
+      });
+  });
+
+  await test("getGraph() reports no edge to a node it will not return", async () => {
+    await withLegacyStore(
+      [legacyRow(1, "tenant-a", [2, 99]), legacyRow(2, "tenant-a", [1])],
+      async () => {
+        const graph = await lib.getGraph();
+        assert.deepStrictEqual(graph.nodes.map(n => n.id), [1, 2]);
+        assert.deepStrictEqual(graph.edges, [{ source: 1, target: 2 }], "the edge to the absent id must not be reported");
+      });
   });
 
   console.log("\n── version count & ordering ─────────────────────────────────────");

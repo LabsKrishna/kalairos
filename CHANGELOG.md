@@ -33,6 +33,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and disappear from the JSONL (and the SQLite index) on the next write; no
   manual migration is needed. Same-workspace edges are untouched, so
   single-workspace deployments are unaffected.
+- **Graph readers reported edges to nodes they withheld.** `traverse()` pushed
+  an edge before checking whether the neighbour was visible, and `getGraph()`
+  never checked the far end at all — so an edge could name a soft-deleted
+  entity, an id no longer in the store, or one outside the caller's
+  `allowedWorkspaces`, while `nodes` correctly omitted it. Both now report an
+  edge only when both endpoints are returned as nodes. Callers that rendered
+  the result as a graph no longer get edges pointing at nothing.
 
 ### Changed
 

@@ -26,6 +26,9 @@ docs/storage-architecture-jsonl-sqlite-hybrid.md
 docs/sqlite-hybrid-index-tickets.md
 docs/phase-4.4-durable-runtime-spec.md
 
+# Audit / positioning notes — strategy content, local-only like CLAUDE.md and STATE.md
+docs/audit/
+
 # Python (agent-platform epic — python/)
 __pycache__/
 *.py[cod]

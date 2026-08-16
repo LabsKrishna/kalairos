@@ -4,7 +4,13 @@ All notable changes to Kalairos. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.8.0] — 2026-08-16
+
+Headline: **workspace isolation is now enforced on the write path.** Three
+fixes close cross-tenant leaks that the read-path `allowedWorkspaces` gates
+could not cover, including one that let a write from one workspace overwrite
+an entity owned by another. Single-workspace deployments (everything on
+`default`) are unaffected by all three.
 
 ### Added
 
@@ -48,6 +54,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   1.7.0 — supports Node 20+ only, so 1.7.0 already failed to install on
   Node 18 wherever a source build wasn't possible (e.g. Windows). CI now
   tests Node 20/22/24.
+- **`engines` narrowed to the LTS lines** (`^20 || ^22 || ^24`, was `>=20`).
+  `>=20` promised support for odd-numbered, non-LTS releases that were never
+  tested and do not install: `better-sqlite3` publishes no prebuilt binary for
+  them, so `npm install kalairos` falls back to a source build and fails on a
+  machine without a working toolchain. Verified on Node 23.7 / macOS arm64,
+  where `prebuild-install` reports `No prebuilt binaries found` and the
+  subsequent `node-gyp` build dies compiling `sqlite3.a`. The supported set is
+  now exactly the CI matrix. Node 21/23 users should move to an LTS line.
 
 ## [1.7.0] — 2026-05-11
 

@@ -1,6 +1,6 @@
 {
   "name": "kalairos",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "description": "Agent platform with bitemporal memory, live observability, and audit-grade traceability — for AI that needs to act at the right moment",
   "main": "./index.js",
   "exports": {
@@ -80,7 +80,7 @@
   "homepage": "https://github.com/LabsKrishna/kalairos#readme",
   "type": "commonjs",
   "engines": {
-    "node": ">=20"
+    "node": "^20 || ^22 || ^24"
   },
   "funding": {
     "type": "github",

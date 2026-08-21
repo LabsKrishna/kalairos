@@ -288,13 +288,40 @@ async function stubDetector(text) {
       calls.push({ url, body: JSON.parse(opts.body) });
       return { ok: true, json: async () => ({ jailbreak: true, score: 0.88 }) };
     };
-    const fn = nemoguardJailbreakFn({ apiKey: "k", baseUrl: "https://example.invalid", fetchImpl });
+    const fn = nemoguardJailbreakFn({ apiKey: "k", baseUrl: "https://example.invalid", endpoint: "/v1/classify", fetchImpl });
     const raw = await fn("some text");
 
-    assert.ok(calls[0].url.endsWith("/v1/classify"), `wrong endpoint: ${calls[0].url}`);
+    assert.strictEqual(calls[0].url, "https://example.invalid/v1/classify", `wrong URL: ${calls[0].url}`);
     assert.strictEqual(calls[0].body.input, "some text", "must send { input }");
     assert.ok(Math.abs(raw.risk - 0.94) < 1e-9, `score 0.88 → risk 0.94, got ${raw.risk}`);
     assert.strictEqual(normalizeVerdict(raw).flagged, true);
+  });
+
+  await test("nemoguardJailbreakFn builds the right URL for hosted and self-hosted", async () => {
+    const seen = [];
+    const fetchImpl = async (url) => { seen.push(url); return { ok: true, json: async () => ({ jailbreak: false, score: -1 }) }; };
+
+    // Hosted default: the path is the model route, NOT /v1/classify. Appending
+    // /v1/classify to it (the self-hosted shape) produces a doubled path that
+    // 404s — this assertion is the regression guard for exactly that bug.
+    await nemoguardJailbreakFn({ fetchImpl })("x");
+    assert.strictEqual(seen[0], "https://ai.api.nvidia.com/v1/security/nvidia/nemoguard-jailbreak-detect",
+      `hosted URL wrong: ${seen[0]}`);
+    assert.ok(!seen[0].includes("/v1/classify"), "hosted URL must not append the self-hosted path");
+
+    // Self-hosted NIM container.
+    await nemoguardJailbreakFn({ baseUrl: "http://0.0.0.0:8000/", endpoint: "v1/classify", fetchImpl })("x");
+    assert.strictEqual(seen[1], "http://0.0.0.0:8000/v1/classify",
+      `self-hosted URL wrong (slash handling): ${seen[1]}`);
+  });
+
+  await test("nemoguardJailbreakFn omits `model` unless supplied", async () => {
+    const bodies = [];
+    const fetchImpl = async (_u, o) => { bodies.push(JSON.parse(o.body)); return { ok: true, json: async () => ({ jailbreak: false, score: -1 }) }; };
+    await nemoguardJailbreakFn({ fetchImpl })("x");
+    assert.ok(!("model" in bodies[0]), "model must be absent by default");
+    await nemoguardJailbreakFn({ fetchImpl, model: "nvidia/nemoguard-jailbreak-detect" })("x");
+    assert.strictEqual(bodies[1].model, "nvidia/nemoguard-jailbreak-detect");
   });
 
   await test("nemoguardJailbreakFn maps a benign response to near-zero risk", async () => {

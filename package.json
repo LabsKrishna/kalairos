@@ -126,7 +126,6 @@
     "mcp.mjs",
     "store/entity-normalizer.js",
     "store/file-store.js",
-    "store/sqlite-index.js",
-    "examples/demo.js"
+    "store/sqlite-index.js"
   ]
 }

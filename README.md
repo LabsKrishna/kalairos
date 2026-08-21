@@ -86,10 +86,6 @@ npm install kalairos
 
 Local-first. No cloud service. No API key required. Bring any embedder. JSONL on disk — human-readable, git-friendly, easy to back up.
 
-```bash
-npx kalairos demo    # interactive demo, zero config
-```
-
 ---
 
 ## Layer 1 — Three calls and you're done

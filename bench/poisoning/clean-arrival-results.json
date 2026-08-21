@@ -1,0 +1,23 @@
+{
+  "runAt": "2026-08-21T23:04:54.720Z",
+  "detector": "offline-stub (plumbing only)",
+  "detectorIsReal": false,
+  "results": [
+    {
+      "label": "baseline (no detector)",
+      "detectionRate": 0,
+      "falsePositiveRate": 0,
+      "meanPoisonTrust": 0.75,
+      "meanBenignTrust": 0.75,
+      "separation": 0
+    },
+    {
+      "label": "detector: offline-stub",
+      "detectionRate": 1,
+      "falsePositiveRate": 0,
+      "meanPoisonTrust": 0.21,
+      "meanBenignTrust": 0.75,
+      "separation": 0.54
+    }
+  ]
+}

@@ -4,6 +4,26 @@ All notable changes to Kalairos. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **`kalairos demo` and the bundled `examples/` directory.** The command, its
+  `examples/demo.js` implementation, the npm `files` entry that shipped it, and
+  the README invocation are all gone. `examples/desktop-tidy.js` and
+  `examples/support-agent-demo.js` went with them; the directory no longer
+  exists.
+
+  **Breaking — this warrants a major bump.** `kalairos demo` was a public CLI
+  command, and it is being removed without the deprecation window this project
+  normally gives a public surface. The programmatic API (`init`, `ingest`,
+  `query`, `remember`, `getHistory`) is untouched.
+
+  **Migration:** there is none — the demo was zero-config scaffolding with no
+  state and no API. `kalairos demo` now prints the usage banner and exits 0
+  rather than erroring, so a script that still calls it degrades to help output
+  instead of crashing.
+
 ## [1.8.0] — 2026-08-16
 
 Headline: **workspace isolation is now enforced on the write path.** Three

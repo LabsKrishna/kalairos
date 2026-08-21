@@ -109,22 +109,32 @@ function riskMultiplier(verdict) {
 /**
  * Build a contentRiskFn backed by NVIDIA's NemoGuard JailbreakDetect NIM.
  *
- * Endpoint contract (docs.nvidia.com/nim/nemoguard-jailbreakdetect):
- *   POST <baseUrl>/v1/classify   { "input": "<text>" }
+ * Request/response contract (docs.nvidia.com/nim/nemoguard-jailbreakdetect):
+ *   POST <baseUrl><endpoint>   { "input": "<text>" }
  *   → { "jailbreak": bool, "score": <float -1..1> }
  * where score +1 is high confidence jailbreak and -1 high confidence safe.
  * We map that to [0, 1] risk via (score + 1) / 2.
+ *
+ * The path differs by deployment, so baseUrl and endpoint are separate knobs:
+ *
+ *   hosted (default)  baseUrl "https://ai.api.nvidia.com"
+ *                     endpoint "/v1/security/nvidia/nemoguard-jailbreak-detect"
+ *   self-hosted NIM   baseUrl "http://0.0.0.0:8000"  endpoint "/v1/classify"
  *
  * Returns null on ANY failure — network, timeout, auth, malformed body. A
  * detector outage must never block ingest or silently downrank good memory;
  * a missing verdict means "no opinion", which yields a 1.0 multiplier.
  *
- * @param {{ apiKey?, baseUrl?, timeoutMs?, fetchImpl? }} [opts]
+ * @param {{ apiKey?, baseUrl?, endpoint?, model?, timeoutMs?, fetchImpl? }} [opts]
  * @returns {(text: string) => Promise<object|null>}
  */
 function nemoguardJailbreakFn({
   apiKey   = process.env.NVIDIA_API_KEY,
-  baseUrl  = process.env.KALAIROS_JAILBREAK_URL || "https://ai.api.nvidia.com/v1/security/nvidia/nemoguard-jailbreak-detect",
+  baseUrl  = process.env.KALAIROS_JAILBREAK_URL      || "https://ai.api.nvidia.com",
+  endpoint = process.env.KALAIROS_JAILBREAK_ENDPOINT || "/v1/security/nvidia/nemoguard-jailbreak-detect",
+  // Some deployments (NeMo microservices nim-proxy) additionally require a
+  // model name in the body. Omitted unless supplied.
+  model,
   timeoutMs = Number(process.env.KALAIROS_CONTENT_RISK_TIMEOUT_MS || 4000),
   fetchImpl = globalThis.fetch,
 } = {}) {
@@ -136,17 +146,27 @@ function nemoguardJailbreakFn({
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetchImpl(`${baseUrl.replace(/\/+$/, "")}/v1/classify`, {
+      const url = `${baseUrl.replace(/\/+$/, "")}/${String(endpoint).replace(/^\/+/, "")}`;
+      const res = await fetchImpl(url, {
         method:  "POST",
         signal:  controller.signal,
         headers: {
           "content-type": "application/json",
+          accept:         "application/json",
           ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
         },
-        body: JSON.stringify({ input: String(text || "").slice(0, 5000) }),
+        body: JSON.stringify({
+          input: String(text || "").slice(0, 5000),
+          ...(model ? { model } : {}),
+        }),
       });
       if (!res.ok) {
-        console.warn(`[kalairos] content-risk: HTTP ${res.status} (non-blocking)`);
+        // Surface the body on failure — a 4xx here is nearly always a wrong
+        // path or a missing field, and the silent-null contract would
+        // otherwise hide the one detail needed to fix it.
+        let detail = "";
+        try { detail = ` — ${(await res.text()).slice(0, 200)}`; } catch {}
+        console.warn(`[kalairos] content-risk: HTTP ${res.status} from ${url} (non-blocking)${detail}`);
         return null;
       }
       const body = await res.json();

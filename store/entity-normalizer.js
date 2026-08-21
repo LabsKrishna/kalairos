@@ -93,6 +93,9 @@ function normalizeRaw(raw) {
   if (!Array.isArray(raw.llmKeywords)) raw.llmKeywords = raw.metadata?.llm?.keywords || [];
   if (raw.importance === undefined)    raw.importance  = null;
   if (raw.trustScore === undefined)    raw.trustScore  = defaultTrustScore(raw.source?.type || "user");
+  // null = never assessed by a content detector. Distinct from a verdict of
+  // score 0 ("assessed and clean"), which an auditor must be able to tell apart.
+  if (raw.contentRisk === undefined)   raw.contentRisk = null;
 
   // Backfill per-version metadata
   for (const v of raw.versions) if (!v.source) v.source = raw.source;

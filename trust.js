@@ -40,12 +40,24 @@
 //                    Trust decays with staleness. Old unrefreshed facts are
 //                    less trustworthy even if still semantically relevant.
 //
-//   trust          = clamp(0, 1, rawTrust × actor × recency)
+//   contentRisk    = 1.0 when no detector verdict is stored, otherwise a
+//                    multiplier ramping 1.0 → 0.2 as adversarial-content risk
+//                    rises past threshold (see content-risk.js). This is the
+//                    ONLY signal here that looks at what the claim says rather
+//                    than at the shape of its history — it catches a poison
+//                    that arrives cleanly, before any contradiction exists to
+//                    fire the structural defenses. Neutral (1.0) unless a
+//                    detector is configured, so stores without one are
+//                    unaffected.
+//
+//   trust          = clamp(0, 1, rawTrust × actor × recency × contentRisk)
 //
 //   KILL SWITCH    contradiction ≤ −0.6 → trust = 0.1 regardless.
 //                  A proven falsehood in history invalidates the present.
 //
 "use strict";
+
+const { riskMultiplier } = require("./content-risk");
 
 // Source-type trust defaults — single source of truth. index.js re-exports
 // the _defaultTrustScore helper; keeping the table here avoids a circular
@@ -69,6 +81,14 @@ function sourceTrust(source) {
 // it's fronted from, because we cannot tell five tool URIs from one adversary
 // cycling domains (this is the repetition-attack defense). An anonymous user
 // (no actor) collapses to a single identity for the same reason.
+// Render a normalized `who` tuple ({ user?, agent?, onBehalfOf?, session? })
+// as a short label for the formula string. Falls back to "human" so an
+// override recorded without attribution still reads sensibly.
+function _whoLabel(who) {
+  if (!who || typeof who !== "object") return "human";
+  return who.user || who.agent || who.onBehalfOf || "human";
+}
+
 function sourceKey(source) {
   if (!source) return "||";
   return `${source.type || ""}|${source.actor || ""}`;
@@ -145,7 +165,8 @@ function countCorroborators(versions) {
 /**
  * Compute trust signals for an entity.
  *
- * @param {object} entity — stored entity with `versions`, `source`, `trustScore`, `updatedAt`
+ * @param {object} entity — stored entity with `versions`, `source`, `trustScore`,
+ *                          `updatedAt`, and optionally `contentRisk` (detector verdict)
  * @param {object} opts
  * @param {number} [opts.now] — reference time for recency decay (default: Date.now())
  * @param {number} [opts.recencyHalfLifeMs] — halflife for recency decay (default: 30 days)
@@ -157,8 +178,12 @@ function countCorroborators(versions) {
  *     contradiction: number,         // signed adjustment (−inf .. 0)
  *     actor:         number,         // multiplier (placeholder 1.0)
  *     recency:       number,         // multiplier (0.5 .. 1.0)
+ *     contentRisk:   number,         // multiplier (0.2 .. 1.0); 1.0 = no verdict
  *     killed:        boolean,        // true if kill switch triggered
  *     sources:       number,         // distinct corroborators
+ *     content:       null | {        // null when no detector ever ran
+ *       score, flagged, detector, assessedAt, label, overridden, override
+ *     },
  *     contradictions: {
  *       total:      number,
  *       unresolved: number,
@@ -197,13 +222,20 @@ function computeTrustSignals(entity, { now = Date.now(), recencyHalfLifeMs = 30 
   const ageMs     = Math.max(0, now - updatedAt);
   const recency   = Math.max(0.5, Math.exp(-Math.LN2 * ageMs / recencyHalfLifeMs));
 
+  // Content-risk multiplier — 1.0 (no-op) unless a detector verdict was stored
+  // at ingest. An overridden verdict also yields 1.0 but stays on the record.
+  const riskVerdict   = entity?.contentRisk || null;
+  const contentRisk   = riskMultiplier(riskVerdict);
+
   // Raw and final
   const rawTrust = base + corroboration + contradictionSum;
-  let trust      = Math.max(0, Math.min(1, rawTrust * actor * recency));
+  let trust      = Math.max(0, Math.min(1, rawTrust * actor * recency * contentRisk));
 
-  // Kill switch: weighted contradiction total past threshold wipes trust
+  // Kill switch: weighted contradiction total past threshold wipes trust.
+  // Expressed as a CAP rather than an assignment so a content-risk penalty
+  // that already pushed trust below the cap is not raised back up to it.
   const killed = contradictionSum <= -0.6;
-  if (killed) trust = 0.1;
+  if (killed) trust = Math.min(trust, 0.1 * contentRisk);
 
   // Human-readable formula string for the breakdown surface
   const formula = [
@@ -211,6 +243,10 @@ function computeTrustSignals(entity, { now = Date.now(), recencyHalfLifeMs = 30 
     corroboration > 0 ? `+${corroboration.toFixed(2)} corroboration (${distinctSources} sources)` : null,
     contradictionSum < 0 ? `${contradictionSum.toFixed(2)} contradictions` : null,
     recency < 1 ? `×${recency.toFixed(2)} recency` : null,
+    contentRisk < 1
+      ? `×${contentRisk.toFixed(2)} content-risk (${riskVerdict.detector}: ${riskVerdict.score.toFixed(2)})`
+      : null,
+    riskVerdict?.override ? `⚑ risk cleared by ${_whoLabel(riskVerdict.override.who)}` : null,
     killed ? "⚠ KILL SWITCH" : null,
   ].filter(Boolean).join(" ");
 
@@ -224,8 +260,21 @@ function computeTrustSignals(entity, { now = Date.now(), recencyHalfLifeMs = 30 
       contradiction: +contradictionSum.toFixed(4),
       actor:         +actor.toFixed(4),
       recency:       +recency.toFixed(4),
+      contentRisk:   +contentRisk.toFixed(4),
       killed,
       sources:       distinctSources,
+      // Present only when a detector actually ran, so callers can distinguish
+      // "assessed and clean" from "never assessed" — an auditor needs that
+      // difference. Carries the verdict through to the query surface.
+      content: riskVerdict ? {
+        score:      riskVerdict.score,
+        flagged:    !!riskVerdict.flagged,
+        detector:   riskVerdict.detector,
+        assessedAt: riskVerdict.at,
+        label:      riskVerdict.label || null,
+        overridden: !!riskVerdict.override,
+        override:   riskVerdict.override || null,
+      } : null,
       contradictions: {
         total:      detailed.length,
         unresolved: unresolvedCount,

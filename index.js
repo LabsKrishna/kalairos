@@ -11,6 +11,10 @@ const { MemoryScope, AgentMemory } = require("./agent");
 const { Err, emitError, resetSignals } = require("./errors");
 const { AuthStore } = require("./auth");
 const { computeTrustSignals } = require("./trust");
+const {
+  normalizeVerdict:      _normalizeRiskVerdict,
+  nemoguardJailbreakFn,
+} = require("./content-risk");
 const { renderExport, parseMarkdownFacts } = require("./markdown");
 const {
   parseNLFilters:    _parseNLFilters,
@@ -70,6 +74,13 @@ const DEFAULTS = {
   // embedFn(text, type) — inject your own: `async (text, type) => number[]`.
   // llmFn(text, type) — inject your own: `async (text, type) => { keywords, context, llmTags, importance?, suggestedType? }`.
   // factExtractFn(text, type) — inject your own: `async (text, type) => string[]` (array of discrete fact strings).
+  // contentRiskFn(text, type) — inject your own adversarial-content detector:
+  //   `async (text, type) => { risk: 0..1 } | { jailbreak: bool, score } | number | null`.
+  //   OFF by default. When unset no network call is made, no verdict is stored,
+  //   and the trust multiplier is exactly 1.0 — output is identical to a build
+  //   without the feature. `contentRisk.nemoguardJailbreakFn()` ships a ready
+  //   adapter for NVIDIA's NemoGuard JailbreakDetect NIM. Opt-in because it is
+  //   an inference call in the ingest path and a cloud dependency (§23.9, §26).
   consolidationThreshold: Number(process.env.KALAIROS_CONSOLIDATION_THRESHOLD || 0.78),
   // Maximum number of mutations that may be pending in the write queue at once.
   // Excess writes are rejected with ERR_WRITE_QUEUE_FULL (HTTP 429) so callers
@@ -300,6 +311,7 @@ function _buildVersionRecord({
   who,
   why,
   previousVersionId,
+  contentRisk,
 }) {
   const ordinal     = (entity.versions?.length || 0) + 1;
   const versionId   = _makeVersionId(entity.id, ordinal);
@@ -321,6 +333,11 @@ function _buildVersionRecord({
     action,
     who:  who || null,
     why:  (typeof why === "string" && why.length) ? why : null,
+    // Per-version detector verdict. Kept on the version, not just the entity,
+    // so the provenance chain still shows a fact was flagged at ingest even
+    // after a later correction moved the head. Omitted entirely when no
+    // detector ran, so existing records are byte-identical.
+    ...(contentRisk ? { contentRisk } : {}),
   };
 }
 
@@ -345,6 +362,7 @@ function _serializeEntity(e, { truncateText } = {}) {
     tags:           e.tags || [],
     importance:     e.importance != null ? e.importance : null,
     trustScore:     e.trustScore != null ? e.trustScore : _defaultTrustScore(e.source?.type || "user"),
+    contentRisk:    e.contentRisk || null,
     linkCount:      e.links?.size || 0,
     versionCount:   e.versions?.length || 1,
     createdAt:      e.createdAt,
@@ -789,6 +807,30 @@ async function _enrichWithLLM(text, type) {
   }
 }
 
+// ─── Content Risk Assessment ─────────────────────────────────────────────────
+
+// Calls the caller-supplied contentRiskFn to score raw text for adversarial
+// content (prompt injection, jailbreak framing) BEFORE it is stored.
+//
+// This is the only ingest-time signal that inspects what the text says. It
+// exists to catch a poison that arrives cleanly — first assertion, plausible
+// source, nothing yet to contradict it — which every structural trust signal
+// necessarily misses until a conflicting truth shows up later.
+//
+// Returns null when unconfigured or on any failure. Never blocks ingest: a
+// detector outage must not stop memory being written, and a null verdict is
+// "no opinion", which yields a neutral 1.0 trust multiplier.
+async function _assessContentRisk(text, type) {
+  if (typeof CFG.contentRiskFn !== "function") return null;
+  try {
+    const raw = await CFG.contentRiskFn(text, type);
+    return _normalizeRiskVerdict(raw);
+  } catch (err) {
+    console.warn(`[kalairos] Content-risk assessment failed (non-blocking): ${err.message}`);
+    return null;
+  }
+}
+
 // ─── Fact Extraction ─────────────────────────────────────────────────────────
 
 // Calls the caller-supplied factExtractFn to break raw text into discrete facts.
@@ -913,6 +955,15 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     }
   }
 
+  // ── Optional content-risk assessment (off by default) ────────────────────
+  // Deliberately in Phase 1, outside the write lock: this can be a network
+  // call, and holding the lock across it would serialise every concurrent
+  // ingest behind one detector round-trip.
+  const riskVerdict = await _assessContentRisk(safeText, type);
+  if (riskVerdict?.flagged) {
+    console.error(`[kalairos] ⚠ content-risk ${riskVerdict.score.toFixed(2)} (${riskVerdict.detector}) — trust will be reduced`);
+  }
+
   // ── Phase 2: critical section (serialised via write lock) ─────────────────
   // All store reads, mutations, graph relinking, and persistence happen here.
   // The body is synchronous so the lock is held for the minimum possible time.
@@ -1023,6 +1074,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
         who:               whoNorm,
         why:               whyText,
         previousVersionId: latest?.versionId || null,
+        contentRisk:       riskVerdict,
       });
       mergeTarget.versions.unshift(versionRecord);
 
@@ -1070,6 +1122,13 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       // Update trust score when explicitly provided; otherwise preserve existing
       if (Number.isFinite(trustScore)) mergeTarget.trustScore = Math.max(0, Math.min(1, trustScore));
       else if (!Number.isFinite(mergeTarget.trustScore)) mergeTarget.trustScore = _defaultTrustScore(src.type);
+      // The verdict describes the HEAD text. This update replaced the head, so
+      // a verdict from the superseded text is stale and must not keep scoring
+      // the new one — including a human override, which cleared different
+      // words than the ones now stored. Replace it (null = no opinion) whenever
+      // a detector is configured; leave it untouched when the feature is off,
+      // so toggling the detector off never silently rewrites stored verdicts.
+      if (typeof CFG.contentRiskFn === "function") mergeTarget.contentRisk = riskVerdict;
 
       _relinkEntity(mergeTarget);
       _persistAll();
@@ -1101,6 +1160,9 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
                    : llmEnrichment ? (llmEnrichment.importance || 0.5) : null,
       trustScore:  Number.isFinite(trustScore) ? Math.max(0, Math.min(1, trustScore))
                    : _defaultTrustScore(src.type),
+      // Detector verdict for the current head text. Absent when no detector is
+      // configured — trust then applies a neutral 1.0 multiplier.
+      contentRisk: riskVerdict,
       llmKeywords: llmEnrichment ? llmEnrichment.keywords : [],
       links:     new Set(),
       createdAt: ts,
@@ -1122,6 +1184,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
         action:            ACTIONS.remembered,
         who:               whoNorm,
         why:               whyText,
+        ...(riskVerdict ? { contentRisk: riskVerdict } : {}),
       }],
       trailEvents: [],
     };
@@ -2056,6 +2119,7 @@ async function getHistory(id, { allowedWorkspaces } = {}) {
       source:            v.source || e.source || { type: "user" },
       classification:    v.classification || e.classification || "internal",
       linkIds:           v.linkIds || [],
+      contentRisk:       v.contentRisk || null,
     })),
     trailEvents: [...(e.trailEvents || [])].reverse(), // oldest-first for readability
   };
@@ -2262,12 +2326,15 @@ async function getDrift(id, { allowedWorkspaces } = {}) {
  *   - verified    (bool): human-confirmed correct
  *   - notes       (string): free-form annotation up to 500 chars
  *   - memoryType  (string): change the memory tier without a content update
+ *   - clearContentRisk (bool): human override of a content-detector verdict.
+ *     true neutralizes the trust penalty (verdict retained for audit);
+ *     false re-applies it.
  *
  * @param {number|string} id
- * @param {{ trustScore?, verified?, notes?, memoryType?, allowedWorkspaces? }} opts
+ * @param {{ trustScore?, verified?, notes?, memoryType?, clearContentRisk?, allowedWorkspaces? }} opts
  * @returns {object} updated serialized entity
  */
-async function annotate(id, { trustScore, verified, notes, memoryType, classification, who, why, allowedWorkspaces } = {}) {
+async function annotate(id, { trustScore, verified, notes, memoryType, classification, clearContentRisk, who, why, allowedWorkspaces } = {}) {
   _assertInit();
   return _withWriteLock(() => {
     const numId = Number(id) || id;
@@ -2307,6 +2374,23 @@ async function annotate(id, { trustScore, verified, notes, memoryType, classific
       if (next !== e.classification) {
         diff.classification = { from: e.classification, to: next };
         e.classification = next;
+      }
+    }
+    // Human override of a detector verdict. Classifiers produce false
+    // positives — a legal agent storing "witness stated they were threatened
+    // into recanting" is evidence, not an injection — so a reviewer can clear
+    // the penalty. The verdict itself is NOT deleted: the score, the detector,
+    // and who cleared it all stay on the record, because provenance is not
+    // strippable (§15) and the auditor needs to see both the flag and the
+    // decision to disregard it. Setting `clearContentRisk: false` re-applies.
+    if (clearContentRisk !== undefined && e.contentRisk) {
+      const wasOverridden = !!e.contentRisk.override;
+      const next = !!clearContentRisk;
+      if (next !== wasOverridden) {
+        diff.contentRiskOverride = { from: wasOverridden, to: next };
+        e.contentRisk = next
+          ? { ...e.contentRisk, override: { who: _normalizeWho(who), at: Date.now(), why: (typeof why === "string" && why.trim()) ? why.trim().slice(0, 500) : null } }
+          : (({ override, ...rest }) => rest)(e.contentRisk);
       }
     }
     // updatedAt intentionally not changed — this is metadata, not a content update
@@ -2735,6 +2819,8 @@ const history = {
 
 const trust = {
   annotate,
+  // Ready-made detector for init({ contentRiskFn }). Off unless wired.
+  nemoguardJailbreakFn,
 };
 
 const graph = {

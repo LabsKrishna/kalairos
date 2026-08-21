@@ -301,6 +301,36 @@ Every query result includes a `trust` score and a `source` provenance chain. Ann
 await kalairos.annotate(id, { trustScore: 0.9, verified: true, notes: 'confirmed by finance' });
 ```
 
+### Content-risk detection (opt-in)
+
+Every other trust signal is *structural* — it reasons about the shape of an entity's
+history (who asserted it, how many voices corroborate it, whether anything contradicted
+it, how stale it is). None of them look at what the claim says. That leaves one hole: a
+poisoned fact that arrives **cleanly** — first assertion, plausible source, nothing yet to
+contradict it — scores full trust until a conflicting truth happens to show up. Wire in a
+`contentRiskFn` and adversarial content is scored at ingest instead, before there is
+anything to contradict:
+
+```js
+await kalairos.init({
+  contentRiskFn: kalairos.trust.nemoguardJailbreakFn(), // needs NVIDIA_API_KEY
+});
+
+const { results } = await kalairos.query('what is the refund policy');
+console.log(results[0].trustBreakdown.formula);
+// → "Trust 0.21 = base 0.75 ×0.28 content-risk (nemoguard-jailbreak-detect: 0.94)"
+```
+
+The penalty is a bounded, monotonic multiplier — never a hard reject — because classifiers
+produce false positives, and *"witness stated they were threatened into recanting"* is
+evidence, not an injection. A reviewer clears it with
+`annotate(id, { clearContentRisk: true, who })`, which neutralizes the penalty while
+keeping the original verdict on the record for the auditor. Any `async (text, type) =>
+{ risk }` works, so you can point this at your own classifier.
+
+**Off by default.** With no `contentRiskFn` configured there is no network call, no stored
+field, and a multiplier of exactly `1.0` — the free tier takes no cloud dependency.
+
 ### Consolidation
 
 Merge near-duplicate memories into a single entity. Useful at the end of long sessions.
@@ -371,6 +401,7 @@ All numbers reproducible on any machine — deterministic bag-of-words embedder,
 | **Contradiction detection** | 100%                             | Conflicting facts flagged; metric drift correctly exempted |
 | **Cross-session recall**    | 100%                             | Memories persist across agent sessions and agents     |
 | **Poisoning defense**       | 5/5 attacks defended             | Injected facts flagged, trust-penalized, `asOf`-recoverable |
+| **First-touch poison separation** | 0.00 baseline → 0.54 with a detector | Trust gap between clean-arrival poison and benign memory (opt-in `contentRiskFn`) |
 | **Query latency (p95)**     | 5.2 ms @ 1k · 64.8 ms @ 10k entities | End-to-end `query()` on the JSONL + SQLite store |
 | **Observability completeness** | 1.000                         | Fraction of agent actions visible in the control-plane ledger |
 | **Cross-agent trace coverage** | 1.000                         | Handoffs reconstructible end-to-end (caller, callee, payload, outcome) |
@@ -445,7 +476,7 @@ await kalairos.listCheckpoints({ workspace? })
 ### Maintenance
 
 ```js
-await kalairos.annotate(id, { trustScore?, verified?, notes?, memoryType? })
+await kalairos.annotate(id, { trustScore?, verified?, notes?, memoryType?, clearContentRisk? })
 await kalairos.consolidate({ threshold?, dryRun? })
 await kalairos.getContradictions(id)
 await kalairos.getDrift(id)
@@ -480,7 +511,7 @@ codebases that prefer grouped imports.
 ```js
 kalairos.history    // getHistory, getChangeSince, getContradictions, getDrift,
                     // buildChangelog, trail, checkpoint, getCheckpoint, listCheckpoints
-kalairos.trust      // annotate
+kalairos.trust      // annotate, nemoguardJailbreakFn
 kalairos.graph      // getGraph, traverse, consolidate
 kalairos.io         // ingestBatch, ingestFile, ingestTimeSeries,
                     // exportMarkdown, importMarkdown

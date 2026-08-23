@@ -170,14 +170,29 @@ function nemoguardJailbreakFn({
         return null;
       }
       const body = await res.json();
-      // score is -1..1; fall back to the boolean when the float is absent.
-      const risk = Number.isFinite(body?.score)
-        ? (body.score + 1) / 2
-        : (body?.jailbreak ? 1 : 0);
+
+      // Parse STRICTLY. An unrecognised body must become "no opinion" (null),
+      // never risk 0. Mapping an unparseable response to zero risk is a
+      // fail-open in a security control: it marks every fact assessed-and-clean
+      // while the detector is effectively disconnected, and it does so
+      // silently. A 200 with the wrong shape means the endpoint contract
+      // changed or we are pointed at the wrong route — both need to be loud.
+      const hasScore = Number.isFinite(body?.score);
+      const hasBool  = typeof body?.jailbreak === "boolean";
+      if (!hasScore && !hasBool) {
+        console.warn(
+          `[kalairos] content-risk: unrecognised response from ${url} ` +
+          `(expected { jailbreak, score }, got keys: ${Object.keys(body || {}).join(",") || "none"}) — treating as NO OPINION`
+        );
+        return null;
+      }
+
+      // score is -1..1 (+1 = jailbreak); fall back to the boolean when absent.
+      const risk = hasScore ? (body.score + 1) / 2 : (body.jailbreak ? 1 : 0);
       return {
         risk,
         detector: "nemoguard-jailbreak-detect",
-        label:    body?.jailbreak ? "jailbreak" : "clean",
+        label:    body.jailbreak ? "jailbreak" : "clean",
       };
     } catch (err) {
       console.warn(`[kalairos] content-risk check failed (non-blocking): ${err.message}`);

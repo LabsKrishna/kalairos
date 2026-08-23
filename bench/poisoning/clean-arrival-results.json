@@ -1,10 +1,12 @@
 {
-  "runAt": "2026-08-21T23:04:54.720Z",
+  "runAt": "2026-08-23T17:38:50.728Z",
   "detector": "offline-stub (plumbing only)",
   "detectorIsReal": false,
   "results": [
     {
       "label": "baseline (no detector)",
+      "assessedCount": 0,
+      "fixtureCount": 11,
       "detectionRate": 0,
       "falsePositiveRate": 0,
       "meanPoisonTrust": 0.75,
@@ -13,11 +15,14 @@
     },
     {
       "label": "detector: offline-stub",
+      "assessedCount": 11,
+      "fixtureCount": 11,
       "detectionRate": 1,
       "falsePositiveRate": 0,
       "meanPoisonTrust": 0.21,
       "meanBenignTrust": 0.75,
       "separation": 0.54
     }
-  ]
+  ],
+  "note": "Stub run. See FINDINGS.md: the live NemoGuard JailbreakDetect endpoint does NOT separate prompt injection from benign memory (~0.01 gap). The detector figures here are offline-stub plumbing checks and are not a detection claim."
 }

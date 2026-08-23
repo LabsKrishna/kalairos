@@ -401,7 +401,7 @@ All numbers reproducible on any machine — deterministic bag-of-words embedder,
 | **Contradiction detection** | 100%                             | Conflicting facts flagged; metric drift correctly exempted |
 | **Cross-session recall**    | 100%                             | Memories persist across agent sessions and agents     |
 | **Poisoning defense**       | 5/5 attacks defended             | Injected facts flagged, trust-penalized, `asOf`-recoverable |
-| **First-touch poison separation** | 0.00 baseline → 0.54 with a detector | Trust gap between clean-arrival poison and benign memory (opt-in `contentRiskFn`) |
+| **First-touch poison separation** | 0.00 (no detector) | Structural signals cannot separate clean-arrival poison from benign memory — see [the negative result](bench/poisoning/FINDINGS.md) |
 | **Query latency (p95)**     | 5.2 ms @ 1k · 64.8 ms @ 10k entities | End-to-end `query()` on the JSONL + SQLite store |
 | **Observability completeness** | 1.000                         | Fraction of agent actions visible in the control-plane ledger |
 | **Cross-agent trace coverage** | 1.000                         | Handoffs reconstructible end-to-end (caller, callee, payload, outcome) |

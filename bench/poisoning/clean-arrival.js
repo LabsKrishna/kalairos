@@ -36,6 +36,7 @@ const path = require("path");
 const kalairos = require("../..");
 const { computeTrustSignals } = require("../../trust");
 const { nemoguardJailbreakFn } = require("../../content-risk");
+const { directiveShapeFn } = require("../../directive-shape");
 
 const DIM = 64;
 
@@ -163,8 +164,11 @@ async function measure({ label, contentRiskFn }) {
 
   const results = [];
   results.push(await measure({ label: "baseline (no detector)", contentRiskFn: null }));
+  // Deterministic, offline, no API key — always measured.
+  results.push(await measure({ label: "detector: directive-shape (deterministic)", contentRiskFn: directiveShapeFn() }));
+  // The live classifier only when a key is present; the stub is plumbing only.
   results.push(await measure({
-    label: `detector: ${useReal ? "nemoguard-live" : "offline-stub"}`,
+    label: `detector: ${useReal ? "nemoguard-live" : "offline-stub (plumbing only)"}`,
     contentRiskFn: useReal ? nemoguardJailbreakFn() : stubDetector,
   }));
 
@@ -178,17 +182,21 @@ async function measure({ label, contentRiskFn }) {
     console.log("");
   }
 
-  const [base, det] = results;
+  const base = results[0];
+  const det  = results[1];  // directive-shape is the gated configuration
   console.log("  ── Interpretation ──");
   console.log(`  Baseline separation is ${base.separation} — structural signals alone cannot`);
   console.log("  distinguish first-touch poison from ordinary memory, because there is no");
   console.log("  contradiction, no missing corroboration, and no staleness to detect.");
-  console.log(`  With a detector wired in, separation is ${det.separation}.`);
+  console.log(`  With directive-shape wired in, separation is ${det.separation}.`);
+  console.log("");
+  console.log("  ⚠ These fixtures are the set directive-shape was DESIGNED against.");
+  console.log("    Passing them is a sanity check, not validation. See");
+  console.log("    bench/poisoning/heldout.js for fixtures it has never seen.");
   if (!useReal) {
     console.log("");
-    console.log("  ⚠ Offline stub run: the detection rate above measures WIRING, not");
-    console.log("    classifier accuracy. Do not publish it as a detection claim.");
-    console.log("    Set NVIDIA_API_KEY to measure the real classifier.");
+    console.log("  ⚠ The third row is an offline stub measuring WIRING only.");
+    console.log("    Set NVIDIA_API_KEY to measure the real NemoGuard classifier.");
   }
   console.log("");
 

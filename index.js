@@ -15,6 +15,7 @@ const {
   normalizeVerdict:      _normalizeRiskVerdict,
   nemoguardJailbreakFn,
 } = require("./content-risk");
+const { directiveShapeFn, analyzeDirectiveShape } = require("./directive-shape");
 const { renderExport, parseMarkdownFacts } = require("./markdown");
 const {
   parseNLFilters:    _parseNLFilters,
@@ -2819,7 +2820,12 @@ const history = {
 
 const trust = {
   annotate,
-  // Ready-made detector for init({ contentRiskFn }). Off unless wired.
+  // Ready-made detectors for init({ contentRiskFn }). Off unless wired.
+  // directiveShapeFn is deterministic and offline; nemoguardJailbreakFn calls
+  // a hosted classifier and does NOT detect memory poisoning (see
+  // bench/poisoning/FINDINGS.md).
+  directiveShapeFn,
+  analyzeDirectiveShape,
   nemoguardJailbreakFn,
 };
 

@@ -1,5 +1,5 @@
 {
-  "runAt": "2026-08-23T17:38:50.728Z",
+  "runAt": "2026-08-23T22:34:50.639Z",
   "detector": "offline-stub (plumbing only)",
   "detectorIsReal": false,
   "results": [
@@ -14,7 +14,17 @@
       "separation": 0
     },
     {
-      "label": "detector: offline-stub",
+      "label": "detector: directive-shape (deterministic)",
+      "assessedCount": 11,
+      "fixtureCount": 11,
+      "detectionRate": 1,
+      "falsePositiveRate": 0,
+      "meanPoisonTrust": 0.234,
+      "meanBenignTrust": 0.75,
+      "separation": 0.516
+    },
+    {
+      "label": "detector: offline-stub (plumbing only)",
       "assessedCount": 11,
       "fixtureCount": 11,
       "detectionRate": 1,
@@ -24,5 +34,5 @@
       "separation": 0.54
     }
   ],
-  "note": "Stub run. See FINDINGS.md: the live NemoGuard JailbreakDetect endpoint does NOT separate prompt injection from benign memory (~0.01 gap). The detector figures here are offline-stub plumbing checks and are not a detection claim."
+  "note": "Offline run. The directive-shape row is the deterministic detector (no API key). The third row is an offline stub measuring wiring only and is NOT a detection claim. These are the fixtures directive-shape was tuned on \u2014 see FINDINGS.md for held-out numbers (recall 0.67, false positives 0.00, evasion recall 0.00)."
 }

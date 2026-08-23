@@ -332,6 +332,40 @@ async function stubDetector(text) {
     assert.strictEqual(normalizeVerdict(raw).flagged, false);
   });
 
+  await test("REGRESSION: a 200 with an unrecognised body is NO OPINION, not risk 0", async () => {
+    // A live run once came back identical to baseline with no errors logged:
+    // the endpoint answered 200 with a shape the parser did not recognise, and
+    // the fallback mapped it to risk 0 — marking every fact assessed-and-clean
+    // while the detector was effectively disconnected. Fail-open in a security
+    // control, and silent. It must be null (no opinion) instead.
+    for (const body of [{}, { choices: [{ message: { content: "safe" } }] }, { detail: "Not Found" }]) {
+      const fn = nemoguardJailbreakFn({
+        baseUrl: "https://example.invalid",
+        fetchImpl: async () => ({ ok: true, json: async () => body }),
+      });
+      assert.strictEqual(await fn("x"), null,
+        `unrecognised body must be no-opinion, got a verdict for ${JSON.stringify(body)}`);
+    }
+
+    // And "no opinion" must remain distinguishable from "assessed and clean".
+    assert.strictEqual(normalizeVerdict(null), null);
+    assert.strictEqual(computeTrustSignals({ trustScore: 0.75, updatedAt: Date.now(), versions: [], contentRisk: null })
+      .breakdown.content, null, "no opinion leaves content null, not a clean verdict");
+  });
+
+  await test("a legitimate jailbreak:false response is still a real verdict", async () => {
+    // The strict parser must not throw away valid negatives — a boolean-only
+    // response is a genuine "assessed and clean", distinct from no opinion.
+    const fn = nemoguardJailbreakFn({
+      baseUrl: "https://example.invalid",
+      fetchImpl: async () => ({ ok: true, json: async () => ({ jailbreak: false }) }),
+    });
+    const raw = await fn("x");
+    assert.ok(raw, "boolean-only response must still produce a verdict");
+    assert.strictEqual(raw.risk, 0);
+    assert.strictEqual(normalizeVerdict(raw).flagged, false);
+  });
+
   await test("nemoguardJailbreakFn returns null on HTTP error and on network failure", async () => {
     const errFn = nemoguardJailbreakFn({
       baseUrl: "https://example.invalid",

@@ -115,8 +115,12 @@ async function measure({ label, contentRiskFn }) {
   for (const r of rows) {
     const e = await kalairos.get(r.id);
     const { trust, breakdown } = computeTrustSignals(e);
-    r.trust   = trust;
-    r.flagged = !!breakdown.content?.flagged;
+    r.trust    = trust;
+    r.flagged  = !!breakdown.content?.flagged;
+    // Did a detector actually return a usable verdict for this fixture?
+    // null content means "no opinion" — never assessed — which must not be
+    // read as "assessed and found clean".
+    r.assessed = breakdown.content !== null;
   }
   await kalairos.shutdown();
 
@@ -131,6 +135,8 @@ async function measure({ label, contentRiskFn }) {
 
   return {
     label,
+    assessedCount:     rows.filter(r => r.assessed).length,
+    fixtureCount:      rows.length,
     detectionRate:     +(detected / poison.length).toFixed(3),
     falsePositiveRate: +(falsePositive / benign.length).toFixed(3),
     meanPoisonTrust:   meanPoison,
@@ -164,6 +170,7 @@ async function measure({ label, contentRiskFn }) {
 
   for (const r of results) {
     console.log(`  ${r.label}`);
+    console.log(`      assessed            ${r.assessedCount}/${r.fixtureCount} fixtures`);
     console.log(`      detection rate      ${r.detectionRate.toFixed(2)}`);
     console.log(`      false-positive rate ${r.falsePositiveRate.toFixed(2)}`);
     console.log(`      mean trust  poison ${r.meanPoisonTrust}  benign ${r.meanBenignTrust}`);
@@ -198,8 +205,27 @@ async function measure({ label, contentRiskFn }) {
   // Gate: the detector configuration must separate poison from benign. The
   // baseline is expected to separate nothing — that is the finding, not a
   // failure, so only the detector run is gated.
+  //
+  // Distinguish the two ways the detector run can fail, because they need
+  // different fixes and one of them is easy to misread as a model result:
+  //   - assessed nothing  → the detector never returned a usable verdict.
+  //     Wrong route, bad key, or a changed response contract. NOT a finding
+  //     about the classifier.
+  //   - assessed, no separation → the classifier genuinely did not flag the
+  //     poison. That IS a finding about the classifier.
+  const assessed = det.rows.filter(r => r.assessed).length;
+  if (assessed === 0) {
+    console.error("  ✗ detector never returned a verdict for ANY fixture.");
+    console.error("    The endpoint is not answering in a shape we understand —");
+    console.error("    this says nothing about the classifier's accuracy.");
+    console.error("    Diagnose with: node bench/poisoning/probe-detector.js");
+    process.exit(2);
+  }
+  if (assessed < det.rows.length) {
+    console.error(`  ! only ${assessed}/${det.rows.length} fixtures were assessed — partial detector coverage`);
+  }
   if (det.separation <= 0) {
-    console.error("  ✗ detector configuration failed to downrank poison");
+    console.error("  ✗ detector assessed the fixtures but did not downrank poison");
     process.exit(1);
   }
 })();

@@ -1,12 +1,12 @@
 // index.js — Kalairos Core Engine
 "use strict";
 
-const os     = require("os");
 const fs     = require("fs");
 const path   = require("path");
 const { cosine } = require("./kernel");
 const { buildDelta, buildChangelog, measureDrift, ACTIONS, isValidAction, synthesizeAction } = require("./versioning");
 const { WorkerPool } = require("./worker-pool");
+const { availableCpus } = require("./cpu");
 const { MemoryScope, AgentMemory } = require("./agent");
 const { Err, emitError, resetSignals } = require("./errors");
 const { AuthStore } = require("./auth");
@@ -429,7 +429,7 @@ async function init(overrides = {}) {
   // boot decision tree so the index is in sync before the first write.
   await _initSqliteIndex();
 
-  _pool = new WorkerPool(os.cpus().length);
+  _pool = new WorkerPool(availableCpus());
   _pool.start();
 
   _initialized = true;
@@ -1221,7 +1221,7 @@ async function ingestFile(filePath, { tags = [], metadata: extra = {} } = {}) {
 async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), useRecency = true } = {}) {
   if (subset.length === 0) return { results: [], trustBreakdowns: new Map() };
 
-  const numWorkers = os.cpus().length;
+  const numWorkers = availableCpus();
   const chunkSize  = Math.ceil(subset.length / numWorkers);
   const jobConfig  = {
     graphBoostWeight:   CFG.graphBoostWeight,

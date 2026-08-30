@@ -2,13 +2,15 @@
 "use strict";
 
 const { Worker } = require("worker_threads");
-const os   = require("os");
 const path = require("path");
+const { availableCpus } = require("./cpu");
 
 const WORKER_FILE = path.resolve(__dirname, "worker.js");
 
 class WorkerPool {
-  constructor(size = os.cpus().length) {
+  // Default to what this container may actually use. os.cpus() would report the
+  // host's cores — see cpu.js for why that OOMs a small instance at boot.
+  constructor(size = availableCpus()) {
     this._size    = size;
     this._workers = []; // [{ worker, pending: { resolve, reject } | null }]
     this._idle    = []; // indices of workers waiting for work

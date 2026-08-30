@@ -6,6 +6,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Worker-thread and ONNX thread pools are sized from the container's CPU
+  quota, not the host's core count.** `os.cpus()` reports the physical host's
+  cores from inside a container, so `init()` spawned one V8 isolate per host
+  core — measured at ~8.8 MB of RSS each, before any entity or model is
+  loaded. On a 0.5-CPU / 512 MB instance backed by a 32-core host that is
+  ~324 MB of worker threads alone, and the process OOM'd during `init()`
+  before it ever bound a port. The platform then served 502s with nothing in
+  the application log to explain them.
+
+  New `cpu.js` reads the cgroup quota (v2 `cpu.max`, falling back to v1
+  `cpu.cfs_quota_us`) and only falls back to `os.cpus()` when genuinely
+  unconstrained. `WorkerPool`, the per-query chunker, and the ONNX Runtime
+  session all size from it. `KALAIROS_MAX_WORKERS` overrides it outright.
+
+  Note that ONNX Runtime's arenas are *native* memory, outside the V8 heap —
+  `--max-old-space-size` never governed them, and raising that flag above the
+  container's RAM limit replaces a catchable V8 error with a kernel SIGKILL.
+
 ### Removed
 
 - **`kalairos demo` and the bundled `examples/` directory.** The command, its

@@ -107,6 +107,8 @@ async function load(modelDir) {
     return false;
   }
 
+  const { availableCpus } = require("./cpu");
+
   let ort;
   try { ort = require("onnxruntime-node"); }
   catch { process.stderr.write("kalairos-embedder: onnxruntime-node not installed\n"); return false; }
@@ -118,9 +120,15 @@ async function load(modelDir) {
     _clsId = _vocab.get("[CLS]") ?? 101;
     _sepId = _vocab.get("[SEP]") ?? 102;
 
+    // ONNX Runtime sizes its own thread pools from the host core count too,
+    // and its arenas are NATIVE memory — outside the V8 heap, so
+    // --max-old-space-size never governed them. Cap both explicitly.
+    const threads = availableCpus();
     _session = await ort.InferenceSession.create(modelPath, {
       executionProviders: ["cpu"],
       graphOptimizationLevel: "all",
+      intraOpNumThreads: threads,
+      interOpNumThreads: 1,
     });
 
     return true;

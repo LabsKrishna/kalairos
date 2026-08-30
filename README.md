@@ -511,6 +511,7 @@ const trail = await history.trail({ entity: id });
 | `KALAIROS_MIN_SEMANTIC`          | `0.35`  | Minimum semantic similarity                |
 | `KALAIROS_MAX_VERSIONS`          | `0`     | Max versions per entity (0 = unlimited)    |
 | `KALAIROS_STRICT_EMBEDDINGS`     | `1`     | Require embedder (`0` to disable)          |
+| `KALAIROS_MAX_WORKERS`           | `auto`  | Worker threads (default: cgroup CPU quota) |
 | `KALAIROS_PORT`                  | `3000`  | HTTP server port                           |
 
 ---

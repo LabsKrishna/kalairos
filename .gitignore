@@ -51,3 +51,10 @@ python/bench/observability-results.json
 
 # Design source — a 12 MB binary, not part of the engine or the package
 Design.pdf
+
+# Discovery notes — call scripts and transcripts, local-only
+docs/discovery/
+
+# Next.js build output — this repo is the engine, but the app under
+# services/web/ traces to a root that can land a .next/ here.
+.next/

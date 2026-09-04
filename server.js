@@ -105,8 +105,14 @@ function _wrap(fn) {
 // ─── Shared body extraction for ingest-like endpoints ────────────────────────
 
 function _ingestParams(body) {
-  const { text, type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM, importance, trustScore } = body || {};
+  const { text, type = "text", timestamp, effectiveAt, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM, importance, trustScore } = body || {};
   const p = { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM: !!useLLM };
+  // effectiveAt is the event-time axis (§14) — when the fact became true in the
+  // world, as opposed to `timestamp`, which is when we learned it. Without it on
+  // the write side, /query's validAt mode has nothing to distinguish: every
+  // fact would be effective exactly when it was ingested and the two axes could
+  // never diverge. The engine validates and normalizes the value.
+  if (effectiveAt != null) p.effectiveAt = effectiveAt;
   if (importance  != null) p.importance  = Number(importance);
   if (trustScore  != null) p.trustScore  = Number(trustScore);
   return p;
@@ -212,15 +218,38 @@ app.post("/ingest/file", _requireAuth("write"), _wrap(async (req) => {
   return { success: true, id: await lib.ingestFile(filePath, { tags, metadata }) };
 }));
 
+// Time arguments select the query mode, and the three modes walk different
+// axes (§14): `asOf` is ingest time ("what did we believe on date X"),
+// `validAt` is event time ("what was actually true on date X"), and
+// { since, until } is a span over the version timeline. Combining them would
+// answer none of those questions, so the request is rejected rather than
+// silently resolved by precedence.
+function _selectTimeMode({ asOf, validAt, since, until }) {
+  const modes = [];
+  if (asOf    != null) modes.push("asOf");
+  if (validAt != null) modes.push("validAt");
+  if (since   != null || until != null) modes.push("since/until");
+  if (modes.length > 1) {
+    throw {
+      code: Codes.VALIDATION,
+      message: `asOf, validAt and { since, until } are distinct query modes — supply exactly one (got: ${modes.join(", ")})`,
+    };
+  }
+  return modes[0] || null;
+}
+
 app.post("/query", _requireAuth("read"), _wrap(async (req) => {
-  const { text, limit = 10, maxTokens = null, filter = {}, asOf = null, since = null, until = null } = req.body;
+  const { text, limit = 10, maxTokens = null, filter = {}, asOf = null, validAt = null, since = null, until = null } = req.body;
   const err = _validateText(text);
   if (err) throw { code: Codes.VALIDATION, message: err };
   const safeLimit = Math.min(Math.max(1, Math.floor(Number(limit) || 10)), 200);
   const opts = { limit: safeLimit, maxTokens, filter, allowedWorkspaces: req.allowedWorkspaces };
-  if (asOf != null) return await lib.queryAt(text, asOf, opts);
-  if (since != null || until != null) return await lib.queryRange(text, since, until, opts);
-  return await lib.query(text, opts);
+  switch (_selectTimeMode({ asOf, validAt, since, until })) {
+    case "asOf":        return await lib.queryAt(text, asOf, opts);
+    case "validAt":     return await lib.queryValidAt(text, validAt, opts);
+    case "since/until": return await lib.queryRange(text, since, until, opts);
+    default:            return await lib.query(text, opts);
+  }
 }));
 
 app.post("/entities/batch", _requireAuth("read"), _wrap(async (req) => {
@@ -374,9 +403,18 @@ app.post("/agent/:agentId/update", _resolveAgent, _requireAuth("write"), _wrap(a
 }));
 
 app.post("/agent/:agentId/recall", _resolveAgent, _requireAuth("read"), _wrap(async (req) => {
-  const { text, limit, filter, asOf } = req.body;
+  const { text, limit, filter, asOf, validAt, since, until } = req.body;
   if (!text) throw { code: Codes.VALIDATION, message: "text is required" };
-  return req.agent.recall(text, { limit, filter, asOf, allowedWorkspaces: req.allowedWorkspaces });
+  // Route the time argument to the matching verb. Passing asOf straight through
+  // to recall() reaches query(), which rejects time arguments outright — so a
+  // historical agent recall has to be dispatched here.
+  const opts = { limit, filter, allowedWorkspaces: req.allowedWorkspaces };
+  switch (_selectTimeMode({ asOf, validAt, since, until })) {
+    case "asOf":        return req.agent.queryAt(text, asOf, opts);
+    case "validAt":     return req.agent.queryValidAt(text, validAt, opts);
+    case "since/until": return req.agent.queryRange(text, since, until, opts);
+    default:            return req.agent.recall(text, opts);
+  }
 }));
 
 app.get("/agent/:agentId/history/:entityId", _resolveAgent, _requireAuth("read"), _wrap(async (req) => {
@@ -521,7 +559,8 @@ lib.init({ strictEmbeddings: false }).then(() => {
     console.log("  POST   /ingest/batch            { items: [{text, type?, ...}] }");
     console.log("  POST   /ingest/timeseries       { label, points: [{timestamp,value}], metadata?, tags? }");
     console.log("  POST   /ingest/file             { filePath, tags?, metadata? }");
-    console.log("  POST   /query                   { text, limit?, filter?: {type?,since?,until?,tags?,memoryType?,workspaceId?} }");
+    console.log("  POST   /query                   { text, limit?, maxTokens?, filter?, asOf? | validAt? | since?+until? }");
+    console.log("                                  asOf = ingest time (what we believed); validAt = event time (what was true)");
     console.log("  GET    /entity/:id");
     console.log("  DELETE /entity/:id              { deletedBy? } → soft delete");
     console.log("  DELETE /entity/:id/purge        → permanent hard delete");

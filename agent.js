@@ -113,6 +113,15 @@ class MemoryScope {
   }
 
   /**
+   * Event-time query — state as it was actually TRUE at `timestamp` (Unix ms),
+   * regardless of when we learned it. Diverges from `queryAt` whenever a fact
+   * was ingested with a backdated `effectiveAt`.
+   */
+  async queryValidAt(text, timestamp, opts = {}) {
+    return this._engine.queryValidAt(text, timestamp, opts);
+  }
+
+  /**
    * Range query — entities whose version timeline overlaps `[since, until]`.
    */
   async queryRange(text, since, until, opts = {}) {

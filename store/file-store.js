@@ -17,6 +17,12 @@
 
 const fs = require("fs");
 const path = require("path");
+const { StringDecoder } = require("string_decoder");
+
+// How much of the JSONL to hold in flight while loading. Big enough that the
+// syscall count stays irrelevant, small enough that it never registers against
+// the store itself.
+const READ_CHUNK_BYTES = 1 << 20; // 1MB
 
 function _writeFileSyncDurable(file, data) {
   // Open + write + fsync + close, then fsync the parent directory so the
@@ -94,15 +100,56 @@ class FileStore {
 
     if (!fs.existsSync(file)) return [];
 
-    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    // Read in chunks rather than whole.
+    //
+    // This used to be `readFileSync(file, "utf8").split("\n").filter(Boolean)`,
+    // which is three complete copies of the store alive at once — the decoded
+    // string, the array of split lines, and the array the filter produces —
+    // before a single row has been parsed. On a 58MB store that is the
+    // difference between a load that PEAKS at +318MB and one that peaks near
+    // what it will actually retain (+216MB). The peak is what gets a process
+    // SIGKILLed on a small container: it dies during init(), before it has
+    // bound a port, and the platform reports a restart with nothing in the
+    // app's own log to explain it.
+    //
+    // Still synchronous, deliberately. The durability contract at the top of
+    // this file rests on there being no async boundary inside the write
+    // critical section, and making the read async to fix a memory problem
+    // would be paying for it in the wrong currency.
     const rows = [];
-    for (const line of lines) {
+    const decoder = new StringDecoder("utf8"); // a chunk can split a multi-byte char
+    const fd = fs.openSync(file, "r");
+    const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+    let carry = "";
+
+    const take = (line) => {
+      if (!line) return; // blank line, including the trailing newline's empty tail
       try {
         rows.push(JSON.parse(line));
       } catch {
         console.warn(`[kalairos] FileStore: skipping malformed line: ${line.slice(0, 80)}`);
       }
+    };
+
+    try {
+      let read;
+      while ((read = fs.readSync(fd, buf, 0, READ_CHUNK_BYTES, null)) > 0) {
+        carry += decoder.write(buf.subarray(0, read));
+        // Scan with a moving offset and slice ONCE per chunk. Re-slicing per
+        // line would make this quadratic in the size of a chunk.
+        let start = 0, nl;
+        while ((nl = carry.indexOf("\n", start)) >= 0) {
+          take(carry.slice(start, nl));
+          start = nl + 1;
+        }
+        carry = carry.slice(start);
+      }
+      carry += decoder.end();
+      take(carry.trim() ? carry : ""); // a final row with no trailing newline
+    } finally {
+      fs.closeSync(fd);
     }
+
     return rows; // caller normalizes and calls store.set()
   }
 

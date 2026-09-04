@@ -79,6 +79,11 @@ const DEFAULTS = {
   // ERR_TEXT_TOO_LONG rather than silently truncating — silent truncation
   // corrupts recall because the embedding is computed from clipped text.
   maxTextLen: Number(process.env.KALAIROS_MAX_TEXT_LEN || 5000),
+  // How many recent (text, type) -> vector results to keep. Embedding is the
+  // one genuinely expensive step in both ingest and query, and it is pure: the
+  // same text through the same embedder is the same vector. 0 disables.
+  // See _embed for what this costs in memory and what it refuses to cache.
+  embedCacheSize: Number(process.env.KALAIROS_EMBED_CACHE ?? 256),
 };
 
 // ─── Module state ─────────────────────────────────────────────────────────────
@@ -88,6 +93,14 @@ let store       = null;        // StoreAdapter (FileStore or PgStore)
 let _pool       = null;        // persistent WorkerPool
 let _initialized = false;
 let _skipIO        = 0;    // ref-counted; > 0 suppresses per-item I/O during batch ops
+
+// Embedding cache — see _embed. A Map is the LRU: insertion order is iteration
+// order, so re-inserting on a hit moves an entry to the back and the oldest is
+// always the first key. Reset by init(), because a new embedFn or a new
+// embeddingDim makes every entry wrong rather than merely stale.
+let _embedCache  = new Map();  // `${type}\u0000${text}` -> vector
+let _embedHits   = 0;
+let _embedMisses = 0;
 
 // ─── Built-in Bag-of-Words Embedder (fallback) ────────────────────────────────
 
@@ -393,6 +406,13 @@ async function init(overrides = {}) {
   _skipIO        = 0;      // reset batch-suppress counter
   _pendingWrites = [];     // drop any queued mutations from previous session
   _draining      = false;  // drain state reset
+  // Not merely stale — WRONG. init() may install a different embedFn or a
+  // different embeddingDim, and a surviving entry would hand back a vector
+  // from the previous model, at the previous dimension, for text that looks
+  // identical. Clearing is the only safe answer, and init() is rare.
+  _embedCache    = new Map();
+  _embedHits     = 0;
+  _embedMisses   = 0;
 
   // Auto-detect embedder if not provided.
   //
@@ -657,19 +677,78 @@ function _emptyEmbedding() {
 
 // Embed text with awareness of the entity type. The embedFn injectable receives
 // (text, type) so callers can dispatch to different models per type.
+// Cache key. The type is part of it because embedFn receives (text, type) and
+// is explicitly allowed to dispatch to a different model per type — keying on
+// text alone would hand an image embedder's vector back for the same string of
+// text. NUL separates them so no text can forge a different type's key.
+function _embedCacheKey(input, type) {
+  return `${type}\u0000${input}`;
+}
+
+/**
+ * Embed text, reusing a recent identical result.
+ *
+ * Embedding is the one genuinely expensive step on both hot paths — a full
+ * ONNX forward pass on the neural embedder, or a network round trip on a
+ * hosted one — and it is a pure function of (text, type, embedder). Before
+ * this, nothing in the engine remembered it: re-running a query re-embedded
+ * the query, and re-ingesting identical content re-embedded it too, even
+ * though ingest goes on to recognise it as a duplicate and merge it. §18 calls
+ * that second case idempotent, and it was idempotent at full price.
+ *
+ * Three rules keep it honest:
+ *
+ *   1. FAILURES ARE NEVER CACHED. A failed embed returns a zero vector (or
+ *      throws, under strictEmbeddings). Caching that would let one transient
+ *      embedder outage pin an empty vector to a piece of text for the life of
+ *      the process, and every future ingest of it would silently store the
+ *      dud. A retry has to be a real retry.
+ *   2. Entries are SHARED, not copied. Two entities ingested with identical
+ *      text end up pointing at one array, which is a small memory win on top
+ *      of the saved call — and it holds only because nothing in this engine
+ *      ever writes into a vector. Vectors are read (cosine, JSON.stringify,
+ *      structured clone to the workers) and replaced wholesale, never mutated
+ *      in place. If that ever stops being true, this must start copying.
+ *   3. It is BOUNDED and it is not free. An entry is the text (up to 2000
+ *      chars) plus the vector, so ~8KB each at 512 dims — the 256-entry
+ *      default is on the order of 2MB. Set KALAIROS_EMBED_CACHE=0 to switch it
+ *      off on a memory-constrained box where the workload has no repeats.
+ */
 async function _embed(text, strict, type = "text") {
   const input     = String(text || "").slice(0, 2000);
   const useStrict = strict !== undefined ? strict : CFG.strictEmbeddings;
+  const max       = Number(CFG.embedCacheSize) > 0 ? Math.floor(CFG.embedCacheSize) : 0;
+  const key       = max ? _embedCacheKey(input, type) : null;
+
+  if (key !== null && _embedCache.has(key)) {
+    const hit = _embedCache.get(key);
+    // Re-insert to move this entry to the back of the eviction order.
+    _embedCache.delete(key);
+    _embedCache.set(key, hit);
+    _embedHits++;
+    return hit;
+  }
 
   // Custom embedder (injected via init — used for testing or alternative backends)
   if (typeof CFG.embedFn === "function") {
     try {
       const vec = await CFG.embedFn(input, type);
-      return _normalizeEmbedding(vec, CFG.embeddingDim);
+      const out = _normalizeEmbedding(vec, CFG.embeddingDim);
+      if (key !== null) {
+        _embedMisses++;
+        _embedCache.set(key, out);
+        // Evict oldest-first until we are back inside the bound. A `while`
+        // rather than an `if` so that lowering embedCacheSize on a later
+        // init() cannot leave the cache permanently over its own limit.
+        while (_embedCache.size > max) {
+          _embedCache.delete(_embedCache.keys().next().value);
+        }
+      }
+      return out;
     } catch (err) {
       if (useStrict) throw emitError(Err.embeddingFailed(err.message));
       emitError(Err.embeddingFailed(err.message));
-      return _emptyEmbedding();
+      return _emptyEmbedding(); // deliberately not cached — see rule 1 above
     }
   }
 
@@ -2014,6 +2093,18 @@ async function getStatus({ allowedWorkspaces } = {}) {
     byMemoryType,
     byWorkspace,
     writeQueue: { pending: _pendingWrites.length, max: CFG.writeQueueMax },
+    // Reported, not inferred: whether the embedding cache is earning its
+    // memory depends entirely on the workload, and a cache nobody can measure
+    // is a cache nobody can tune. hitRate is null until something asks.
+    embedCache: {
+      size:    _embedCache.size,
+      max:     Number(CFG.embedCacheSize) > 0 ? Math.floor(CFG.embedCacheSize) : 0,
+      hits:    _embedHits,
+      misses:  _embedMisses,
+      hitRate: (_embedHits + _embedMisses) > 0
+        ? Number((_embedHits / (_embedHits + _embedMisses)).toFixed(4))
+        : null,
+    },
     runningSince:  new Date().toISOString(),
   };
 }
@@ -2566,6 +2657,7 @@ async function listCheckpoints({ workspace } = {}) {
 async function shutdown() {
   if (!_initialized) return; // safe to call even if init() was never called
   _persistAll(); // final flush to backing store
+  _embedCache.clear();
   if (_pool) { await _pool.stop(); _pool = null; }
   if (store?.shutdown) await store.shutdown();
   if (_sqliteIdx) { _sqliteIdx.close(); _sqliteIdx = null; }

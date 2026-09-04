@@ -16,6 +16,7 @@ export const {
   ingestFile,
   query,
   queryAt,
+  queryValidAt,
   queryRange,
   get,
   getMany,

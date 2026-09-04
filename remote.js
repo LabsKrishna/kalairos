@@ -75,6 +75,7 @@ function connect(baseUrl = "http://localhost:3000", { token } = {}) {
     ingestFile:       (filePath, opts = {})           => post("/ingest/file", { filePath, ...opts }),
     query:            (text, opts = {})               => post("/query", { text, ...opts }),
     queryAt:          (text, timestamp, opts = {})    => post("/query", { text, asOf: timestamp, ...opts }),
+    queryValidAt:     (text, timestamp, opts = {})    => post("/query", { text, validAt: timestamp, ...opts }),
     queryRange:       (text, since, until, opts = {}) => post("/query", { text, since, until, ...opts }),
     get:              (id)                            => get(`/entity/${id}`),
     getMany:          (ids)                           => post("/entities/batch", { ids }),
@@ -101,7 +102,8 @@ function connect(baseUrl = "http://localhost:3000", { token } = {}) {
 
     /**
      * Create a bounded remote memory scope. Returns a handle whose methods use
-     * the flat-API vocabulary (`remember`, `query`, `queryAt`, `getHistory`,
+     * the flat-API vocabulary (`remember`, `query`, `queryAt`, `queryValidAt`,
+     * `getHistory`,
      * `getContradictions`) and forward to the server under the hood.
      *
      * @param {object} [opts]
@@ -131,6 +133,8 @@ function connect(baseUrl = "http://localhost:3000", { token } = {}) {
         query:            (text, o = {}) => post(`/agent/${agentId}/recall`, { text, ...o }),
         queryAt:          (text, timestamp, o = {}) =>
                             post(`/agent/${agentId}/recall`, { text, asOf: Number(timestamp), ...o }),
+        queryValidAt:     (text, timestamp, o = {}) =>
+                            post(`/agent/${agentId}/recall`, { text, validAt: Number(timestamp), ...o }),
         queryRange:       (text, since, until, o = {}) =>
                             post(`/agent/${agentId}/recall`, { text, since, until, ...o }),
         getHistory:       (entityId)     => get(`/agent/${agentId}/history/${entityId}`),

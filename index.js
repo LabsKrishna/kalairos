@@ -1472,11 +1472,54 @@ async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), 
  * @param {{ limit?, maxTokens?, filter?: { type?, since?, until?, tags?, memoryType?, workspaceId? }, allowedWorkspaces? }} [opts]
  * @returns {{ count, results, filter, asOf, since, until, config, tokenUsage? }}
  */
+/**
+ * Select the version whose EVENT-TIME validity interval contains `validAt`.
+ *
+ * This is the second bitemporal axis (§14). `asOf` walks ingest time — "what
+ * did we believe on date X". This walks event time — "what was actually true
+ * on date X" — and the two diverge whenever a fact is ingested with a
+ * backdated `effectiveAt`.
+ *
+ * Intervals are DERIVED here rather than read from the stored `validTo`:
+ * sort versions by `effectiveAt` ascending, and each version stays valid until
+ * the next distinct greater `effectiveAt` (or forever, if it is the last).
+ * Deriving is what makes backdated ingest correct — a version written later
+ * but effective earlier slots into its true place in the timeline, which a
+ * stored `validTo` written in ingest order cannot express.
+ *
+ * Ties on `effectiveAt` are broken by `ingestAt`: the most recently learned
+ * belief about that instant wins.
+ *
+ * @param {object[]} versions — entity.versions (stored newest-ingested-first)
+ * @param {number} validAt    — Unix ms on the event-time axis
+ * @returns {object|null} the version valid at `validAt`, or null if the fact
+ *                        was not yet true at that instant.
+ */
+function _versionValidAt(versions, validAt) {
+  const list = (versions || []).filter(Boolean);
+  if (!list.length) return null;
+
+  const eff = (v) => v.validFrom ?? v.effectiveAt ?? v.timestamp ?? 0;
+  const ing = (v) => v.ingestAt ?? v.timestamp ?? 0;
+
+  // Event-time order; later ingest wins a tie on the same effective instant.
+  const byEventTime = [...list].sort((a, b) => (eff(a) - eff(b)) || (ing(a) - ing(b)));
+
+  // The valid version is the last one that became effective at or before
+  // validAt. Everything after it opens a later interval.
+  let found = null;
+  for (const v of byEventTime) {
+    if (eff(v) <= validAt) found = v;
+    else break;
+  }
+  return found;
+}
+
 async function query(text, opts = {}) {
-  if (opts && (opts.asOf != null || opts.since != null || opts.until != null)) {
+  if (opts && (opts.asOf != null || opts.validAt != null || opts.since != null || opts.until != null)) {
     _assertInit();
     throw emitError(Err.validation(
-      "query() does not accept time arguments. Use queryAt(text, timestamp) for time-travel or queryRange(text, since, until) for range queries."
+      "query() does not accept time arguments. Use queryAt(text, timestamp) for ingest-time travel, queryValidAt(text, timestamp) for event-time validity, or queryRange(text, since, until) for range queries."
     ));
   }
   return _queryInternal(text, opts);
@@ -1501,6 +1544,28 @@ async function queryAt(text, timestamp, opts = {}) {
 }
 
 /**
+ * Event-time query: score each entity against the version that was VALID at
+ * `timestamp` in the world, regardless of when we learned it.
+ *
+ * Contrast with `queryAt`, which answers the ingest-time question. For a fact
+ * ingested today but backdated to last month, `queryValidAt(lastMonth)` returns
+ * it and `queryAt(lastMonth)` does not — we did not know it yet. Both answers
+ * are correct; they answer different questions (§14).
+ *
+ * @param {string} text
+ * @param {number} timestamp — Unix ms on the event-time axis
+ * @param {{ limit?, maxTokens?, filter?, allowedWorkspaces? }} [opts]
+ * @returns {{ count, results, filter, asOf, validAt, since, until, config, tokenUsage? }}
+ */
+async function queryValidAt(text, timestamp, opts = {}) {
+  _assertInit();
+  if (!Number.isFinite(Number(timestamp))) {
+    throw emitError(Err.validation("queryValidAt: timestamp must be a finite Unix ms number"));
+  }
+  return _queryInternal(text, { ...opts, validAt: Number(timestamp) });
+}
+
+/**
  * Range query over the version timeline. An entity is included if any version's
  * active interval overlaps `[since, until]`. Each is scored against the version
  * current at `until` (or latest, if `until` is omitted). Either bound may be null
@@ -1520,13 +1585,16 @@ async function queryRange(text, since, until, opts = {}) {
   return _queryInternal(text, { ...opts, since, until });
 }
 
-async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {}, asOf = null, since = null, until = null, allowedWorkspaces } = {}) {
+async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {}, asOf = null, validAt = null, since = null, until = null, allowedWorkspaces } = {}) {
   _assertInit();
 
-  const hasRange = (since !== null && since !== undefined) || (until !== null && until !== undefined);
-  const hasAsOf  = asOf !== null && asOf !== undefined;
-  if (hasAsOf && hasRange) {
-    throw emitError(Err.validation("asOf and { since, until } are distinct query modes — supply one or the other, not both"));
+  const hasRange   = (since !== null && since !== undefined) || (until !== null && until !== undefined);
+  const hasAsOf    = asOf !== null && asOf !== undefined;
+  const hasValidAt = validAt !== null && validAt !== undefined;
+  // The three time modes walk different axes and cannot be combined: asOf is
+  // ingest time, validAt is event time, {since, until} is a timeline span.
+  if ([hasAsOf, hasValidAt, hasRange].filter(Boolean).length > 1) {
+    throw emitError(Err.validation("asOf, validAt and { since, until } are distinct query modes — supply exactly one"));
   }
   const sinceMs = hasRange ? (Number.isFinite(Number(since)) ? Number(since) : -Infinity) : null;
   const untilMs = hasRange ? (Number.isFinite(Number(until)) ? Number(until) :  Infinity) : null;
@@ -1567,6 +1635,32 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
         source:    v.source || e.source || { type: "user" },
         classification: v.classification || e.classification || "internal",
         delta:     v.delta || null,
+      };
+    }).filter(Boolean);
+  }
+
+  // Event-time mode: remap each entity to the version whose validity interval
+  // contains validAt. Unlike asOf, this is keyed on effectiveAt/validFrom, so a
+  // backdated ingest lands in its true place on the world timeline.
+  if (hasValidAt && Number.isFinite(validAt)) {
+    subset = subset.map(e => {
+      const v = _versionValidAt(e.versions, validAt);
+      if (!v) return null; // the fact was not yet true at this instant
+      const historicalLinks = new Set(v.linkIds || []);
+      return {
+        id:        e.id,
+        type:      e.type,
+        text:      v.text,
+        vector:    v.vector,
+        updatedAt: v.effectiveAt ?? v.timestamp,
+        tags:      e.tags || [],
+        links:     historicalLinks.size > 0 ? historicalLinks : e.links,
+        memoryType:  e.memoryType || "long-term",
+        workspaceId: e.workspaceId || "default",
+        source:    v.source || e.source || { type: "user" },
+        classification: v.classification || e.classification || "internal",
+        delta:     v.delta || null,
+        trustScore: e.trustScore,
       };
     }).filter(Boolean);
   }
@@ -1626,8 +1720,8 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
     : null;
   console.time("[kalairos] query");
   const { results: raw, trustBreakdowns } = await _runWorkers(queryVector, queryTerms, subset, {
-    now:        hasAsOf ? asOf : (hasRange ? rangeNow : Date.now()),
-    useRecency: !hasAsOf && !hasRange,
+    now:        hasAsOf ? asOf : (hasValidAt ? validAt : (hasRange ? rangeNow : Date.now())),
+    useRecency: !hasAsOf && !hasValidAt && !hasRange,
   });
   console.timeEnd("[kalairos] query");
 
@@ -1680,13 +1774,14 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
     results,
     filter:  merged,
     asOf,
+    validAt,
     since:   hasRange ? since : null,
     until:   hasRange ? until : null,
     config:  {
       minScore:      CFG.minFinalScore,
       minSemantic:   CFG.minSemanticScore,
       linkThreshold: CFG.linkThreshold,
-      recencyWeight: (hasAsOf || hasRange) ? 0 : CFG.recencyWeight,
+      recencyWeight: (hasAsOf || hasValidAt || hasRange) ? 0 : CFG.recencyWeight,
       trustWeight:   CFG.trustWeight,
     },
   };
@@ -2858,6 +2953,7 @@ module.exports = {
   ingestFile,
   query,
   queryAt,
+  queryValidAt,
   queryRange,
   get,
   getMany,

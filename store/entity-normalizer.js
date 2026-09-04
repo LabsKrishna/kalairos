@@ -136,8 +136,11 @@ function normalizeRaw(raw) {
       prevVersionId = v.versionId;
     }
     // If the entity is soft-deleted, the latest version's validTo should be
-    // closed at deletedAt rather than left open.
-    if (raw.deletedAt && raw.versions[0]?.validTo == null) {
+    // closed at deletedAt rather than left open. Use an explicit null check
+    // (not truthy) — deletedAt=0 is a legitimate epoch timestamp and must
+    // still close the version, matching the !== null/undefined convention
+    // used for deletedAt everywhere else in this function.
+    if (raw.deletedAt !== null && raw.versions[0]?.validTo == null) {
       raw.versions[0].validTo = raw.deletedAt;
     }
   }

@@ -66,7 +66,7 @@ server.tool(
 // 2. kalairos_recall — semantic search
 server.tool(
   "kalairos_recall",
-  "Search memories by semantic similarity. Returns ranked results with scores, provenance, and version info. Supports time-travel via asOf and token-budgeted packing via maxTokens.",
+  "Search memories by semantic similarity. Returns ranked results with scores, provenance, and version info. Two independent time axes: asOf answers \"what did we BELIEVE on date X\" (ingest time) and validAt answers \"what was actually TRUE on date X\" (event time). They give different answers for any fact recorded with a backdated effectiveAt — use validAt when the question is about the world, asOf when it is about the record. Supports token-budgeted packing via maxTokens.",
   {
     text:      z.string().describe("Natural language search query"),
     limit:     z.number().int().min(1).max(100).optional().describe("Max results to return (default: 5)"),
@@ -77,9 +77,10 @@ server.tool(
     workspaceId: z.string().optional().describe("Filter by workspace"),
     since: z.number().optional().describe("Only results created/updated after this Unix ms timestamp"),
     until: z.number().optional().describe("Only results created/updated before this Unix ms timestamp"),
-    asOf:  z.number().optional().describe("Time-travel: return state as of this Unix ms timestamp"),
+    asOf:  z.number().optional().describe("Ingest-time travel: return the state we believed at this Unix ms timestamp. A fact learned later is absent, even if it was already true then. Mutually exclusive with validAt"),
+    validAt: z.number().optional().describe("Event-time validity: return the version that was actually in force at this Unix ms timestamp in the world, regardless of when we learned it. Mutually exclusive with asOf"),
   },
-  async ({ text, limit, maxTokens, type, tags, memoryType, workspaceId, since, until, asOf }) => {
+  async ({ text, limit, maxTokens, type, tags, memoryType, workspaceId, since, until, asOf, validAt }) => {
     try {
       const filter = {};
       if (type)        filter.type = type;
@@ -89,9 +90,13 @@ server.tool(
       if (since)       filter.since = since;
       if (until)       filter.until = until;
       const opts = { limit, maxTokens, filter };
-      const result = asOf != null
-        ? await dbx.queryAt(text, asOf, opts)
-        : await dbx.query(text, opts);
+      if (asOf != null && validAt != null) {
+        throw new Error("asOf and validAt are distinct time axes — supply one or the other, not both");
+      }
+      let result;
+      if (asOf != null)         result = await dbx.queryAt(text, asOf, opts);
+      else if (validAt != null) result = await dbx.queryValidAt(text, validAt, opts);
+      else                      result = await dbx.query(text, opts);
       return ok(result);
     } catch (err) { return fail(err); }
   },

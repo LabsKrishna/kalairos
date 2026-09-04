@@ -613,6 +613,34 @@ function _mirrorToSqlite(entity, row) {
 // Embeddings are supplied by the caller through embedFn(text, type).
 // Database X stays model-agnostic and normalizes the returned vector.
 
+// Vectors are the bulk of what the store holds resident: strip them from a
+// 5,000-entity store and it falls from +319MB RSS to +109MB. The obvious fix
+// is to stop holding 512 boxed doubles per vector and hold a Float32Array
+// instead. It was tried, measured, and it LOSES — recorded here so the next
+// person does not spend the afternoon rediscovering it.
+//
+// Measured, 20,000 entities, after a forced GC, reproducible across runs:
+//
+//                     retained RSS      V8 heap     external
+//   boxed doubles          +246MB        +195MB          0MB
+//   Float32Array           +342MB         +44MB        +78MB
+//
+// The heap saving is real and large. RSS still goes UP by ~96MB, because
+// 40,000 separate 2KB ArrayBuffers (one per entity, one per version) are
+// 40,000 separate small allocations outside the heap, interleaved with the
+// object churn of loading every row. The allocator cannot pack them, and it is
+// RSS — not heap — that a container limit is enforced against, so the trade is
+// backwards for the problem it was meant to solve.
+//
+// The lesson is that the element type was never the issue; the ALLOCATION COUNT
+// is. The version that should work is one contiguous slab with each vector as a
+// subarray view into it: ~82MB in a single allocation, no fragmentation, and a
+// near-empty heap. That has one known obstacle worth knowing before starting —
+// structured clone copies a view's WHOLE backing buffer, so the per-query
+// `postMessage` to the worker pool (see the chunk built in _scoreEntities)
+// would ship the entire slab to every worker on every query. Packing each
+// chunk's candidates into one transferable Float32Array is the way through, and
+// it makes queries cheaper rather than more expensive.
 function _normalizeEmbedding(raw, dim) {
   const arr = Array.isArray(raw?.[0]) ? raw[0] : raw;
   if (!Array.isArray(arr)) throw new Error("Embedding is not an array");

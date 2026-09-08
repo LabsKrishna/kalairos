@@ -111,6 +111,8 @@
     "kernel.js",
     "versioning.js",
     "trust.js",
+    "content-risk.js",
+    "directive-shape.js",
     "worker-pool.js",
     "cpu.js",
     "worker.js",

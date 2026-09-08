@@ -70,6 +70,14 @@ const DEFAULTS = {
   minFinalScore:      Number(process.env.KALAIROS_MIN_SCORE         || 0.45),
   minSemanticScore:   Number(process.env.KALAIROS_MIN_SEMANTIC      || 0.35),
   maxVersions:        Number(process.env.KALAIROS_MAX_VERSIONS      || 0), // 0 = unlimited
+  // Companion cap for the provenance trail. Trail events accrue on a SEPARATE
+  // axis from versions: annotate() writes no version at all and still appends
+  // one, so a store whose content never changes can still grow without limit.
+  // Default 0 (unlimited) matches maxVersions and, more to the point, matches
+  // what an audit trail is for — dropping the oldest records by default would
+  // quietly undercut the append-only guarantee the compliance story rests on.
+  // The knob exists for memory-constrained deployments that opt out knowingly.
+  maxTrailEvents:     Number(process.env.KALAIROS_MAX_TRAIL_EVENTS  || 0), // 0 = unlimited
   strictEmbeddings:   (process.env.KALAIROS_STRICT_EMBEDDINGS       || "1") !== "0",
   dataFile:           path.join(process.cwd(), "data.kalairos"),
   // embedFn(text, type) — inject your own: `async (text, type) => number[]`.
@@ -295,6 +303,11 @@ function _appendTrailEvent(entity, event) {
   }
   if (!Array.isArray(entity.trailEvents)) entity.trailEvents = [];
   entity.trailEvents.unshift(event);
+  // Newest-first, so truncating from the end drops the oldest events — the
+  // same shape as the version cap in _ingestInternal.
+  if (CFG.maxTrailEvents > 0 && entity.trailEvents.length > CFG.maxTrailEvents) {
+    entity.trailEvents.length = CFG.maxTrailEvents;
+  }
 }
 
 // Build a content version record with the full audit shape.

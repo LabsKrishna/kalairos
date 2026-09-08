@@ -369,7 +369,14 @@ app.post("/import/markdown", _requireAuth("write"), _wrap(async (req) => {
 
 // ─── Agent Helper ─────────────────────────────────────────────────────────────
 
+// Handles created by POST /agent/create. Each entry is a thin MemoryScope
+// wrapper — the memories themselves live in the engine, not here — so this is
+// a slow drip rather than a fast leak. It is still a client-controlled Map that
+// nothing ever removed from, which over a long-running process is a leak.
+// Bounded, and pairs with DELETE /agent/:agentId so callers can release their
+// own handles rather than waiting to be evicted.
 const _agents = new Map();
+const AGENTS_MAX = Number(process.env.KALAIROS_MAX_AGENTS || 1000);
 let _agentSeq = 0;
 
 function _resolveAgent(req, res, next) {
@@ -386,8 +393,22 @@ app.post("/agent/create", _requireAuth("write"), _wrap(async (req) => {
   const agent = lib.createAgent({ name, defaultClassification, defaultTags, useLLM });
   const agentId = String(++_agentSeq);
   _agents.set(agentId, { agent, allowedWorkspaces: req.allowedWorkspaces, principal: req.principal });
+  // Map iteration is insertion order, so the first key is always the oldest
+  // handle. Evicting it costs the caller a 404 on a handle they abandoned;
+  // keeping it costs the process memory it never gets back.
+  while (_agents.size > AGENTS_MAX) {
+    _agents.delete(_agents.keys().next().value);
+  }
   auth.audit("agent_create", { principal: req.principal, detail: name });
   return { success: true, agentId, name: agent.name };
+}));
+
+app.delete("/agent/:agentId", _resolveAgent, _requireAuth("write"), _wrap(async (req) => {
+  // Releases the server-side handle only. Memories the agent wrote are the
+  // engine's and are untouched — use DELETE /entity/:id to remove those.
+  _agents.delete(req.params.agentId);
+  auth.audit("agent_delete", { principal: req.principal, detail: req.params.agentId });
+  return { success: true, released: req.params.agentId };
 }));
 
 app.post("/agent/:agentId/remember", _resolveAgent, _requireAuth("write"), _wrap(async (req) => {

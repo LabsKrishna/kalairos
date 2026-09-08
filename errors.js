@@ -53,6 +53,7 @@ const Codes = {
   AUTH_FAILED:        "ERR_AUTH_FAILED",
   FORBIDDEN:          "ERR_FORBIDDEN",
   WRITE_QUEUE_FULL:   "ERR_WRITE_QUEUE_FULL",
+  WORKER_QUEUE_FULL:  "ERR_WORKER_QUEUE_FULL",
   TEXT_TOO_LONG:      "ERR_TEXT_TOO_LONG",
 };
 
@@ -191,6 +192,14 @@ const Err = {
     new KalairosError(Codes.WORKER_FAILED, `Worker scoring failed: ${detail}`, {
       recoverable: true,
       suggestion: "Query will retry on the main thread if workers fail.",
+    }),
+
+  workerQueueFull: (depth, max) =>
+    new KalairosError(Codes.WORKER_QUEUE_FULL,
+      `Worker scoring queue is full (${depth}/${max} waiting). Retry after a short delay.`, {
+      recoverable: true,
+      suggestion: "Reduce concurrent query rate, or raise the cap via KALAIROS_WORKER_QUEUE_MAX.",
+      context: { queueDepth: depth, queueMax: max },
     }),
 
   authFailed: () =>

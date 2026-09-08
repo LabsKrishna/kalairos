@@ -121,6 +121,83 @@ await test("a stopped pool releases every worker", async () => {
   assert.equal(pool._workers.length, 0);
 });
 
+// ── WorkerPool failure handling — the leak regressions ───────────────────────
+// Each of these was a measured leak, not a hypothetical one. A worker dying is
+// the expected failure on the small containers cpu.js exists for, and every
+// path out of that used to either retain memory or hang the caller forever.
+console.log("\n── WorkerPool failure handling ───────────────────────────────────");
+
+const settle = (ms = 400) => new Promise(r => setTimeout(r, ms));
+
+await test("stop() settles queued jobs instead of abandoning their promises", async () => {
+  const pool = new WorkerPool(1);
+  pool.start();
+  await settle(300);
+  let settled = 0;
+  for (let i = 0; i < 50; i++) {
+    pool.run({ chunk: [], queryVector: [], queryTerms: [], config: {} })
+      .then(() => settled++, () => settled++);
+  }
+  await pool.stop();
+  await settle();
+  assert.equal(settled, 50,
+    `only ${settled}/50 queued callers were settled — the rest wait on a promise nothing will resolve`);
+});
+
+await test("a dead worker is replaced and never left advertised as idle", async () => {
+  const pool = new WorkerPool(1);
+  pool.start();
+  await settle(300);
+  await pool._workers[0].worker.terminate();
+  await settle();
+  try {
+    assert.ok(pool._workers[0], "the pool did not replace the dead worker");
+    for (const idx of pool._idle) {
+      assert.ok(pool._workers[idx], `_idle advertises dead slot ${idx} — the next dispatch writes to null`);
+    }
+    const results = await pool.run({ chunk: [], queryVector: [], queryTerms: [], config: {} });
+    assert.ok(Array.isArray(results), "the replaced worker cannot run jobs");
+  } finally {
+    await pool.stop();
+  }
+});
+
+await test("with no live worker left, run() rejects rather than queueing forever", async () => {
+  // maxRespawns: 0 is the pool that has given up. Queued jobs pin their whole
+  // chunk — every candidate's text and vector — so holding them is the leak.
+  const pool = new WorkerPool(1, { maxRespawns: 0 });
+  pool.start();
+  await settle(300);
+  await pool._workers[0].worker.terminate();
+  await settle();
+  try {
+    assert.equal(pool._liveCount(), 0, "expected the pool to have no live workers");
+    let rejected = 0;
+    await Promise.all(Array.from({ length: 25 }, () =>
+      pool.run({ chunk: new Array(500).fill({ v: 1 }), queryVector: [], config: {} }).catch(() => rejected++)));
+    assert.equal(rejected, 25, `${25 - rejected} jobs are still waiting on a pool that cannot run them`);
+    assert.equal(pool._queue.length, 0, `_queue retained ${pool._queue.length} chunks`);
+  } finally {
+    await pool.stop();
+  }
+});
+
+await test("the wait queue is bounded and reports backpressure", async () => {
+  const pool = new WorkerPool(1, { queueMax: 5 });
+  pool.start();
+  await settle(300);
+  try {
+    const codes = [];
+    await Promise.all(Array.from({ length: 40 }, () =>
+      pool.run({ chunk: [], queryVector: [], queryTerms: [], config: {} }).catch(e => codes.push(e.code))));
+    assert.ok(pool._queue.length <= 5, `queue grew to ${pool._queue.length} past its cap of 5`);
+    assert.ok(codes.includes("ERR_WORKER_QUEUE_FULL"),
+      `no backpressure signal raised; saw ${JSON.stringify([...new Set(codes)])}`);
+  } finally {
+    await pool.stop();
+  }
+});
+
 // ── Results ──────────────────────────────────────────────────────────────────
 console.log(`\n${"─".repeat(60)}`);
 const total = passed + failed;

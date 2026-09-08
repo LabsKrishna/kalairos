@@ -4,9 +4,134 @@ All notable changes to Kalairos. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.9.0] — 2026-09-08
+
+Headline: **the second time axis, and four unbounded-growth paths closed.**
+`validAt` answers what was actually true on a date, not merely what we had
+recorded by then — two different questions, of which the engine only ever
+answered one. Alongside it, ingest gained a content-risk signal that fires on first
+touch, and four places where a long-running process grew without limit are now
+bounded.
+
+**Note for npm users:** 1.8.0 was tagged but never published to the registry,
+so the last release you can install is 1.7.0. Everything in the 1.8.0 entry
+below ships here — including the three workspace-isolation fixes that close
+cross-tenant leaks on the write path.
+
+### Added
+
+- **Event-time queries — `query(text, { validAt })` and `scope.queryValidAt()`.**
+  `asOf` travels *ingest* time: the state we had recorded by a date, so a fact
+  learned later is invisible even if it was already true. That is the auditor's
+  question. `validAt` travels *event* time: what was actually in force in the
+  world on that date. A fact recorded with a backdated `effectiveAt` gives the
+  two axes genuinely different answers. Versions are ordered by `effectiveAt`,
+  each valid until the next distinct greater one, with `ingestAt` breaking ties
+  so the most recently learned correction wins a same-instant conflict.
+  Supplying both axes at once is an error rather than a silent precedence rule.
+
+- **Content-risk scoring at ingest — opt-in `contentRiskFn`.** Every other
+  trust signal is structural: it reasons about the shape of an entity's version
+  history — source type, corroboration, contradictions, recency. None inspect
+  what the claim actually says, which leaves a specific hole. A poisoned fact
+  that arrives cleanly (first assertion about an entity, plausible source,
+  nothing yet to contradict it) scored base × recency and passed at full trust.
+  The verdict is stored on both the entity and the version record and folds
+  into the composite as a bounded, monotonic multiplier. Off by default: no
+  detector configured means no network call and a multiplier of exactly 1.0.
+
+- **Structural poison detection (`directive-shape.js`)** — deterministic,
+  offline, no model. Poisoned "facts" share a shape: they are imperatives aimed
+  at whoever reads them next. The discriminator against reported speech ("the
+  phishing email instructed the employee to disable MFA") is not whether a
+  command is present but whether it is addressed to the reader or reported
+  about someone else. Held-out recall 0.67, false positives 0.00, and evasion
+  recall 0.00 — the limit is published rather than discovered later. Ships in
+  the free tier.
+
+- **`maxTrailEvents` / `KALAIROS_MAX_TRAIL_EVENTS`** — companion cap to
+  `maxVersions` for the provenance trail. See *Fixed* below.
+
+- **`DELETE /agent/:agentId`** on the REST server, to release a handle created
+  by `POST /agent/create`. Drops the server-side handle only; memories the
+  agent wrote belong to the engine and are untouched.
+
+### Changed
+
+- **Embeddings are cached across calls.** Embedding is the one genuinely
+  expensive step on both hot paths — a full ONNX forward pass locally, or a
+  network round trip on a hosted embedder — and it is a pure function of
+  (text, type, embedder). Nothing remembered it: re-running a query re-embedded
+  the query, and re-ingesting identical content re-embedded it before
+  recognising it as a duplicate — idempotent, but idempotent at full price. Against the real 768-dim neural embedder, four distinct
+  queries asked six times each: **277ms → 45ms** (11.6ms → 1.9ms per query),
+  hit rate 0.72. Bounded LRU, 256 entries by default (~2MB);
+  `KALAIROS_EMBED_CACHE=0` disables it. Failed embeds are never cached, so a
+  retry is a real retry.
+
+- **The JSONL store loads in chunks rather than all at once.**
+  `readFileSync(...).split("\n").filter(Boolean)` held three complete copies of
+  the store alive simultaneously — the decoded string, the split array, the
+  filtered array — before a single row was parsed. That transient, not the
+  resident store, is what kills a small container: the process dies inside
+  `init()` before it binds a port, so the platform reports a restart and the
+  application log has nothing to say about it.
 
 ### Fixed
+
+- **A dead worker thread no longer leaks the queue behind it.** A worker exit
+  nulled its slot and gave up: the index stayed in `_idle` so the dead slot kept
+  being handed out, nothing respawned so the pool shrank toward zero, and
+  `run()` queued into an unbounded array. Once nothing was alive, every query
+  parked a job nothing could drain — and each job pins its whole payload, one
+  chunk of candidate entities carrying full text and full embedding vectors.
+  Terminating both workers of a 2-worker pool and issuing 25 queries retained
+  **285.1MB**; it now retains **0.0MB**. The caller side was worse than the
+  memory: `_scoreParallel` awaits these, so a stuck job hung `query()` forever,
+  and in the REST server that pinned the request and response objects with it.
+  `stop()` then cleared the queue without settling it, leaving 48 of 50 callers
+  on a promise nothing would ever resolve.
+
+  Dead workers are now replaced (the likely cause is an OOM kill on a small
+  container, not a bug in `worker.js`), with a respawn budget so a worker that
+  crashes at startup cannot loop forever. `_idle` only ever holds live slots.
+  The wait queue is bounded and reports backpressure as
+  `ERR_WORKER_QUEUE_FULL`. `run()` fails fast when nothing is alive, and
+  `stop()` rejects queued and in-flight jobs instead of dropping them. New
+  knobs: `KALAIROS_WORKER_QUEUE_MAX` (256), `KALAIROS_WORKER_MAX_RESPAWNS` (32).
+
+- **The provenance trail grows without limit.** `maxVersions` has capped
+  `versions[]` since it was added; `trailEvents[]` had no cap, no knob and no
+  default — and it grows on a separate axis. `annotate()` writes no version at
+  all and still appends a trail event, so a store whose content never changes
+  once could still grow forever. 2000 `annotate()` calls against one entity,
+  with versions held at 1: **2000 events / +1.22MB heap / 740KB of JSONL for a
+  single entity**, now **100 / +0.41MB / 60KB** under `maxTrailEvents: 100`.
+
+  The default is `0` (unlimited), matching `maxVersions` and matching what an
+  audit trail is for — dropping the oldest records by default would undercut
+  the append-only guarantee the compliance story rests on. The knob is for
+  memory-constrained deployments that opt out knowingly; leaving it unset is
+  byte-identical to previous behaviour.
+
+- **Agent handles on the REST server were never released.**
+  `POST /agent/create` wrote into a map nothing ever deleted from. Each entry is
+  a thin `MemoryScope` wrapper — the memories live in the engine — so it is a
+  slow drip rather than a fast leak (4000 handles did not move RSS out of the
+  noise), but it is still a client-controlled map with no eviction in a process
+  meant to run for months. Bounded at `KALAIROS_MAX_AGENTS` (default 1000,
+  oldest evicted first), paired with the new `DELETE` route above.
+
+- **`zod` is declared as a direct dependency.** `mcp.js` requires it but only
+  received it by hoisting from `@modelcontextprotocol/sdk`. Under a strict,
+  non-hoisting `node_modules` layout (pnpm's default) that resolution fails and
+  `kalairos-mcp` cannot start. The range mirrors the SDK's own so the two
+  always dedupe.
+
+- **Hosted NemoGuard requests went to the wrong path**, and **an unparsed
+  detector response is no longer treated as safe.** A response the adapter
+  could not parse previously fell through to a zero-risk verdict — failing open
+  on the one signal whose whole job is to fail closed.
 
 - **Worker-thread and ONNX thread pools are sized from the container's CPU
   quota, not the host's core count.** `os.cpus()` reports the physical host's
@@ -34,10 +159,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `examples/support-agent-demo.js` went with them; the directory no longer
   exists.
 
-  **Breaking — this warrants a major bump.** `kalairos demo` was a public CLI
-  command, and it is being removed without the deprecation window this project
-  normally gives a public surface. The programmatic API (`init`, `ingest`,
-  `query`, `remember`, `getHistory`) is untouched.
+  **Breaking, shipped in a minor.** `kalairos demo` was a public CLI command
+  removed without the deprecation window this project normally gives a public
+  surface, which on a strict reading calls for a major bump. It ships here in a
+  minor because the removal is soft: the command now prints the usage banner
+  and exits 0, so a script that still calls it degrades to help output rather
+  than crashing. The programmatic API (`init`, `ingest`, `query`, `remember`,
+  `getHistory`) is untouched. If you invoke the CLI from automation, pin
+  exactly.
 
   **Migration:** there is none — the demo was zero-config scaffolding with no
   state and no API. `kalairos demo` now prints the usage banner and exits 0

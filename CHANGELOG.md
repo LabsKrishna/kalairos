@@ -4,6 +4,88 @@ All notable changes to Kalairos. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Headline: **a fresh install now works the way the README says it does.**
+Installing from npm and running the quickstart, the MCP server and the HTTP
+server turned up a set of failures that the test suite never exercised. The
+largest: no install had ever downloaded the neural embedder, so every npm user
+was running on bag-of-words, where paraphrased questions return nothing and an
+update worded differently from the fact it replaces never becomes a version.
+
+### Security
+
+- **The `/auth/*` routes required no authentication.** With auth enabled, an
+  anonymous caller could create an owner principal (and receive its token) or
+  call `POST /auth/disable` and then read everything. Once auth is on, every
+  `/auth/*` route except `/auth/status` now needs an owner token, and an owner
+  can grant, revoke, create or remove principals only on workspaces it owns.
+  Disabling auth needs an owner of every workspace. Enabling auth is refused
+  until an owner principal exists, so it cannot lock every caller out.
+  Re-adding an existing principal id is refused instead of silently replacing
+  its roles while its old token kept working. Audit entries for these actions
+  now record who performed them.
+- **The HTTP server binds `127.0.0.1` by default** (was `0.0.0.0`). Auth is off
+  until enabled, so the old default exposed the whole store to the network.
+  Set `KALAIROS_HOST=0.0.0.0` to serve remotely; the Dockerfile does. The
+  server warns at startup when it listens beyond loopback with auth off.
+  **Behavior change:** a remote deployment that relied on the old default must
+  now set `KALAIROS_HOST`.
+
+### Fixed
+
+- **The neural embedder was never downloaded.** postinstall requested
+  `releases/download/v<version>/model_int8.onnx`, an asset no release has ever
+  carried, and failed silently. It now fetches the published `v1.6.0/model.onnx`
+  and always verifies a pinned SHA-256, before the file becomes visible as
+  `model.onnx`, not after. `KALAIROS_MODEL_DIR` is now also where the embedder
+  looks, not only where the downloader writes.
+- **Stores written by another embedder are re-embedded on startup.** Vectors of
+  a different width (a bag-of-words store opened once the model is present, or
+  a switched provider) could not be compared with queries. Cosine over
+  mismatched arrays returned NaN, which passed every score floor, so old
+  memories surfaced with `score: null` or not at all. `init()` now re-embeds
+  entity and version vectors from their stored text when the embedding width is
+  known (the built-in embedders, or `init({ embedFn, embeddingDim })`). Cosine
+  scores mismatched widths as 0 instead of NaN.
+- **The MCP server corrupted its own transport.** `query()` timed itself with
+  `console.time`, which prints to stdout, the JSON-RPC channel, so every
+  `kalairos_recall` wrote a non-protocol line into the stream. Overlapping
+  queries also collided on the shared timer label. The MCP server now reports
+  the package version instead of `1.0.0`.
+- **Scripts that never called `shutdown()` hung forever.** Idle worker threads
+  held the process open. They are now unref'd while idle and only hold the
+  process while a job is in flight. Writes were already durable without
+  `shutdown()`.
+- **`npm start` ignored `KALAIROS_DATA_FILE`.** The CLI and MCP server honored
+  it, but the HTTP server opened `./data.kalairos` regardless. `init()` now
+  defaults to it.
+- **`kalairos import` wrote unsearchable memories.** It embedded with a private
+  64-dim embedder whose vocabulary depended on encounter order, so nothing it
+  imported could be found by the server. It now uses the default embedder.
+  `kalairos export` loads no embedder at all.
+- **README examples failed as written.** Both full examples used a toy
+  embedder that scores almost any two sentences as similar: the quickstart
+  merged unrelated facts into one entity, and the compliance audit crashed on
+  an empty result. The quickstart also combined `require()` with top-level
+  `await`, which runs in no Node module type. Both now use the default
+  embedder, and the quickstart uses `import`.
+- The HTTP server no longer advertises a dashboard at `/` that does not exist.
+
+### Added
+
+- **`kalairos model [--force]`** downloads the neural embedder on demand, for
+  installs that skip postinstall (pnpm and bun by default, `--ignore-scripts`,
+  CI). When the model is missing, `init()` now says what that costs and names
+  this command.
+
+### Changed
+
+- **`better-sqlite3` is an optional dependency.** It backs the opt-in SQLite
+  index (`KALAIROS_INDEX_SQLITE=1`) and is a native addon, so a missing
+  prebuilt binary or toolchain used to fail `npm install kalairos` outright.
+  Enabling the index without it now raises an error naming the fix.
+
 ## [1.9.0] — 2026-09-08
 
 Headline: **the second time axis, and four unbounded-growth paths closed.**

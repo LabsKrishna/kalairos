@@ -47,8 +47,23 @@ const {
 // SQLite hybrid index (KAL-108). Loaded lazily inside _initSqliteIndex so
 // users with KALAIROS_INDEX_SQLITE unset never pay the require cost.
 let _sqliteModule = null;
+// better-sqlite3 is an optional dependency: it is a native addon, and a missing
+// prebuilt binary or build toolchain must not fail `npm install kalairos` for
+// the majority who never turn the index on.
 function _loadSqliteModule() {
-  if (!_sqliteModule) _sqliteModule = require("./store/sqlite-index");
+  if (!_sqliteModule) {
+    try {
+      _sqliteModule = require("./store/sqlite-index");
+    } catch (err) {
+      if (err.code === "MODULE_NOT_FOUND" && /better-sqlite3/.test(err.message)) {
+        throw new Error(
+          "[kalairos] KALAIROS_INDEX_SQLITE=1 needs the optional better-sqlite3 package, which is not installed.\n" +
+          "  Install it with `npm install better-sqlite3`, or unset KALAIROS_INDEX_SQLITE to use the JSONL store alone."
+        );
+      }
+      throw err;
+    }
+  }
   return _sqliteModule;
 }
 

@@ -573,6 +573,7 @@ const trail = await history.trail({ entity: id });
 | `KALAIROS_HOST`                  | `127.0.0.1` | HTTP server bind address (`0.0.0.0` for remote access) |
 | `KALAIROS_DATA_FILE`             | `./data.kalairos` | Data file for `init()`, the server, the MCP server and the CLI |
 | `KALAIROS_MODEL_DIR`             | `~/.kalairos` | Where the neural embedder is downloaded and loaded from |
+| `KALAIROS_INDEX_SQLITE`          | unset   | `1` enables the SQLite index (needs the optional `better-sqlite3`) |
 
 ---
 

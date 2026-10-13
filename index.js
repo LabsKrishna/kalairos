@@ -1735,12 +1735,14 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
   const rangeNow = hasRange
     ? (Number.isFinite(untilMs) ? untilMs : Date.now())
     : null;
-  console.time("[kalairos] query");
+  // Not console.time: timeEnd prints to stdout, which is the MCP server's
+  // JSON-RPC channel, and its one shared label collides when queries overlap.
+  const startedAt = performance.now();
   const { results: raw, trustBreakdowns } = await _runWorkers(queryVector, queryTerms, subset, {
     now:        hasAsOf ? asOf : (hasValidAt ? validAt : (hasRange ? rangeNow : Date.now())),
     useRecency: !hasAsOf && !hasValidAt && !hasRange,
   });
-  console.timeEnd("[kalairos] query");
+  console.error(`[kalairos] query: ${(performance.now() - startedAt).toFixed(3)}ms`);
 
   const sorted = raw
     .sort((a, b) => b.score - a.score)

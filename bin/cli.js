@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // bin/cli.js — Kalairos CLI
-// Usage: kalairos start | kalairos status | kalairos query <text>
+// Usage: kalairos start | kalairos status | kalairos query <text> | kalairos model
 //        kalairos export [--out file.md] [--include-history]
 //        kalairos import <file.md>
 "use strict";
@@ -107,6 +107,16 @@ if (cmd === "start") {
     process.exit(1);
   });
 
+} else if (cmd === "model") {
+  // kalairos model [--force] — fetch the neural embedder. postinstall tries
+  // this too, but pnpm, bun, --ignore-scripts and CI all skip postinstall.
+  require("../scripts/download-model")
+    .downloadModel({ force: hasFlag("--force") })
+    .catch(err => {
+      console.error(`[kalairos] model download failed: ${err.message}`);
+      process.exit(1);
+    });
+
 } else if (cmd === "migrate") {
   console.error("[kalairos] 'kalairos migrate' requires Kalairos Enterprise (PostgreSQL/pgvector).");
   console.error("  See https://github.com/LabsKrishna/kalairos#enterprise for upgrade information.");
@@ -124,6 +134,7 @@ if (cmd === "start") {
   console.log("         [--data <path>]             ...override data file (default: data.kalairos)");
   console.log("  kalairos import <file.md>          Ingest a markdown file back into local memory");
   console.log("         [--data <path>]             ...override data file (default: data.kalairos)");
+  console.log("  kalairos model [--force]           Download the neural embedder to ~/.kalairos (~105 MB)");
   console.log("  kalairos migrate [file]            [Enterprise] Import data.kalairos → PostgreSQL");
   console.log("");
   console.log("Environment:");

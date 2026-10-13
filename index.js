@@ -463,7 +463,11 @@ async function init(overrides = {}) {
     if (embedderResult.loaded === "neural") {
       console.error("[kalairos] neural embedder loaded (768-dim)");
     } else {
-      console.error("[kalairos] neural embedder unavailable; using built-in bag-of-words (128-dim)");
+      // Say what this costs and how to fix it. Bag-of-words matches shared
+      // words only: paraphrased questions find nothing, and an update worded
+      // differently from the fact it replaces lands as a separate entity.
+      console.error("[kalairos] neural embedder unavailable; using built-in bag-of-words (128-dim).");
+      console.error("[kalairos]   Recall and update detection are much weaker without it. Run `npx kalairos model` to download it (~105 MB).");
     }
   }
 

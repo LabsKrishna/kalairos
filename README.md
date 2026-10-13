@@ -84,7 +84,15 @@ Kalairos makes those properties structural, not bolted on. Every returned fact c
 npm install kalairos
 ```
 
-Local-first. No cloud service. No API key required. Bring any embedder. JSONL on disk — human-readable, git-friendly, easy to back up.
+Local-first. No cloud service. No API key required. JSONL on disk — human-readable, git-friendly, easy to back up.
+
+Install also downloads a local neural embedder (~105 MB, to `~/.kalairos`). If your package manager skipped install scripts (pnpm and bun do by default, as does `--ignore-scripts`), fetch it once with:
+
+```bash
+npx kalairos model
+```
+
+Without it Kalairos still runs, on a built-in bag-of-words embedder that only matches shared words. It warns you at startup when that happens. Stores written before the model arrived are re-embedded automatically on the next start.
 
 ---
 
@@ -564,6 +572,7 @@ const trail = await history.trail({ entity: id });
 | `KALAIROS_PORT`                  | `3000`  | HTTP server port                           |
 | `KALAIROS_HOST`                  | `127.0.0.1` | HTTP server bind address (`0.0.0.0` for remote access) |
 | `KALAIROS_DATA_FILE`             | `./data.kalairos` | Data file for `init()`, the server, the MCP server and the CLI |
+| `KALAIROS_MODEL_DIR`             | `~/.kalairos` | Where the neural embedder is downloaded and loaded from |
 
 ---
 

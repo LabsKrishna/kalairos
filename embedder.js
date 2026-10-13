@@ -79,6 +79,7 @@ function _resolveModelDir() {
 
   const candidates = [
     process.env.KALAIROS_EMBEDDER_PATH,
+    process.env.KALAIROS_MODEL_DIR, // where scripts/download-model.js writes when set
     path.join(os.homedir(), ".kalairos"),
     path.join(process.cwd(), "kalairos-model"),
   ].filter(Boolean);

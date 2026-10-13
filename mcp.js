@@ -34,12 +34,12 @@ function fail(err) {
 
 const serverName = process.env.KALAIROS_MCP_NAME || "kalairos";
 const server = new McpServer(
-  { name: serverName, version: "1.0.0" },
+  { name: serverName, version: require("./package.json").version },
   { capabilities: { tools: {} } },
 );
 
 // ─── Tools ───────────────────────────────────────────────────────────────────
-// 14 tools covering the full agent memory lifecycle.
+// Tools covering the full agent memory lifecycle.
 
 // 1. kalairos_remember — store or update a memory
 server.tool(

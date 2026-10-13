@@ -62,7 +62,9 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-mcp-"));
 
     await tool("kalairos_remember", { text: "Deploys go out every Friday afternoon" });
     await tool("kalairos_remember", { text: "The staging database is reset nightly" });
-    const recall = await tool("kalairos_recall", { text: "when do deploys happen?" });
+    // Worded to match under either embedder: CI has no cached ONNX model, so
+    // the server falls back to bag-of-words, which needs shared words.
+    const recall = await tool("kalairos_recall", { text: "when do deploys go out?" });
     assert.ok(recall.results?.length > 0 || recall.count > 0 || Array.isArray(recall), "recall returns a result");
     console.log("  [ok] remember and recall work over stdio");
 

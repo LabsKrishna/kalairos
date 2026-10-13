@@ -625,11 +625,18 @@ app.get("/auth/audit", _requireOwner, _wrap(async (req) => {
 
 lib.init({ strictEmbeddings: false }).then(() => {
   const PORT = Number(process.env.KALAIROS_PORT) || 3000;
-  // KALAIROS_HOST=127.0.0.1 restricts the listener to loopback — recommended
-  // when the server backs a local agent stack rather than serving remotely.
-  const HOST = process.env.KALAIROS_HOST || "0.0.0.0";
+  // Loopback by default. Auth is off until someone enables it, so listening on
+  // every interface handed the whole store to anyone on the network. Set
+  // KALAIROS_HOST=0.0.0.0 to serve remotely (the Dockerfile does), and enable
+  // auth when you do.
+  const HOST = process.env.KALAIROS_HOST || "127.0.0.1";
   const server = app.listen(PORT, HOST, () => {
-    console.log(`Kalairos running on http://localhost:${PORT}`);
+    console.log(`Kalairos running on http://${HOST}:${PORT}`);
+    if (HOST === "127.0.0.1" || HOST === "localhost" || HOST === "::1") {
+      console.log("  (loopback only; set KALAIROS_HOST=0.0.0.0 to accept remote connections)");
+    } else if (!auth.enabled) {
+      console.log("  WARNING: listening beyond loopback with auth disabled. Anyone who can reach this port can read and delete every memory.");
+    }
     console.log("Endpoints:");
     console.log("  POST   /ingest                  { text, type?, metadata?, tags?, timestamp?, source?, classification?, retention?, memoryType?, workspaceId?, useLLM? }");
     console.log("  POST   /remember                { text, type?, metadata?, tags?, timestamp?, source?, classification?, retention?, memoryType?, workspaceId?, useLLM? }");

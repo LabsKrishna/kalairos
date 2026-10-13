@@ -562,6 +562,7 @@ const trail = await history.trail({ entity: id });
 | `KALAIROS_STRICT_EMBEDDINGS`     | `1`     | Require embedder (`0` to disable)          |
 | `KALAIROS_MAX_WORKERS`           | `auto`  | Worker threads (default: cgroup CPU quota) |
 | `KALAIROS_PORT`                  | `3000`  | HTTP server port                           |
+| `KALAIROS_HOST`                  | `127.0.0.1` | HTTP server bind address (`0.0.0.0` for remote access) |
 | `KALAIROS_DATA_FILE`             | `./data.kalairos` | Data file for `init()`, the server, the MCP server and the CLI |
 
 ---
@@ -577,10 +578,12 @@ const trail = await history.trail({ entity: id });
 ## HTTP server
 
 ```bash
-npx kalairos          # starts on localhost:3000
+npx kalairos          # starts on 127.0.0.1:3000
 ```
 
 Core endpoints mirror the flat API (`/remember`, `/query`, `/history/:id`, etc.). See `server.js` for the full route list.
+
+The server listens on loopback only. To serve other machines, set `KALAIROS_HOST=0.0.0.0` and turn on auth: create an owner with `POST /auth/principals` (`{ "id": "ops", "name": "Ops", "workspaces": { "default": "owner" } }`, which returns its token once), then `POST /auth/enable`. From then on every route, including the `/auth/*` routes, needs `Authorization: Bearer <token>`. Auth settings live in memory, so repeat this after a restart.
 
 ---
 

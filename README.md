@@ -98,22 +98,21 @@ Without it Kalairos still runs, on a built-in bag-of-words embedder that only ma
 
 ## Layer 1 — Three calls and you're done
 
-`init`, `remember`, `query`. Most agents need nothing more.
+`init`, `remember`, `query`. Most agents need nothing more. Save this as `app.mjs` and run `node app.mjs`:
 
 ```js
-const kalairos = require('kalairos');
-const embed = async (t) => [...t].map(c => c.charCodeAt(0) / 255); // toy embedder
+import kalairos from 'kalairos';
 
-await kalairos.init({ embedFn: embed });
+await kalairos.init();
 
 await kalairos.remember('User prefers concise bullet points');
 await kalairos.remember('Customer is on the $10/month plan');
 
 const { results } = await kalairos.query('what plan are they on?');
-console.log(results[0].text);
+console.log(results[0].text); // → "Customer is on the $10/month plan"
 ```
 
-Swap the toy embedder for OpenAI, Cohere, or any `async (text) => number[]` when you're ready.
+To use a hosted embedder instead, pass any `async (text) => number[]` and its width: `init({ embedFn, embeddingDim: 1536 })`. Declaring the width lets Kalairos re-embed old memories if you ever switch models.
 
 ---
 
@@ -229,8 +228,7 @@ The scenarios above, as one runnable script. A policy pipeline records a regulat
 const kalairos = require('kalairos');
 
 async function main() {
-  const embed = async (t) => [...t].map(c => c.charCodeAt(0) / 255).slice(0, 64); // toy embedder
-  await kalairos.init({ embedFn: embed, dataFile: ':memory:' });
+  await kalairos.init({ dataFile: ':memory:' });
 
   // Every write from this pipeline carries provenance + data classification.
   const policy = kalairos.scope({

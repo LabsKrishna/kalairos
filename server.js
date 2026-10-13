@@ -503,17 +503,58 @@ app.post("/agent/:agentId/annotate", _resolveAgent, _requireAuth("write"), _wrap
 }));
 
 // ─── Auth Management ─────────────────────────────────────────────────────────
-// These endpoints are only available when auth is enabled. They require the
-// "owner" role on at least one workspace. In production, consider restricting
-// these to an admin-only listener or API key.
+// While auth is disabled the whole server is open — any caller can already
+// read, write and purge everything — so these routes stay open too; that is
+// how a deployment bootstraps its first owner before switching auth on.
+//
+// Once auth is enabled they require an owner token, and an owner manages only
+// the workspaces it owns. Without that, any anonymous caller could mint itself
+// an owner token or switch auth off and read everything, which made enabling
+// auth a no-op.
 
-app.post("/auth/enable", _wrap(async () => {
+const _requireOwner = _requireAuth("owner");
+
+// Owner check for a set of workspaces. `req.allowedWorkspaces` is null when
+// auth is disabled, which means unrestricted.
+function _assertOwns(req, workspaceIds) {
+  if (req.allowedWorkspaces === null) return;
+  const owned = new Set(req.allowedWorkspaces);
+  const outside = workspaceIds.filter(ws => !owned.has(ws));
+  if (outside.length) {
+    throw { code: Codes.FORBIDDEN, message: `Owner role required on workspace(s): ${outside.join(", ")}` };
+  }
+}
+
+// Every workspace any principal holds a role on — the reach of the auth switch.
+function _allKnownWorkspaces() {
+  const all = new Set();
+  for (const p of auth.listPrincipals()) for (const ws of Object.keys(p.workspaces)) all.add(ws);
+  return [...all];
+}
+
+// AuthStore throws plain Errors for bad input; surface those as 400, not 500.
+function _authCall(fn) {
+  try { return fn(); }
+  catch (err) { throw { code: Codes.VALIDATION, message: err.message }; }
+}
+
+app.post("/auth/enable", _requireOwner, _wrap(async (req) => {
+  // Enabling with no owner would lock every caller out of these routes, with
+  // no way back short of a restart.
+  const hasOwner = auth.listPrincipals().some(p => Object.values(p.workspaces).includes("owner"));
+  if (!hasOwner) {
+    throw { code: Codes.VALIDATION, message: "Create a principal with the owner role before enabling auth (POST /auth/principals)" };
+  }
   auth.enable();
+  auth.audit("auth_enabled", { principal: req.principal });
   return { success: true, enabled: true };
 }));
 
-app.post("/auth/disable", _wrap(async () => {
+app.post("/auth/disable", _requireOwner, _wrap(async (req) => {
+  // Disabling opens every workspace, so it takes an owner of all of them.
+  _assertOwns(req, _allKnownWorkspaces());
   auth.disable();
+  auth.audit("auth_disabled", { principal: req.principal });
   return { success: true, enabled: false };
 }));
 
@@ -521,43 +562,59 @@ app.get("/auth/status", _wrap(async () => {
   return { enabled: auth.enabled, principals: auth.listPrincipals().length };
 }));
 
-app.post("/auth/principals", _wrap(async (req) => {
-  const { id, name, workspaces, token } = req.body;
+app.post("/auth/principals", _requireOwner, _wrap(async (req) => {
+  const { id, name, workspaces = {}, token } = req.body || {};
   if (!id || !name) throw { code: Codes.VALIDATION, message: "id and name are required" };
-  const result = auth.addPrincipal({ id, name, workspaces, token });
-  auth.audit("principal_created", { detail: `${id} (${name})` });
+  // Re-adding an existing id would overwrite its roles while its old token
+  // kept working. Changing roles goes through /auth/grant and /auth/revoke.
+  if (auth.getPrincipal(id)) throw { code: Codes.VALIDATION, message: `Principal ${id} already exists` };
+  _assertOwns(req, Object.keys(workspaces));
+  const result = _authCall(() => auth.addPrincipal({ id, name, workspaces, token }));
+  auth.audit("principal_created", { principal: req.principal, detail: `${id} (${name})` });
   return { success: true, principal: result };
 }));
 
-app.delete("/auth/principals/:id", _wrap(async (req) => {
+app.delete("/auth/principals/:id", _requireOwner, _wrap(async (req) => {
+  const target = auth.getPrincipal(req.params.id);
+  if (target) _assertOwns(req, Object.keys(target.workspaces));
   auth.removePrincipal(req.params.id);
-  auth.audit("principal_removed", { detail: req.params.id });
+  auth.audit("principal_removed", { principal: req.principal, detail: req.params.id });
   return { success: true };
 }));
 
-app.get("/auth/principals", _wrap(async () => {
-  return { principals: auth.listPrincipals() };
+app.get("/auth/principals", _requireOwner, _wrap(async (req) => {
+  const all = auth.listPrincipals();
+  if (req.allowedWorkspaces === null) return { principals: all };
+  const owned = new Set(req.allowedWorkspaces);
+  return { principals: all.filter(p => Object.keys(p.workspaces).some(ws => owned.has(ws))) };
 }));
 
-app.post("/auth/grant", _wrap(async (req) => {
-  const { principalId, workspaceId, role } = req.body;
+app.post("/auth/grant", _requireOwner, _wrap(async (req) => {
+  const { principalId, workspaceId, role } = req.body || {};
   if (!principalId || !workspaceId || !role) throw { code: Codes.VALIDATION, message: "principalId, workspaceId, and role are required" };
-  auth.grant(principalId, workspaceId, role);
-  auth.audit("grant", { principalId, workspaceId: workspaceId, detail: role });
+  _assertOwns(req, [workspaceId]);
+  _authCall(() => auth.grant(principalId, workspaceId, role));
+  auth.audit("grant", { principal: req.principal, workspaceId, detail: `${principalId}=${role}` });
   return { success: true };
 }));
 
-app.post("/auth/revoke", _wrap(async (req) => {
-  const { principalId, workspaceId } = req.body;
+app.post("/auth/revoke", _requireOwner, _wrap(async (req) => {
+  const { principalId, workspaceId } = req.body || {};
   if (!principalId || !workspaceId) throw { code: Codes.VALIDATION, message: "principalId and workspaceId are required" };
+  _assertOwns(req, [workspaceId]);
   auth.revoke(principalId, workspaceId);
-  auth.audit("revoke", { principalId, workspaceId: workspaceId });
+  auth.audit("revoke", { principal: req.principal, workspaceId, detail: principalId });
   return { success: true };
 }));
 
-app.get("/auth/audit", _wrap(async (req) => {
+app.get("/auth/audit", _requireOwner, _wrap(async (req) => {
   const { workspaceId, principalId, action, since, limit } = req.query;
-  return { log: auth.getAuditLog({ workspaceId, principalId, action, since: since ? Number(since) : undefined, limit: limit ? Number(limit) : undefined }) };
+  let log = auth.getAuditLog({ workspaceId, principalId, action, since: since ? Number(since) : undefined, limit: limit ? Number(limit) : undefined });
+  if (req.allowedWorkspaces !== null) {
+    const owned = new Set(req.allowedWorkspaces);
+    log = log.filter(e => e.workspaceId === null || owned.has(e.workspaceId));
+  }
+  return { log };
 }));
 
 // ─── Start ────────────────────────────────────────────────────────────────────
@@ -595,12 +652,13 @@ lib.init({ strictEmbeddings: false }).then(() => {
     console.log("  GET    /export/markdown?type&memoryType&workspaceId&tags&includeHistory");
     console.log("  POST   /import/markdown           { markdown, source?, classification?, ... }");
     console.log("Auth management:");
-    console.log("  POST   /auth/enable               Enable token-based auth");
-    console.log("  POST   /auth/disable              Disable auth (open access)");
+    console.log("  (open while auth is off; once on, every route below except /auth/status needs an owner token)");
+    console.log("  POST   /auth/enable               Enable token-based auth (needs an owner principal first)");
+    console.log("  POST   /auth/disable              Disable auth (needs owner on every workspace)");
     console.log("  GET    /auth/status               { enabled, principals }");
     console.log("  POST   /auth/principals           { id, name, workspaces?, token? } → create principal + token");
     console.log("  DELETE /auth/principals/:id        Remove principal");
-    console.log("  GET    /auth/principals            List all principals");
+    console.log("  GET    /auth/principals            List principals in workspaces you own");
     console.log("  POST   /auth/grant                { principalId, workspaceId, role }");
     console.log("  POST   /auth/revoke               { principalId, workspaceId }");
     console.log("  GET    /auth/audit?workspaceId&principalId&action&since&limit");

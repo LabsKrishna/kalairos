@@ -485,6 +485,8 @@ async function init(overrides = {}) {
   // boot decision tree so the index is in sync before the first write.
   await _initSqliteIndex();
 
+  await _reembedForeignVectors();
+
   _pool = new WorkerPool(availableCpus());
   _pool.start();
 
@@ -550,6 +552,48 @@ async function _loadStore() {
   // Runs once every row is in the store — a link's other end may load later.
   _pruneCrossWorkspaceLinks();
   console.error(`[kalairos] Loaded ${store.size} entities`);
+}
+
+// Re-embed vectors that a different embedder wrote.
+//
+// A store outlives its embedder: the model gets downloaded after weeks on
+// bag-of-words (128-dim → 768-dim), or a caller swaps providers. Vectors of
+// another width cannot be compared with this embedder's queries — cosine over
+// mismatched arrays is NaN, and NaN slips past every score floor — so those
+// entities were either returned with garbage scores or never found. Text is
+// canonical and every version keeps its own, so re-embedding loses nothing.
+//
+// Only runs when the width is known: the built-in embedders set it, and a
+// custom embedFn can by passing embeddingDim to init(). If the embedder fails
+// part-way, what was done is kept and the rest is retried on the next start;
+// until then kernel.cosine scores the leftovers as 0 rather than NaN.
+async function _reembedForeignVectors() {
+  const dim = CFG.embeddingDim;
+  if (!Number.isFinite(dim) || dim <= 0) return 0;
+
+  const isForeign = (vec) => Array.isArray(vec) && vec.length > 0 && vec.length !== dim;
+  const stale = [];
+  for (const e of store.values()) {
+    if (isForeign(e.vector) || (e.versions || []).some(v => isForeign(v.vector))) stale.push(e);
+  }
+  if (!stale.length) return 0;
+
+  console.error(`[kalairos] re-embedding ${stale.length} entities written by a different embedder (now ${dim}-dim)`);
+  let done = 0;
+  try {
+    for (const e of stale) {
+      if (isForeign(e.vector)) e.vector = await _embed(e.text, true, e.type);
+      for (const v of e.versions || []) {
+        if (isForeign(v.vector)) v.vector = await _embed(v.text, true, e.type);
+      }
+      done++;
+    }
+  } catch (err) {
+    console.error(`[kalairos] re-embedding stopped after ${done}/${stale.length}: ${err.message}. The rest will be retried on next start.`);
+  }
+  if (done > 0) _persistAll();
+  if (done === stale.length) console.error(`[kalairos] re-embedded ${done} entities`);
+  return done;
 }
 
 // Serialise entity for backing store I/O (links Set → Array).

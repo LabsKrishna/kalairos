@@ -1,7 +1,12 @@
 // kernel.js — Scoring primitives
 "use strict";
 
+// Vectors of different widths come from different embedders and have no
+// meaningful similarity. Without this guard a shorter `b` reads undefined,
+// the result is NaN, and NaN passes every `score < floor` filter — so a
+// foreign vector surfaced in results instead of scoring nothing.
 function cosine(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
   let dot = 0, magA = 0, magB = 0;
   for (let i = 0; i < a.length; i++) {
     dot  += a[i] * b[i];

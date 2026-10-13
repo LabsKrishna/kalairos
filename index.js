@@ -79,7 +79,11 @@ const DEFAULTS = {
   // The knob exists for memory-constrained deployments that opt out knowingly.
   maxTrailEvents:     Number(process.env.KALAIROS_MAX_TRAIL_EVENTS  || 0), // 0 = unlimited
   strictEmbeddings:   (process.env.KALAIROS_STRICT_EMBEDDINGS       || "1") !== "0",
-  dataFile:           path.join(process.cwd(), "data.kalairos"),
+  // The same variable the CLI and the MCP server read, so `npm start` serves the
+  // file they write to rather than whatever data.kalairos sits in the cwd.
+  dataFile:           process.env.KALAIROS_DATA_FILE
+    ? path.resolve(process.env.KALAIROS_DATA_FILE)
+    : path.join(process.cwd(), "data.kalairos"),
   // embedFn(text, type) — inject your own: `async (text, type) => number[]`.
   // llmFn(text, type) — inject your own: `async (text, type) => { keywords, context, llmTags, importance?, suggestedType? }`.
   // factExtractFn(text, type) — inject your own: `async (text, type) => string[]` (array of discrete fact strings).

@@ -16,21 +16,11 @@ function flagValue(name) {
 }
 function hasFlag(name) { return args.indexOf(name) >= 0; }
 
-// Minimal deterministic bag-of-words embedder for local export/import (no API key).
-// Same shape as bench/agent-memory/helpers.js — stable, zero dependencies.
-function makeLocalEmbedder(dim = 64) {
-  const vocab = new Map();
-  return async (text) => {
-    const words = String(text).toLowerCase().match(/[a-z]+/g) || [];
-    const vec = new Array(dim).fill(0);
-    for (const w of words) {
-      if (!vocab.has(w)) vocab.set(w, vocab.size);
-      vec[vocab.get(w) % dim]++;
-    }
-    const mag = Math.sqrt(vec.reduce((s, v) => s + v * v, 0)) || 1;
-    return vec.map(v => v / mag);
-  };
-}
+// export only reads text, so it needs no real embedder — and must not get one:
+// a known embedding width would let init() re-embed and rewrite the store, the
+// wrong side effect for a read, and racy beside a running server. A no-op
+// embedFn leaves the width unknown, so init() leaves vectors alone.
+const noEmbed = async () => [];
 
 if (cmd === "start") {
   require("../server");
@@ -71,7 +61,7 @@ if (cmd === "start") {
     const dataFile  = flagValue("--data") || process.env.KALAIROS_DATA_FILE || "data.kalairos";
     const history   = hasFlag("--include-history");
 
-    await kalairos.init({ embedFn: makeLocalEmbedder(), dataFile });
+    await kalairos.init({ embedFn: noEmbed, dataFile });
     const md = await kalairos.exportMarkdown({ includeHistory: history });
     if (outPath) {
       fs.writeFileSync(outPath, md);
@@ -98,7 +88,10 @@ if (cmd === "start") {
     const dataFile  = flagValue("--data") || process.env.KALAIROS_DATA_FILE || "data.kalairos";
     const mdText    = fs.readFileSync(input, "utf8");
 
-    await kalairos.init({ embedFn: makeLocalEmbedder(), dataFile });
+    // The default embedder, the same one the server and MCP server load, so
+    // imported memories are findable there. A private embedder here wrote
+    // vectors no other entry point could compare against.
+    await kalairos.init({ dataFile });
     const res = await kalairos.importMarkdown(mdText);
     console.error(`[kalairos] Imported ${res.imported} entities → ${dataFile}`);
     await kalairos.shutdown();

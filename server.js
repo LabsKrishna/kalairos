@@ -630,7 +630,6 @@ lib.init({ strictEmbeddings: false }).then(() => {
   const HOST = process.env.KALAIROS_HOST || "0.0.0.0";
   const server = app.listen(PORT, HOST, () => {
     console.log(`Kalairos running on http://localhost:${PORT}`);
-    console.log(`Dashboard: http://localhost:${PORT}/`);
     console.log("Endpoints:");
     console.log("  POST   /ingest                  { text, type?, metadata?, tags?, timestamp?, source?, classification?, retention?, memoryType?, workspaceId?, useLLM? }");
     console.log("  POST   /remember                { text, type?, metadata?, tags?, timestamp?, source?, classification?, retention?, memoryType?, workspaceId?, useLLM? }");

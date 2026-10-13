@@ -50,6 +50,16 @@ function tempCwd(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `kalairos-${label}-`));
 }
 
+// kill() only sends the signal. Windows refuses to remove a directory that is
+// still a live process's cwd (EBUSY), so wait for the exit before cleaning up.
+function stop(proc) {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise(resolve => {
+    proc.once("exit", resolve);
+    proc.kill("SIGKILL");
+  });
+}
+
 // ─── REST ─────────────────────────────────────────────────────────────────────
 
 async function waitForServer(timeoutMs = 30_000) {
@@ -82,7 +92,7 @@ async function withServer(fn) {
     if (stderr) e.message += `\n       --- server stderr ---\n${stderr.split("\n").slice(-8).join("\n")}`;
     throw e;
   } finally {
-    proc.kill("SIGKILL");
+    await stop(proc);
     fs.rmSync(cwd, { recursive: true, force: true });
   }
 }
@@ -148,8 +158,8 @@ function mcpClient() {
   return {
     send,
     notify,
-    close() {
-      proc.kill("SIGKILL");
+    async close() {
+      await stop(proc);
       fs.rmSync(cwd, { recursive: true, force: true });
     },
   };
@@ -277,7 +287,7 @@ function includesMatch(payload, re) {
       assert.match(String(props.asOf.description), /ingest|believe/i,
         "the asOf description must tell the model which question it answers");
     } finally {
-      mcp.close();
+      await mcp.close();
     }
   });
 
@@ -313,7 +323,7 @@ function includesMatch(payload, re) {
       assert.ok(includesMatch(actual, /thirty thousand/),
         "event-time recall must return the version in force on Feb 15");
     } finally {
-      mcp.close();
+      await mcp.close();
     }
   });
 

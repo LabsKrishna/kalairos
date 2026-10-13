@@ -4,7 +4,7 @@ All notable changes to Kalairos. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.9.1] — 2026-10-13
 
 Headline: **a fresh install now works the way the README says it does.**
 Installing from npm and running the quickstart, the MCP server and the HTTP

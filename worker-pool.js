@@ -111,6 +111,13 @@ class WorkerPool {
     w.on("message", msg  => { if (isCurrent()) this._onMessage(idx, msg); });
     w.on("error",   err  => { if (isCurrent()) this._onError(idx, err); });
     w.on("exit",    code => { if (isCurrent()) this._onExit(idx, code); });
+
+    // An idle worker must not keep the process alive, or a script that calls
+    // init() and query() but never shutdown() hangs after its last line.
+    // _dispatch refs the worker for the life of a job, so an in-flight query
+    // still holds the process open until it settles. This has to come after
+    // the 'message' listener: attaching one re-refs the worker's port.
+    w.unref();
   }
 
   _dispatch(idx, msg, resolve, reject) {
@@ -119,6 +126,7 @@ class WorkerPool {
     // and the symptom was "Cannot set properties of null (setting 'pending')".
     if (!slot) return reject(emitError(Err.workerFailed(`worker ${idx} is not alive`)));
     slot.pending = { resolve, reject };
+    slot.worker.ref();
     slot.worker.postMessage(msg);
   }
 
@@ -127,6 +135,7 @@ class WorkerPool {
     const pending = slot?.pending ?? null; // a worker may emit with no job in flight
     if (slot) {
       slot.pending = null;
+      slot.worker.unref();
       this._idle.push(idx);
     }
     this._drain();

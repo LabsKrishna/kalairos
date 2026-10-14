@@ -29,6 +29,9 @@ function versionToTrailEvent(entity, v) {
     contentChanged:    true,
     deltaSummary:      v.delta?.summary || null,
     classification:    v.classification || entity.classification || "internal",
+    // Non-content fields the write changed (today: base trust), in the same
+    // { from, to } shape as an annotated event's diff. Absent when none did.
+    ...(v.diff ? { diff: v.diff } : {}),
   };
 }
 

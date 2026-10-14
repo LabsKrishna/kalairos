@@ -64,6 +64,21 @@ jobs:
       - run: npm ci
       - run: npm run bench:poisoning
 
+  prior-auth:
+    # CLAUDE.md §17: the prior-authorization replay benchmark publishes exact
+    # floors (zero hindsight leakage, full late-evidence recall, criteria in
+    # force, frozen determination record). The runner exits non-zero on any
+    # miss; see bench/prior-auth/README.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run bench:prior-auth
+
   latency:
     # CLAUDE.md §17: named latency budgets are CI-gated. Threshold is
     # calibrated for shared GitHub runners (slower than M-series local dev);

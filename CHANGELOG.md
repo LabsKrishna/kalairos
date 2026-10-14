@@ -4,6 +4,66 @@ All notable changes to Kalairos. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Prior-authorization replay benchmark** (`npm run bench:prior-auth`,
+  CI-gated). Replays synthetic prior-authorization decisions after late
+  records, reversals, corrections and policy revisions have landed, and
+  checks that `queryAt` shows only what the reviewer had, `queryValidAt`
+  shows what was true (including records that arrived late), the policy in
+  force on the request date comes back, the decision-day checkpoint is
+  intact, and authorship survives. Every floor is exact and met. A control
+  run on current state proves the leakage metric can see a leak.
+  `node bench/prior-auth/case.js` narrates the reference case. See
+  `bench/prior-auth/README.md`.
+
+### Fixed
+
+- **`queryAt` trust is point-in-time.** A replay used to score trust against
+  the entity's full version history and its current annotations, so a
+  contradiction, correction or annotation recorded after `asOf` changed the
+  trust a past answer reported, and its breakdown cited it. `trust`,
+  `trustScore` and `trustBreakdown` from `queryAt(text, asOf)` now come from
+  what had been recorded by `asOf`: the versions ingested by then, recency
+  from the version returned (and any reaffirm by then), the base trust score
+  as it stood then (rewound through every recorded change to it since),
+  and the returned version's content-risk verdict, with a reviewer's override
+  only if it was made by then. In the prior-auth benchmark, trust drift fell
+  from 40% of cases (max Δ 0.27) to 0 and trust citing later contradictions
+  from 30% to 0; both are now gated floors. `queryAt` results' `trustScore`
+  is now that base, matching `trustBreakdown.base`; it used to be the source
+  default of the returned version. A `queryRange` with a finite `until`
+  scores the same snapshot as `queryAt(until)`, so its trust follows.
+  `query()` output is unchanged, and `queryValidAt` deliberately keeps trust
+  from everything known now: it asks what was true, with today's knowledge.
+- **A `trustScore` passed to `ingest()` is recorded.** On an update or a
+  reaffirm it used to overwrite the stored base without keeping the value it
+  replaced, so a `queryAt` replay from before that write reported the newer
+  base. The write now records `diff.trustScore = { from, to }`, the shape
+  `annotate()` already uses: on the new version for an update (in
+  `getHistory()` and on that version's `trail()` event), and on the
+  `reaffirmed` trail event for a reaffirm. A write that leaves the base
+  unchanged records nothing, so its version and trail event look exactly as
+  before.
+- **An open-ended `queryRange` works.** A missing bound is documented as
+  open-ended, but `null` went through `Number()` and became 0, so
+  `queryRange(text, since)` and `queryRange(text, since, null)` threw
+  "since must be <= until" for any real timestamp. The same happened over
+  REST (`POST /query` and agent recall with only `since`), where a missing
+  `until` arrives as `null`. A missing `since` was 0 rather than -Infinity,
+  which dropped anything stamped before 1970. Both bounds are now
+  open-ended when omitted.
+
+### Known issues
+
+- **Some base trust changes cannot be replayed.** Annotations and reaffirms
+  dropped by a `maxTrailEvents` cap, and `ingest()` trust changes written
+  before this release, carry no record of the value they replaced, so a
+  `queryAt` replay from before them reports the newer base. Every other
+  change is reconstructed exactly.
+
 ## [1.9.1] — 2026-10-13
 
 Headline: **a fresh install now works the way the README says it does.**

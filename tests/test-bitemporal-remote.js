@@ -50,6 +50,16 @@ function tempCwd(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `kalairos-${label}-`));
 }
 
+// kill() only sends the signal. Windows refuses to remove a directory that is
+// still a live process's cwd (EBUSY), so wait for the exit before cleaning up.
+function stop(proc) {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise(resolve => {
+    proc.once("exit", resolve);
+    proc.kill("SIGKILL");
+  });
+}
+
 // ─── REST ─────────────────────────────────────────────────────────────────────
 
 async function waitForServer(timeoutMs = 30_000) {
@@ -82,7 +92,7 @@ async function withServer(fn) {
     if (stderr) e.message += `\n       --- server stderr ---\n${stderr.split("\n").slice(-8).join("\n")}`;
     throw e;
   } finally {
-    proc.kill("SIGKILL");
+    await stop(proc);
     fs.rmSync(cwd, { recursive: true, force: true });
   }
 }
@@ -148,8 +158,8 @@ function mcpClient() {
   return {
     send,
     notify,
-    close() {
-      proc.kill("SIGKILL");
+    async close() {
+      await stop(proc);
       fs.rmSync(cwd, { recursive: true, force: true });
     },
   };
@@ -253,6 +263,20 @@ function includesMatch(payload, re) {
     });
   });
 
+  // 4. REST: a since-only range. The client drops the missing `until`, the
+  // server defaults it to null, and the engine must read that as open-ended.
+  await test("REST: a range with only since is open-ended", async () => {
+    await withServer(async () => {
+      const kal = connect(BASE);
+      await seedOverRest(kal);
+
+      const res = await kal.queryRange("Dana annual salary", FEB1);
+      assert.ok(res.count > 0, "a since-only range must return what is in range");
+      assert.ok(includesMatch(res, /thirty thousand/), "an open range ends at the latest version");
+      assert.equal(res.until, null, "the response echoes the missing bound as null");
+    });
+  });
+
   // 4. MCP: validAt is a registered parameter on kalairos_recall.
   await test("MCP: kalairos_recall advertises both time axes", async () => {
     const mcp = mcpClient();
@@ -277,7 +301,7 @@ function includesMatch(payload, re) {
       assert.match(String(props.asOf.description), /ingest|believe/i,
         "the asOf description must tell the model which question it answers");
     } finally {
-      mcp.close();
+      await mcp.close();
     }
   });
 
@@ -313,7 +337,7 @@ function includesMatch(payload, re) {
       assert.ok(includesMatch(actual, /thirty thousand/),
         "event-time recall must return the version in force on Feb 15");
     } finally {
-      mcp.close();
+      await mcp.close();
     }
   });
 

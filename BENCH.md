@@ -1,9 +1,10 @@
 # Kalairos — Benchmarks (Latency & Observability)
 
-This document records **reproducible** platform measurements and the floors CI gates against. Two families live here:
+This document records **reproducible** platform measurements and the floors CI gates against. Three families live here:
 
 - **Latency** (this first section) — query latency against the JSONL store, backing the Stage 1 budget in `CLAUDE.md §5`.
 - **Observability** ([jump](#observability-completeness--cross-agent-trace-coverage)) — observability completeness and cross-agent trace coverage, the platform benchmarks named in `CLAUDE.md §17`.
+- **Prior-authorization replay** ([jump](#prior-authorization-replay)) — whether a decision replayed later shows what the reviewer had, and separately what was true, with no hindsight in either.
 
 ## Latency budget
 
@@ -128,6 +129,46 @@ On our **own reference fixture** the platform emits every action it takes — so
 ### CI enforcement
 
 The `python` job in `.github/workflows/ci.yml` enforces this two ways: `pytest` runs `tests/test_observability_bench.py` (which asserts both floors plus the sensitivity checks), and a named `python bench/observability.py --check` step prints the table and fails the build on a miss. Per §17, a merge that drops either metric below its floor requires written justification on the PR.
+
+## Prior-authorization replay
+
+A prior-authorization decision gets reviewed after the fact: an appeal, an audit, a regulator sampling AI-assisted denials. The review asks two questions that sound alike: what did the reviewer **have** when they decided (`queryAt`), and what was actually **true** at that moment (`queryValidAt`)? Records routinely exist days before they arrive, so the answers differ, and the difference is what the review turns on. Full method in [`bench/prior-auth/README.md`](bench/prior-auth/README.md).
+
+### Method
+
+- Workload: reference case PA-0001 (narrated by `node bench/prior-auth/case.js`) plus 300 seeded synthetic cases across three payer policies, each revised during the year. Late records, reversals, corrections, post-decision events and mid-case policy revisions are all common by design.
+- Every write carries `ingestAt` and `effectiveAt`. All writes stream in receipt order; each case's `queryAt(decisionAt)` is captured live at its decision and a checkpoint is frozen. Everything is asked again after the stream ends.
+- Ground truth comes from the domain rule in `fixtures.js`, not from engine code. Relevance floors are off, so a retrieval miss cannot pass as a time-travel result.
+- A control asks current state (`query()`) instead of `queryAt`; it must register leakage in every case that has post-decision writes, which proves the leakage metric can see one.
+
+```bash
+npm run bench:prior-auth
+```
+
+### Current measurements & floors
+
+Reference case + 300 generated cases, seed 114, 2026-10-14. 301 cases replay in about 0.6 s.
+
+| Metric | Floor | Current |
+| ------ | ----- | ------- |
+| Hindsight leakage | 0 | **0 — PASS** |
+| Decision-time recall | 1.0 | **1.0 — PASS** |
+| Replay drift | 0 | **0 — PASS** |
+| Trust drift (replayed trust ≠ decision-day trust) | 0 | **0 — PASS** |
+| Trust cites later (explanation names a contradiction recorded after the decision) | 0 | **0 — PASS** |
+| Event-time recall | 1.0 | **1.0 — PASS** |
+| Late-evidence recall | 1.0 | **1.0 — PASS** (382 late records) |
+| Forward leakage | 0 | **0 — PASS** |
+| Criteria in force | 1.0 | **1.0 — PASS** |
+| Frozen determination record | 1.0 | **1.0 — PASS** |
+| Authorship preserved | 1.0 | **1.0 — PASS** |
+| Control: leak detection | 1.0 | **1.0 — PASS** |
+
+The two trust rows were first reported ungated, at 0.40 of cases (max Δ 0.27) and 0.30: a replay scored trust against the entity's full version history, so a later reversal changed a past replay's trust and showed up in its explanation. `queryAt` now computes trust from what had been recorded by `asOf` (versions, recency, base trust score, content-risk override), and both rows are gated at 0.
+
+### CI enforcement
+
+The `prior-auth` job in `.github/workflows/ci.yml` runs `npm run bench:prior-auth`, which exits non-zero on any floor miss. `tests/test-prior-auth-replay.js` (part of `npm test`) injects each failure into a real run and asserts the scorer catches it.
 
 ## What this is **not**
 

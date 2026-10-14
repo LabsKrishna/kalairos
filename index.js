@@ -345,6 +345,7 @@ function _buildVersionRecord({
   why,
   previousVersionId,
   contentRisk,
+  diff,
 }) {
   const ordinal     = (entity.versions?.length || 0) + 1;
   const versionId   = _makeVersionId(entity.id, ordinal);
@@ -371,7 +372,21 @@ function _buildVersionRecord({
     // after a later correction moved the head. Omitted entirely when no
     // detector ran, so existing records are byte-identical.
     ...(contentRisk ? { contentRisk } : {}),
+    // Entity fields this write changed besides the content, as { from, to }
+    // — the shape annotate() records on its trail event. `delta` describes
+    // the text; this describes the rest. Omitted when nothing else changed.
+    ...(diff ? { diff } : {}),
   };
+}
+
+// The `diff` an ingest records when it moves the stored base trust, so every
+// change to the base is on the record whichever write made it: annotate(),
+// a reaffirming ingest, or an updating one. _trustInputsAt rewinds through
+// these to score a replay with the base in force at the time. null when the
+// base is unchanged.
+function _trustDiff(from, to) {
+  if (from === to) return null;
+  return { trustScore: { from: Number.isFinite(from) ? from : null, to } };
 }
 
 // ─── Shared Entity Serialization ─────────────────────────────────────────────
@@ -1092,6 +1107,8 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       // Skip a new content version; record a metadata-only trail event so the
       // audit log still captures that a write happened.
       if (sameContent && sameSource) {
+        const nextTrust = Number.isFinite(trustScore) ? Math.max(0, Math.min(1, trustScore)) : mergeTarget.trustScore;
+        const diff = _trustDiff(mergeTarget.trustScore, nextTrust);
         const reaffirmEvent = {
           entityId:          mergeTarget.id,
           versionId:         _makeVersionId(mergeTarget.id, mergeTarget.versions.length + 1) + ":reaffirmed",
@@ -1105,12 +1122,13 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
           contentChanged:    false,
           deltaSummary:      null,
           classification:    cls,
+          ...(diff ? { diff } : {}),
         };
         _appendTrailEvent(mergeTarget, reaffirmEvent);
         // Refresh updatedAt so recency-aware features still notice the touch,
         // but keep text/vector untouched.
         mergeTarget.updatedAt = ts;
-        if (Number.isFinite(trustScore)) mergeTarget.trustScore = Math.max(0, Math.min(1, trustScore));
+        if (diff) mergeTarget.trustScore = nextTrust;
         _persistAll();
         console.error(`[kalairos] Reaffirmed entity ${mergeTarget.id} (no content change)`);
         return mergeTarget.id;
@@ -1141,6 +1159,12 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       // when this new one becomes effective.
       if (latest) latest.validTo = newEffectiveAt;
 
+      // Update trust score when explicitly provided; otherwise preserve existing.
+      // Settled before the version is built so the version records the change.
+      const nextTrust = Number.isFinite(trustScore) ? Math.max(0, Math.min(1, trustScore))
+                      : Number.isFinite(mergeTarget.trustScore) ? mergeTarget.trustScore
+                      : _defaultTrustScore(src.type);
+
       const versionRecord = _buildVersionRecord({
         entity:            mergeTarget,
         text:              safeText,
@@ -1156,6 +1180,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
         why:               whyText,
         previousVersionId: latest?.versionId || null,
         contentRisk:       riskVerdict,
+        diff:              _trustDiff(mergeTarget.trustScore, nextTrust),
       });
       mergeTarget.versions.unshift(versionRecord);
 
@@ -1200,9 +1225,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       if (llmEnrichment) mergeTarget.llmKeywords = llmEnrichment.keywords;
       if (Number.isFinite(importance)) mergeTarget.importance = Math.max(0, Math.min(1, importance));
       else if (llmEnrichment && Number.isFinite(llmEnrichment.importance)) mergeTarget.importance = llmEnrichment.importance;
-      // Update trust score when explicitly provided; otherwise preserve existing
-      if (Number.isFinite(trustScore)) mergeTarget.trustScore = Math.max(0, Math.min(1, trustScore));
-      else if (!Number.isFinite(mergeTarget.trustScore)) mergeTarget.trustScore = _defaultTrustScore(src.type);
+      mergeTarget.trustScore = nextTrust;
       // The verdict describes the HEAD text. This update replaced the head, so
       // a verdict from the superseded text is stale and must not keep scoring
       // the new one — including a human override, which cleared different
@@ -1493,14 +1516,14 @@ async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), 
   // here in a Map and is re-attached to top-K results during assembly. This
   // avoids serialising a breakdown object for every entity we score.
   //
-  // For historical queries (queryAt / queryRange), `updatedAt` on the subset
-  // entity already reflects the snapshot time; we use it for recency decay.
-  // Contradiction/corroboration counts still draw from the full version
-  // history — point-in-time trust is a follow-up (documented in CLAUDE.md
-  // under time-aware retrieval).
+  // Ingest-time snapshots (queryAt, bounded queryRange) carry `trustInputs`
+  // from _trustInputsAt, so a replay's trust and its breakdown see only what
+  // had been recorded by then. Everything else scores the stored entity:
+  // current state, and queryValidAt, which asks what was true at an instant
+  // with everything known today.
   const trustBreakdowns = new Map();
   const scoredEntities = subset.map(e => {
-    const storeEntity = store.get(e.id) || e;
+    const storeEntity = e.trustInputs || store.get(e.id) || e;
     const { trust, breakdown } = computeTrustSignals(storeEntity, {
       now,
       recencyHalfLifeMs: CFG.recencyHalfLifeMs,
@@ -1595,6 +1618,84 @@ function _versionValidAt(versions, validAt) {
   return found;
 }
 
+/**
+ * The trust inputs of `e` as they stood at ingest-time `asOf`, shaped for
+ * computeTrustSignals. A replay must not score a past answer with what was
+ * learned after it: a contradiction, correction or corroboration recorded
+ * later is outside the snapshot, and so is a reviewer's later annotation.
+ *
+ * - versions: only those ingested by asOf. Stored newest-first, so the
+ *   snapshot version queryAt scores stays at the head.
+ * - updatedAt: the snapshot's ingest, moved forward by any reaffirm that had
+ *   landed by asOf (a reaffirm touches updatedAt without a new version).
+ * - trustScore: every change to the base is recorded as
+ *   diff.trustScore = { from, to } — on the trail event of an annotate() or
+ *   a reaffirming ingest, and on the version an updating ingest wrote — so
+ *   the earliest change after asOf gives the value in force at asOf.
+ * - contentRisk: the verdict stored on the snapshot version, with a
+ *   reviewer's override only if the last toggle between that version's ingest
+ *   and asOf turned it on.
+ *
+ * Not reconstructed: with maxTrailEvents set, the oldest annotations and
+ * reaffirms may be gone, and the base falls back to what the trail still
+ * shows. Records written before ingest recorded its trust changes carry no
+ * diff for them either.
+ *
+ * @param {object} e     — stored entity
+ * @param {number} asOf  — Unix ms on the ingest-time axis
+ * @returns {object|null} null if the entity did not exist yet at asOf
+ */
+function _trustInputsAt(e, asOf) {
+  const versions = (e.versions || []).filter(v => v.timestamp <= asOf);
+  const head = versions[0];
+  if (!head) return null;
+  const events = e.trailEvents || [];
+  const annotated = (field) => (ev) => ev.action === ACTIONS.annotated && ev.diff?.[field];
+
+  let updatedAt = head.timestamp;
+  for (const ev of events) {
+    if (ev.action === ACTIONS.reaffirmed && ev.ingestAt > updatedAt && ev.ingestAt <= asOf) updatedAt = ev.ingestAt;
+  }
+
+  // Trail events are newest-first, so `<=` lets the older of two same-instant
+  // changes win. A version tied with a trail change came first only if it led
+  // into it: its `to` is the `from` already picked.
+  let trustScore = e.trustScore;
+  let firstLater = Infinity;
+  for (const ev of events) {
+    if (ev.diff?.trustScore && ev.ingestAt > asOf && ev.ingestAt <= firstLater) {
+      firstLater = ev.ingestAt;
+      trustScore = ev.diff.trustScore.from;
+    }
+  }
+  for (const v of e.versions || []) {
+    const change = v.diff?.trustScore;
+    if (change && v.timestamp > asOf && (v.timestamp < firstLater || (v.timestamp === firstLater && change.to === trustScore))) {
+      firstLater = v.timestamp;
+      trustScore = change.from;
+    }
+  }
+
+  let contentRisk = null;
+  if (head.contentRisk) {
+    contentRisk = (({ override, ...rest }) => rest)(head.contentRisk);
+    let toggle = null;
+    for (const ev of events.filter(annotated("contentRiskOverride"))) {
+      if (ev.ingestAt >= head.timestamp && ev.ingestAt <= asOf && (!toggle || ev.ingestAt > toggle.ingestAt)) toggle = ev;
+    }
+    if (toggle?.diff.contentRiskOverride.to) {
+      // Prefer the stored override when it is this same decision; otherwise
+      // rebuild it from the trail event that recorded it.
+      const live = head === e.versions[0] ? e.contentRisk?.override : null;
+      contentRisk.override = live && live.at <= asOf
+        ? live
+        : { who: toggle.who || null, at: toggle.ingestAt, why: toggle.why || null };
+    }
+  }
+
+  return { versions, updatedAt, trustScore, contentRisk };
+}
+
 async function query(text, opts = {}) {
   if (opts && (opts.asOf != null || opts.validAt != null || opts.since != null || opts.until != null)) {
     _assertInit();
@@ -1609,6 +1710,10 @@ async function query(text, opts = {}) {
  * Time-travel query: score each entity against the version current at `timestamp`.
  * Entities that did not yet exist are skipped. Recency boost is disabled —
  * "now" has no meaning for a historical snapshot.
+ *
+ * Trust is point-in-time too: `trust`, `trustScore` and `trustBreakdown` are
+ * computed from what had been recorded by `timestamp`, so a contradiction or
+ * annotation that landed later does not change a replayed answer.
  *
  * @param {string} text
  * @param {number} timestamp — Unix ms
@@ -1632,6 +1737,10 @@ async function queryAt(text, timestamp, opts = {}) {
  * it and `queryAt(lastMonth)` does not — we did not know it yet. Both answers
  * are correct; they answer different questions (§14).
  *
+ * Trust uses everything recorded up to now, including later contradictions
+ * and corrections: the question is what was true, asked with today's
+ * knowledge. For trust as it stood at an instant, use `queryAt`.
+ *
  * @param {string} text
  * @param {number} timestamp — Unix ms on the event-time axis
  * @param {{ limit?, maxTokens?, filter?, allowedWorkspaces? }} [opts]
@@ -1649,7 +1758,8 @@ async function queryValidAt(text, timestamp, opts = {}) {
  * Range query over the version timeline. An entity is included if any version's
  * active interval overlaps `[since, until]`. Each is scored against the version
  * current at `until` (or latest, if `until` is omitted). Either bound may be null
- * for an open-ended range.
+ * for an open-ended range. With a finite `until`, trust is as of `until`, the
+ * same as `queryAt(text, until)`; with no `until` it is current trust.
  *
  * @param {string} text
  * @param {number|null} since — Unix ms (null for -Infinity)
@@ -1676,8 +1786,11 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
   if ([hasAsOf, hasValidAt, hasRange].filter(Boolean).length > 1) {
     throw emitError(Err.validation("asOf, validAt and { since, until } are distinct query modes — supply exactly one"));
   }
-  const sinceMs = hasRange ? (Number.isFinite(Number(since)) ? Number(since) : -Infinity) : null;
-  const untilMs = hasRange ? (Number.isFinite(Number(until)) ? Number(until) :  Infinity) : null;
+  // A missing bound is open-ended. Test for it before Number(): Number(null)
+  // is 0, which would pin an omitted `until` to the epoch.
+  const bound   = (v, open) => (v == null || !Number.isFinite(Number(v)) ? open : Number(v));
+  const sinceMs = hasRange ? bound(since, -Infinity) : null;
+  const untilMs = hasRange ? bound(until,  Infinity) : null;
   if (hasRange && sinceMs > untilMs) {
     throw emitError(Err.validation(`since (${since}) must be <= until (${until})`));
   }
@@ -1702,6 +1815,7 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
       if (!v) return null; // entity did not exist yet
       // Use per-version linkIds snapshot for true historical graph state
       const historicalLinks = new Set(v.linkIds || []);
+      const trustInputs = _trustInputsAt(e, asOf);
       return {
         id:        e.id,
         type:      e.type,
@@ -1715,6 +1829,8 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
         source:    v.source || e.source || { type: "user" },
         classification: v.classification || e.classification || "internal",
         delta:     v.delta || null,
+        trustScore: trustInputs.trustScore,
+        trustInputs,
       };
     }).filter(Boolean);
   }
@@ -1771,6 +1887,10 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
       if (!overlaps) return null;
 
       const historicalLinks = new Set(scoreVersion.linkIds || []);
+      // A bounded range scores the ingest-time snapshot at untilMs — the same
+      // one queryAt(untilMs) scores — so its trust is as of untilMs too. An
+      // open-ended range is current state and keeps current trust.
+      const trustInputs = Number.isFinite(untilMs) ? _trustInputsAt(e, untilMs) : null;
       return {
         id:        e.id,
         type:      e.type,
@@ -1784,7 +1904,8 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
         source:    scoreVersion.source || e.source || { type: "user" },
         classification: scoreVersion.classification || e.classification || "internal",
         delta:     scoreVersion.delta || null,
-        trustScore: e.trustScore,
+        trustScore: trustInputs ? trustInputs.trustScore : e.trustScore,
+        trustInputs,
       };
     }).filter(Boolean);
   }
@@ -2298,6 +2419,7 @@ async function getHistory(id, { allowedWorkspaces } = {}) {
       classification:    v.classification || e.classification || "internal",
       linkIds:           v.linkIds || [],
       contentRisk:       v.contentRisk || null,
+      ...(v.diff ? { diff: v.diff } : {}),
     })),
     trailEvents: [...(e.trailEvents || [])].reverse(), // oldest-first for readability
   };
@@ -2723,8 +2845,9 @@ async function getStartupSummary({
 // existed.
 //
 // Trust changes that are reflected only in scoring (e.g. recency-weighted decay)
-// are NOT trail events. Only explicit annotate({ trustScore }) calls and
-// contradiction-flagging produce trail entries.
+// are NOT trail events. Only explicit writes of the base — annotate() or
+// ingest() with a `trustScore`, each carrying diff.trustScore = { from, to } —
+// and contradiction-flagging produce trail entries.
 
 /**
  * Read-only projection of every memory mutation across the store. Sorted by

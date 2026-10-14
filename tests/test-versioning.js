@@ -547,6 +547,41 @@ const INIT_OPTS = {
     assert.strictEqual(res.since, null, "since should echo null when omitted");
   });
 
+  // Number(null) is 0, so a missing `until` used to become the epoch and every
+  // since-only range threw "since must be <= until".
+  await test("unbounded until (null, undefined or omitted) is open-ended", async () => {
+    await lib.init(INIT_OPTS);
+    const t0 = Date.now() - 60_000;
+    const id = await lib.ingest("quarterly revenue is fifty million dollars", { timestamp: t0 });
+    await lib.ingest("quarterly revenue is sixty million dollars", { timestamp: t0 + 1000 });
+
+    for (const [label, res] of [
+      ["null",      await lib.queryRange("quarterly revenue", t0, null)],
+      ["undefined", await lib.queryRange("quarterly revenue", t0, undefined)],
+      ["omitted",   await lib.queryRange("quarterly revenue", t0)],
+    ]) {
+      const r = res.results.find(x => x.id === id);
+      assert.ok(r, `until ${label}: the entity must be in range`);
+      assert.ok(r.text.includes("sixty"), `until ${label}: scored against the latest version, got: ${r.text}`);
+      assert.strictEqual(res.until, null, `until ${label}: should echo null`);
+    }
+  });
+
+  await test("unbounded since reaches before the epoch", async () => {
+    await lib.init(INIT_OPTS);
+    const id = await lib.ingest("archived ledger entry from the punch card era", { timestamp: -86_400_000 });
+    const res = await lib.queryRange("archived ledger punch card", null, 0);
+    assert.ok(res.results.find(x => x.id === id), "since null is -Infinity, not 0");
+  });
+
+  await test("an open range keeps the until bound it was given", async () => {
+    await lib.init(INIT_OPTS);
+    const t0 = Date.now() - 60_000;
+    const id = await lib.ingest("distinct walrus memory about arctic ice", { timestamp: t0 });
+    const res = await lib.queryRange("walrus arctic", null, t0 - 1);
+    assert.ok(!res.results.find(x => x.id === id), "an entity created after until stays out");
+  });
+
   await test("buildChangelog is exported and consumes getHistory output", async () => {
     await lib.init(INIT_OPTS);
     assert.strictEqual(typeof lib.buildChangelog, "function", "buildChangelog must be exported");

@@ -47,6 +47,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `reaffirmed` trail event for a reaffirm. A write that leaves the base
   unchanged records nothing, so its version and trail event look exactly as
   before.
+- **An open-ended `queryRange` works.** A missing bound is documented as
+  open-ended, but `null` went through `Number()` and became 0, so
+  `queryRange(text, since)` and `queryRange(text, since, null)` threw
+  "since must be <= until" for any real timestamp. The same happened over
+  REST (`POST /query` and agent recall with only `since`), where a missing
+  `until` arrives as `null`. A missing `since` was 0 rather than -Infinity,
+  which dropped anything stamped before 1970. Both bounds are now
+  open-ended when omitted.
 
 ### Known issues
 

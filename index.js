@@ -1786,8 +1786,11 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
   if ([hasAsOf, hasValidAt, hasRange].filter(Boolean).length > 1) {
     throw emitError(Err.validation("asOf, validAt and { since, until } are distinct query modes — supply exactly one"));
   }
-  const sinceMs = hasRange ? (Number.isFinite(Number(since)) ? Number(since) : -Infinity) : null;
-  const untilMs = hasRange ? (Number.isFinite(Number(until)) ? Number(until) :  Infinity) : null;
+  // A missing bound is open-ended. Test for it before Number(): Number(null)
+  // is 0, which would pin an omitted `until` to the epoch.
+  const bound   = (v, open) => (v == null || !Number.isFinite(Number(v)) ? open : Number(v));
+  const sinceMs = hasRange ? bound(since, -Infinity) : null;
+  const untilMs = hasRange ? bound(until,  Infinity) : null;
   if (hasRange && sinceMs > untilMs) {
     throw emitError(Err.validation(`since (${since}) must be <= until (${until})`));
   }

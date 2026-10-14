@@ -263,6 +263,20 @@ function includesMatch(payload, re) {
     });
   });
 
+  // 4. REST: a since-only range. The client drops the missing `until`, the
+  // server defaults it to null, and the engine must read that as open-ended.
+  await test("REST: a range with only since is open-ended", async () => {
+    await withServer(async () => {
+      const kal = connect(BASE);
+      await seedOverRest(kal);
+
+      const res = await kal.queryRange("Dana annual salary", FEB1);
+      assert.ok(res.count > 0, "a since-only range must return what is in range");
+      assert.ok(includesMatch(res, /thirty thousand/), "an open range ends at the latest version");
+      assert.equal(res.until, null, "the response echoes the missing bound as null");
+    });
+  });
+
   // 4. MCP: validAt is a registered parameter on kalairos_recall.
   await test("MCP: kalairos_recall advertises both time axes", async () => {
     const mcp = mcpClient();

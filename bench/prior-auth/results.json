@@ -1,0 +1,127 @@
+{
+  "runAt": "2026-10-14T18:00:38.103Z",
+  "cases": 301,
+  "seed": 114,
+  "elapsedMs": 597.4,
+  "summary": {
+    "cases": 301,
+    "hindsightLeakage": 0,
+    "decisionTimeRecall": 1,
+    "replayDrift": 0,
+    "eventTimeRecall": 1,
+    "lateEvidenceRecall": 1,
+    "lateEvidenceRecords": 382,
+    "forwardLeakage": 0,
+    "criteriaInForce": 1,
+    "frozenRecord": 1,
+    "authorshipPreserved": 1,
+    "trustDrift": 0.3987,
+    "trustDriftMax": 0.27,
+    "trustCitesLater": 0.2957,
+    "controlCases": 271,
+    "controlDetection": 1,
+    "coverage": {
+      "lateRecords": 242,
+      "revisedAfterDecision": 126,
+      "policyRevisedByReview": 52
+    }
+  },
+  "floors": [
+    {
+      "metric": "hindsightLeakage",
+      "op": "<=",
+      "value": 0,
+      "actual": 0,
+      "ok": true
+    },
+    {
+      "metric": "decisionTimeRecall",
+      "op": ">=",
+      "value": 1,
+      "actual": 1,
+      "ok": true
+    },
+    {
+      "metric": "replayDrift",
+      "op": "<=",
+      "value": 0,
+      "actual": 0,
+      "ok": true
+    },
+    {
+      "metric": "eventTimeRecall",
+      "op": ">=",
+      "value": 1,
+      "actual": 1,
+      "ok": true
+    },
+    {
+      "metric": "lateEvidenceRecall",
+      "op": ">=",
+      "value": 1,
+      "actual": 1,
+      "ok": true
+    },
+    {
+      "metric": "forwardLeakage",
+      "op": "<=",
+      "value": 0,
+      "actual": 0,
+      "ok": true
+    },
+    {
+      "metric": "criteriaInForce",
+      "op": ">=",
+      "value": 1,
+      "actual": 1,
+      "ok": true
+    },
+    {
+      "metric": "frozenRecord",
+      "op": ">=",
+      "value": 1,
+      "actual": 1,
+      "ok": true
+    },
+    {
+      "metric": "authorshipPreserved",
+      "op": ">=",
+      "value": 1,
+      "actual": 1,
+      "ok": true
+    },
+    {
+      "metric": "controlDetection",
+      "op": ">=",
+      "value": 1,
+      "actual": 1,
+      "ok": true
+    }
+  ],
+  "reference": {
+    "id": "PA-0001",
+    "revisedAfter": 1,
+    "policyRevised": true,
+    "leaked": [],
+    "knownExpected": 5,
+    "knownFound": 5,
+    "drift": false,
+    "trustDelta": 0.27,
+    "trustCitesLater": true,
+    "truthExpected": 6,
+    "truthFound": 6,
+    "lateExpected": 1,
+    "lateFound": 1,
+    "forward": [],
+    "criteriaOk": true,
+    "criteriaReturned": [
+      "Medical policy MP-114, lumbar discectomy: covered when spine imaging confirms nerve root compression and the member has completed at least six weeks of conservative therapy, unless a progressive neurological deficit is documented."
+    ],
+    "frozenOk": true,
+    "frozenExpected": 5,
+    "frozenGot": 5,
+    "authorshipOk": true,
+    "hasLaterWrites": true,
+    "naiveLeaked": true
+  }
+}

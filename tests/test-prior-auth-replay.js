@@ -148,6 +148,56 @@ const clone  = (o) => JSON.parse(JSON.stringify(o));
     assert.equal(F.trueAt([original, corrected], 4), null, "nothing was true before the event");
   });
 
+  await test("the full runner meets every floor on generated cases", async () => {
+    const { summary, identityMisses } = await R.runReplay([C, ...F.generateCases(25, 3)]);
+    assert.deepEqual(identityMisses, [], "every revision lands on its own record");
+    const failing = R.checkFloors(summary).filter(f => !f.ok).map(f => f.metric);
+    assert.deepEqual(failing, [], "every published floor holds end to end");
+    assert.equal(summary.cases, 26);
+  });
+
+  await test("a revision that lands on the wrong record is reported, not scored", async () => {
+    // Same key, unrelated text: nothing is similar enough to merge into, so
+    // the engine creates a second record. The harness must flag that instead
+    // of letting a broken fixture pass as a time-travel result.
+    const t = Date.parse("2026-05-01T09:00:00Z");
+    const broken = {
+      id: "PA-9999", policy: "MP-114", requestAt: t, decisionAt: t + F.DAY, reviewAt: t + 30 * F.DAY,
+      writes: [
+        { key: "imaging", role: "evidence", text: "Case PA-9999 lumbar MRI report: disc herniation compressing the left nerve root.",
+          ingestAt: t, effectiveAt: t - F.DAY, source: { type: "file" }, who: { agent: "intake" } },
+        { key: "imaging", role: "evidence", text: "Quarterly parking garage access badge audit completed without findings.",
+          ingestAt: t + 2 * F.DAY, effectiveAt: t - F.DAY, source: { type: "file" }, who: { agent: "intake" } },
+      ],
+    };
+    const unmuteLocal = R.muteEngineLog();
+    try {
+      await R.initEngine();
+      const { identityMisses } = await R.load([broken]);
+      assert.equal(identityMisses.length, 1, "the forked revision is caught");
+      assert.equal(identityMisses[0].key, "imaging");
+      assert.notEqual(identityMisses[0].got, identityMisses[0].expected);
+    } finally {
+      await lib.shutdown().catch(() => {});
+      unmuteLocal();
+    }
+  });
+
+  await test("muting engine chatter lets every other error through", async () => {
+    const original = console.error;
+    const seen = [];
+    console.error = (...args) => seen.push(args.join(" "));
+    const unmuteLocal = R.muteEngineLog();
+    try {
+      console.error("[kalairos] Created entity 1 [text]");
+      console.error("something actually went wrong");
+    } finally {
+      unmuteLocal();
+      console.error = original;
+    }
+    assert.deepEqual(seen, ["something actually went wrong"]);
+  });
+
   await test("the generator is deterministic per seed", async () => {
     const a = F.generateCases(20, 7), b = F.generateCases(20, 7), c = F.generateCases(20, 8);
     assert.deepEqual(a, b, "same seed, same cases");

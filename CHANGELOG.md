@@ -19,13 +19,33 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `node bench/prior-auth/case.js` narrates the reference case. See
   `bench/prior-auth/README.md`.
 
+### Fixed
+
+- **`queryAt` trust is point-in-time.** A replay used to score trust against
+  the entity's full version history and its current annotations, so a
+  contradiction, correction or annotation recorded after `asOf` changed the
+  trust a past answer reported, and its breakdown cited it. `trust`,
+  `trustScore` and `trustBreakdown` from `queryAt(text, asOf)` now come from
+  what had been recorded by `asOf`: the versions ingested by then, recency
+  from the version returned (and any reaffirm by then), the base trust score
+  as it stood then (reconstructed from `annotate()` changes on the trail),
+  and the returned version's content-risk verdict, with a reviewer's override
+  only if it was made by then. In the prior-auth benchmark, trust drift fell
+  from 40% of cases (max Δ 0.27) to 0 and trust citing later contradictions
+  from 30% to 0; both are now gated floors. `queryAt` results' `trustScore`
+  is now that base, matching `trustBreakdown.base`; it used to be the source
+  default of the returned version. A `queryRange` with a finite `until`
+  scores the same snapshot as `queryAt(until)`, so its trust follows.
+  `query()` output is unchanged, and `queryValidAt` deliberately keeps trust
+  from everything known now: it asks what was true, with today's knowledge.
+
 ### Known issues
 
-- **Trust is not point-in-time.** A `queryAt` replay scores trust against the
-  entity's full version history, so a contradiction recorded after `asOf`
-  lowers the replayed trust and appears in its breakdown. The new benchmark
-  measures this (40% of cases, max Δ 0.27) and reports it ungated until fixed.
-  Record content in a replay is unaffected.
+- **A `trustScore` passed to `ingest()` on an update or reaffirm is not
+  recorded on the trail**, so a `queryAt` replay from before that write
+  reports the newer base. The same applies to annotations dropped by a
+  `maxTrailEvents` cap. Changes made through `annotate()` are reconstructed
+  exactly.
 
 ## [1.9.1] — 2026-10-13
 

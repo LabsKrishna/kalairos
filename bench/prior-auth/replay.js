@@ -189,8 +189,8 @@ function scoreCase(c, live, obs, entityIds) {
   const laterKeys = new Set(obs.replayKnown.map(key));
   const drift = liveKeys.size !== laterKeys.size || [...liveKeys].some(k => !laterKeys.has(k));
 
-  // Trust hindsight (reported, not gated): same records, same day — is the
-  // trust the same, and does its explanation cite only what existed by then?
+  // Trust hindsight: same records, same day — is the trust the same, and
+  // does its explanation cite only what existed by then?
   const liveTrust = new Map(live.map(r => [r.id, r.trust]));
   let trustDelta = 0;
   for (const r of obs.replayKnown) {
@@ -307,6 +307,8 @@ const FLOORS = [
   { metric: "hindsightLeakage",    op: "<=", value: 0, label: "Hindsight leakage" },
   { metric: "decisionTimeRecall",  op: ">=", value: 1, label: "Decision-time recall" },
   { metric: "replayDrift",         op: "<=", value: 0, label: "Replay drift" },
+  { metric: "trustDrift",          op: "<=", value: 0, label: "Trust drift" },
+  { metric: "trustCitesLater",     op: "<=", value: 0, label: "Trust cites later" },
   { metric: "eventTimeRecall",     op: ">=", value: 1, label: "Event-time recall" },
   { metric: "lateEvidenceRecall",  op: ">=", value: 1, label: "Late-evidence recall" },
   { metric: "forwardLeakage",      op: "<=", value: 0, label: "Forward leakage" },

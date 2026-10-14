@@ -1,8 +1,8 @@
 {
-  "runAt": "2026-10-14T18:00:38.103Z",
+  "runAt": "2026-10-14T18:52:12.214Z",
   "cases": 301,
   "seed": 114,
-  "elapsedMs": 597.4,
+  "elapsedMs": 538.9,
   "summary": {
     "cases": 301,
     "hindsightLeakage": 0,
@@ -15,9 +15,9 @@
     "criteriaInForce": 1,
     "frozenRecord": 1,
     "authorshipPreserved": 1,
-    "trustDrift": 0.3987,
-    "trustDriftMax": 0.27,
-    "trustCitesLater": 0.2957,
+    "trustDrift": 0,
+    "trustDriftMax": 0,
+    "trustCitesLater": 0,
     "controlCases": 271,
     "controlDetection": 1,
     "coverage": {
@@ -43,6 +43,20 @@
     },
     {
       "metric": "replayDrift",
+      "op": "<=",
+      "value": 0,
+      "actual": 0,
+      "ok": true
+    },
+    {
+      "metric": "trustDrift",
+      "op": "<=",
+      "value": 0,
+      "actual": 0,
+      "ok": true
+    },
+    {
+      "metric": "trustCitesLater",
       "op": "<=",
       "value": 0,
       "actual": 0,
@@ -106,8 +120,8 @@
     "knownExpected": 5,
     "knownFound": 5,
     "drift": false,
-    "trustDelta": 0.27,
-    "trustCitesLater": true,
+    "trustDelta": 0,
+    "trustCitesLater": false,
     "truthExpected": 6,
     "truthFound": 6,
     "lateExpected": 1,

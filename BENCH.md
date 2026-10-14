@@ -154,6 +154,8 @@ Reference case + 300 generated cases, seed 114, 2026-10-14. 301 cases replay in 
 | Hindsight leakage | 0 | **0 — PASS** |
 | Decision-time recall | 1.0 | **1.0 — PASS** |
 | Replay drift | 0 | **0 — PASS** |
+| Trust drift (replayed trust ≠ decision-day trust) | 0 | **0 — PASS** |
+| Trust cites later (explanation names a contradiction recorded after the decision) | 0 | **0 — PASS** |
 | Event-time recall | 1.0 | **1.0 — PASS** |
 | Late-evidence recall | 1.0 | **1.0 — PASS** (382 late records) |
 | Forward leakage | 0 | **0 — PASS** |
@@ -162,14 +164,7 @@ Reference case + 300 generated cases, seed 114, 2026-10-14. 301 cases replay in 
 | Authorship preserved | 1.0 | **1.0 — PASS** |
 | Control: leak detection | 1.0 | **1.0 — PASS** |
 
-Reported, not gated — **trust is not yet point-in-time**:
-
-| Metric | Current |
-| ------ | ------- |
-| Trust drift (replayed trust ≠ decision-day trust) | 0.40 of cases, max Δ 0.27 |
-| Trust cites later (explanation names a contradiction recorded after the decision) | 0.30 of cases |
-
-Record content in a replay is exact; trust is computed against an entity's full version history, so a later reversal changes a past replay's trust and shows up in its explanation. When point-in-time trust lands, both rows should reach 0 and join the gated table.
+The two trust rows were first reported ungated, at 0.40 of cases (max Δ 0.27) and 0.30: a replay scored trust against the entity's full version history, so a later reversal changed a past replay's trust and showed up in its explanation. `queryAt` now computes trust from what had been recorded by `asOf` (versions, recency, base trust score, content-risk override), and both rows are gated at 0.
 
 ### CI enforcement
 

@@ -82,6 +82,12 @@ function check(ok, what) {
   const liveKeys = new Set(live.get(C.id).map(r => `${r.id}|${r.text}`));
   check(had.length === liveKeys.size && had.every(r => liveKeys.has(`${r.id}|${r.text}`)),
     "the replay differs from what was returned on the decision day");
+  const liveTrust = new Map(live.get(C.id).map(r => [r.id, r.trust]));
+  const hadDet    = had.find(r => /determination/.test(r.text));
+  console.log(`     Trust on the determination: ${liveTrust.get(hadDet?.id)} on the decision day, ${hadDet?.trust} replayed.`);
+  check(had.every(r => r.trust === liveTrust.get(r.id)), "a replayed trust differs from the decision day");
+  check(!had.some(r => (r.trustBreakdown?.contradictions?.details || []).some(d => d.timestamp > D)),
+    "a trust explanation cites a contradiction recorded after the decision");
 
   // ── 2. What was true? ──────────────────────────────────────────────────────
   const wasTrue = (await lib.queryValidAt(R.QUERY, D, scope)).results;
@@ -132,14 +138,6 @@ function check(ok, what) {
   const expectedFrozen = C.writes.filter(w => w.ingestAt <= D).length;
   check(frozen.length === expectedFrozen && frozen.every(ev => ev.ingestAt <= D),
     "the frozen record gained or lost events after the decision");
-
-  // ── Open gap, stated plainly ──────────────────────────────────────────────
-  const liveDet = live.get(C.id).find(r => r.id === det?.id);
-  console.log("");
-  console.log("  Open gap: trust is computed from full history.");
-  console.log(`     Decision-day trust on the determination: ${liveDet?.trust}. Replayed for the same day: ${det?.trust}.`);
-  console.log("     The reversal recorded later lowers the replayed score and appears in its");
-  console.log("     explanation. Record content is clean; the trust layer is not yet point-in-time.");
 
   await lib.shutdown().catch(() => {});
   console.log("");

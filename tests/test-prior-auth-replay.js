@@ -57,6 +57,8 @@ const clone  = (o) => JSON.parse(JSON.stringify(o));
     assert.deepEqual(s.leaked, [], "nothing received after the decision is in the replay");
     assert.equal(s.knownFound, s.knownExpected, "everything the reviewer had is in the replay");
     assert.equal(s.drift, false, "the replay matches the decision-day answer");
+    assert.equal(s.trustDelta, 0, "the replayed trust matches the decision-day trust");
+    assert.equal(s.trustCitesLater, false, "the trust explanation cites nothing recorded later");
     assert.equal(s.lateExpected, 1, "the MRI is the one record true but not yet received");
     assert.equal(s.lateFound, 1, "event time surfaces the late MRI");
     assert.deepEqual(s.forward, [], "nothing that became true later is in the event-time answer");
@@ -132,12 +134,25 @@ const clone  = (o) => JSON.parse(JSON.stringify(o));
     assert.equal(R.summarize([s]).controlDetection, 0);
   });
 
-  await test("a trust explanation citing a later contradiction is reported", async () => {
+  await test("a replayed trust that differs from the decision day fails trust drift", async () => {
+    const o = clone(obs);
+    o.replayKnown.find(r => /determination/.test(r.text)).trust -= 0.27;
+    const s = score(o);
+    assert.equal(s.trustDelta, 0.27);
+    assert.equal(s.drift, false, "the records are the same; only their trust moved");
+    const failing = R.checkFloors(R.summarize([s])).filter(f => !f.ok).map(f => f.metric);
+    assert.deepEqual(failing, ["trustDrift"]);
+  });
+
+  await test("a trust explanation citing a later contradiction fails its floor", async () => {
     const o = clone(obs);
     o.replayKnown.forEach(r => { r.contradictionTimes = []; });
     assert.equal(score(o).trustCitesLater, false);
     o.replayKnown[0].contradictionTimes = [D + F.HOUR];
-    assert.equal(score(o).trustCitesLater, true);
+    const s = score(o);
+    assert.equal(s.trustCitesLater, true);
+    const failing = R.checkFloors(R.summarize([s])).filter(f => !f.ok).map(f => f.metric);
+    assert.deepEqual(failing, ["trustCitesLater"]);
   });
 
   await test("ground truth: a correction replaces what it corrects on the event axis", async () => {

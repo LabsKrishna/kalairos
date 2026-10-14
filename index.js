@@ -1493,14 +1493,14 @@ async function _runWorkers(queryVector, queryTerms, subset, { now = Date.now(), 
   // here in a Map and is re-attached to top-K results during assembly. This
   // avoids serialising a breakdown object for every entity we score.
   //
-  // For historical queries (queryAt / queryRange), `updatedAt` on the subset
-  // entity already reflects the snapshot time; we use it for recency decay.
-  // Contradiction/corroboration counts still draw from the full version
-  // history — point-in-time trust is a follow-up (documented in CLAUDE.md
-  // under time-aware retrieval).
+  // Ingest-time snapshots (queryAt, bounded queryRange) carry `trustInputs`
+  // from _trustInputsAt, so a replay's trust and its breakdown see only what
+  // had been recorded by then. Everything else scores the stored entity:
+  // current state, and queryValidAt, which asks what was true at an instant
+  // with everything known today.
   const trustBreakdowns = new Map();
   const scoredEntities = subset.map(e => {
-    const storeEntity = store.get(e.id) || e;
+    const storeEntity = e.trustInputs || store.get(e.id) || e;
     const { trust, breakdown } = computeTrustSignals(storeEntity, {
       now,
       recencyHalfLifeMs: CFG.recencyHalfLifeMs,
@@ -1595,6 +1595,74 @@ function _versionValidAt(versions, validAt) {
   return found;
 }
 
+/**
+ * The trust inputs of `e` as they stood at ingest-time `asOf`, shaped for
+ * computeTrustSignals. A replay must not score a past answer with what was
+ * learned after it: a contradiction, correction or corroboration recorded
+ * later is outside the snapshot, and so is a reviewer's later annotation.
+ *
+ * - versions: only those ingested by asOf. Stored newest-first, so the
+ *   snapshot version queryAt scores stays at the head.
+ * - updatedAt: the snapshot's ingest, moved forward by any reaffirm that had
+ *   landed by asOf (a reaffirm touches updatedAt without a new version).
+ * - trustScore: annotate() records each change as { from, to } on the trail,
+ *   so the earliest change after asOf gives the value in force at asOf.
+ * - contentRisk: the verdict stored on the snapshot version, with a
+ *   reviewer's override only if the last toggle between that version's ingest
+ *   and asOf turned it on.
+ *
+ * Not recorded, so not reconstructed: a `trustScore` passed to ingest() on an
+ * update or reaffirm overwrites the base without keeping the prior value, and
+ * with maxTrailEvents set the oldest annotations may be gone. In both cases
+ * the base falls back to what the trail still shows.
+ *
+ * @param {object} e     — stored entity
+ * @param {number} asOf  — Unix ms on the ingest-time axis
+ * @returns {object|null} null if the entity did not exist yet at asOf
+ */
+function _trustInputsAt(e, asOf) {
+  const versions = (e.versions || []).filter(v => v.timestamp <= asOf);
+  const head = versions[0];
+  if (!head) return null;
+  const events = e.trailEvents || [];
+  const annotated = (field) => (ev) => ev.action === ACTIONS.annotated && ev.diff?.[field];
+
+  let updatedAt = head.timestamp;
+  for (const ev of events) {
+    if (ev.action === ACTIONS.reaffirmed && ev.ingestAt > updatedAt && ev.ingestAt <= asOf) updatedAt = ev.ingestAt;
+  }
+
+  // Trail events are newest-first, so `<=` lets the older of two same-instant
+  // changes win.
+  let trustScore = e.trustScore;
+  let firstLater = Infinity;
+  for (const ev of events.filter(annotated("trustScore"))) {
+    if (ev.ingestAt > asOf && ev.ingestAt <= firstLater) {
+      firstLater = ev.ingestAt;
+      trustScore = ev.diff.trustScore.from;
+    }
+  }
+
+  let contentRisk = null;
+  if (head.contentRisk) {
+    contentRisk = (({ override, ...rest }) => rest)(head.contentRisk);
+    let toggle = null;
+    for (const ev of events.filter(annotated("contentRiskOverride"))) {
+      if (ev.ingestAt >= head.timestamp && ev.ingestAt <= asOf && (!toggle || ev.ingestAt > toggle.ingestAt)) toggle = ev;
+    }
+    if (toggle?.diff.contentRiskOverride.to) {
+      // Prefer the stored override when it is this same decision; otherwise
+      // rebuild it from the trail event that recorded it.
+      const live = head === e.versions[0] ? e.contentRisk?.override : null;
+      contentRisk.override = live && live.at <= asOf
+        ? live
+        : { who: toggle.who || null, at: toggle.ingestAt, why: toggle.why || null };
+    }
+  }
+
+  return { versions, updatedAt, trustScore, contentRisk };
+}
+
 async function query(text, opts = {}) {
   if (opts && (opts.asOf != null || opts.validAt != null || opts.since != null || opts.until != null)) {
     _assertInit();
@@ -1609,6 +1677,10 @@ async function query(text, opts = {}) {
  * Time-travel query: score each entity against the version current at `timestamp`.
  * Entities that did not yet exist are skipped. Recency boost is disabled —
  * "now" has no meaning for a historical snapshot.
+ *
+ * Trust is point-in-time too: `trust`, `trustScore` and `trustBreakdown` are
+ * computed from what had been recorded by `timestamp`, so a contradiction or
+ * annotation that landed later does not change a replayed answer.
  *
  * @param {string} text
  * @param {number} timestamp — Unix ms
@@ -1632,6 +1704,10 @@ async function queryAt(text, timestamp, opts = {}) {
  * it and `queryAt(lastMonth)` does not — we did not know it yet. Both answers
  * are correct; they answer different questions (§14).
  *
+ * Trust uses everything recorded up to now, including later contradictions
+ * and corrections: the question is what was true, asked with today's
+ * knowledge. For trust as it stood at an instant, use `queryAt`.
+ *
  * @param {string} text
  * @param {number} timestamp — Unix ms on the event-time axis
  * @param {{ limit?, maxTokens?, filter?, allowedWorkspaces? }} [opts]
@@ -1649,7 +1725,8 @@ async function queryValidAt(text, timestamp, opts = {}) {
  * Range query over the version timeline. An entity is included if any version's
  * active interval overlaps `[since, until]`. Each is scored against the version
  * current at `until` (or latest, if `until` is omitted). Either bound may be null
- * for an open-ended range.
+ * for an open-ended range. With a finite `until`, trust is as of `until`, the
+ * same as `queryAt(text, until)`; with no `until` it is current trust.
  *
  * @param {string} text
  * @param {number|null} since — Unix ms (null for -Infinity)
@@ -1702,6 +1779,7 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
       if (!v) return null; // entity did not exist yet
       // Use per-version linkIds snapshot for true historical graph state
       const historicalLinks = new Set(v.linkIds || []);
+      const trustInputs = _trustInputsAt(e, asOf);
       return {
         id:        e.id,
         type:      e.type,
@@ -1715,6 +1793,8 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
         source:    v.source || e.source || { type: "user" },
         classification: v.classification || e.classification || "internal",
         delta:     v.delta || null,
+        trustScore: trustInputs.trustScore,
+        trustInputs,
       };
     }).filter(Boolean);
   }
@@ -1771,6 +1851,10 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
       if (!overlaps) return null;
 
       const historicalLinks = new Set(scoreVersion.linkIds || []);
+      // A bounded range scores the ingest-time snapshot at untilMs — the same
+      // one queryAt(untilMs) scores — so its trust is as of untilMs too. An
+      // open-ended range is current state and keeps current trust.
+      const trustInputs = Number.isFinite(untilMs) ? _trustInputsAt(e, untilMs) : null;
       return {
         id:        e.id,
         type:      e.type,
@@ -1784,7 +1868,8 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
         source:    scoreVersion.source || e.source || { type: "user" },
         classification: scoreVersion.classification || e.classification || "internal",
         delta:     scoreVersion.delta || null,
-        trustScore: e.trustScore,
+        trustScore: trustInputs ? trustInputs.trustScore : e.trustScore,
+        trustInputs,
       };
     }).filter(Boolean);
   }

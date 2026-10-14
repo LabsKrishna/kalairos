@@ -44,6 +44,8 @@ Ground truth comes from the domain rule in `fixtures.js` (`knownAt`, `trueAt`), 
 | Hindsight leakage | 0 | Any record, or later version of a record, in the decision-day replay that was received after the decision |
 | Decision-time recall | 1.0 | A record the reviewer had is missing from the replay |
 | Replay drift | 0 | The replay, asked after later writes, differs from what was returned on the decision day |
+| Trust drift | 0 | A replayed record's trust differs from the trust reported for it on the decision day |
+| Trust cites later | 0 | The replayed trust explanation cites a contradiction recorded after the decision |
 | Event-time recall | 1.0 | A record true at the decision is missing from `queryValidAt` |
 | Late-evidence recall | 1.0 | The same, restricted to records that arrived after the decision |
 | Forward leakage | 0 | `queryValidAt` returns something that only became true after the decision |
@@ -56,18 +58,15 @@ Every floor is exact. On synthetic cases with known ground truth, a miss is a bu
 
 ## Current result
 
-Reference case + 300 generated cases, seed 114, 2026-10-14: **every floor met.** 242 cases had a record arrive after the decision (382 records), 126 had a record revised after the decision, 52 had their policy revised between request and review.
+Reference case + 300 generated cases, seed 114, 2026-10-14: **every floor met**, trust included. 242 cases had a record arrive after the decision (382 records), 126 had a record revised after the decision, 52 had their policy revised between request and review.
 
-## Known gap: trust is not point-in-time
+## Trust in a replay
 
-Reported, not gated:
+The two trust rows were first published ungated, as a known gap: trust drift in 0.40 of cases (max Δ 0.27), and a trust explanation citing a later contradiction in 0.30. Record content in a replay was already exact, but trust was scored against the entity's full version history, so a reversal recorded on day 5 lowered the trust a day-2 replay reported and the explanation named it. In the reference case the determination read 0.90 on the decision day and 0.63 when replayed for the same day.
 
-| Metric | Result | Meaning |
-|---|---|---|
-| Trust drift | 0.40 of cases, max Δ 0.27 | A replayed record's trust differs from what it was on the decision day |
-| Trust cites later | 0.30 of cases | The replayed trust explanation cites a contradiction recorded after the decision |
+`queryAt` now computes trust from what had been recorded by `asOf`: only versions received by then, recency from the version it returns, the base trust score as it stood then (reconstructed from the `annotate()` changes on the trail), and that version's content-risk verdict, with a reviewer's override only if it was made by then. Both rows are 0 and gated.
 
-Record content in a replay is exact. Trust is not: `computeTrustSignals` scores an entity against its full version history, so a reversal recorded on day 5 lowers the trust a day-2 replay reports, and the explanation names it. In the reference case the determination reads 0.90 on the decision day and 0.63 when replayed for the same day. For a regulated review this is hindsight in the provenance payload. The fix is point-in-time trust for `queryAt` (score only versions received by `asOf`); when it lands, both rows should reach 0 and become gated.
+One limit remains, and it does not occur in this workload: a `trustScore` passed to `ingest()` on an update overwrites the base without recording the value it replaced, so a replay from before that write reports the newer base. Changes made through `annotate()` are reconstructed exactly.
 
 ## What this is not
 

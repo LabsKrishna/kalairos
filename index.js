@@ -345,6 +345,7 @@ function _buildVersionRecord({
   why,
   previousVersionId,
   contentRisk,
+  diff,
 }) {
   const ordinal     = (entity.versions?.length || 0) + 1;
   const versionId   = _makeVersionId(entity.id, ordinal);
@@ -371,7 +372,21 @@ function _buildVersionRecord({
     // after a later correction moved the head. Omitted entirely when no
     // detector ran, so existing records are byte-identical.
     ...(contentRisk ? { contentRisk } : {}),
+    // Entity fields this write changed besides the content, as { from, to }
+    // — the shape annotate() records on its trail event. `delta` describes
+    // the text; this describes the rest. Omitted when nothing else changed.
+    ...(diff ? { diff } : {}),
   };
+}
+
+// The `diff` an ingest records when it moves the stored base trust, so every
+// change to the base is on the record whichever write made it: annotate(),
+// a reaffirming ingest, or an updating one. _trustInputsAt rewinds through
+// these to score a replay with the base in force at the time. null when the
+// base is unchanged.
+function _trustDiff(from, to) {
+  if (from === to) return null;
+  return { trustScore: { from: Number.isFinite(from) ? from : null, to } };
 }
 
 // ─── Shared Entity Serialization ─────────────────────────────────────────────
@@ -1092,6 +1107,8 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       // Skip a new content version; record a metadata-only trail event so the
       // audit log still captures that a write happened.
       if (sameContent && sameSource) {
+        const nextTrust = Number.isFinite(trustScore) ? Math.max(0, Math.min(1, trustScore)) : mergeTarget.trustScore;
+        const diff = _trustDiff(mergeTarget.trustScore, nextTrust);
         const reaffirmEvent = {
           entityId:          mergeTarget.id,
           versionId:         _makeVersionId(mergeTarget.id, mergeTarget.versions.length + 1) + ":reaffirmed",
@@ -1105,12 +1122,13 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
           contentChanged:    false,
           deltaSummary:      null,
           classification:    cls,
+          ...(diff ? { diff } : {}),
         };
         _appendTrailEvent(mergeTarget, reaffirmEvent);
         // Refresh updatedAt so recency-aware features still notice the touch,
         // but keep text/vector untouched.
         mergeTarget.updatedAt = ts;
-        if (Number.isFinite(trustScore)) mergeTarget.trustScore = Math.max(0, Math.min(1, trustScore));
+        if (diff) mergeTarget.trustScore = nextTrust;
         _persistAll();
         console.error(`[kalairos] Reaffirmed entity ${mergeTarget.id} (no content change)`);
         return mergeTarget.id;
@@ -1141,6 +1159,12 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       // when this new one becomes effective.
       if (latest) latest.validTo = newEffectiveAt;
 
+      // Update trust score when explicitly provided; otherwise preserve existing.
+      // Settled before the version is built so the version records the change.
+      const nextTrust = Number.isFinite(trustScore) ? Math.max(0, Math.min(1, trustScore))
+                      : Number.isFinite(mergeTarget.trustScore) ? mergeTarget.trustScore
+                      : _defaultTrustScore(src.type);
+
       const versionRecord = _buildVersionRecord({
         entity:            mergeTarget,
         text:              safeText,
@@ -1156,6 +1180,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
         why:               whyText,
         previousVersionId: latest?.versionId || null,
         contentRisk:       riskVerdict,
+        diff:              _trustDiff(mergeTarget.trustScore, nextTrust),
       });
       mergeTarget.versions.unshift(versionRecord);
 
@@ -1200,9 +1225,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       if (llmEnrichment) mergeTarget.llmKeywords = llmEnrichment.keywords;
       if (Number.isFinite(importance)) mergeTarget.importance = Math.max(0, Math.min(1, importance));
       else if (llmEnrichment && Number.isFinite(llmEnrichment.importance)) mergeTarget.importance = llmEnrichment.importance;
-      // Update trust score when explicitly provided; otherwise preserve existing
-      if (Number.isFinite(trustScore)) mergeTarget.trustScore = Math.max(0, Math.min(1, trustScore));
-      else if (!Number.isFinite(mergeTarget.trustScore)) mergeTarget.trustScore = _defaultTrustScore(src.type);
+      mergeTarget.trustScore = nextTrust;
       // The verdict describes the HEAD text. This update replaced the head, so
       // a verdict from the superseded text is stale and must not keep scoring
       // the new one — including a human override, which cleared different
@@ -1605,16 +1628,18 @@ function _versionValidAt(versions, validAt) {
  *   snapshot version queryAt scores stays at the head.
  * - updatedAt: the snapshot's ingest, moved forward by any reaffirm that had
  *   landed by asOf (a reaffirm touches updatedAt without a new version).
- * - trustScore: annotate() records each change as { from, to } on the trail,
- *   so the earliest change after asOf gives the value in force at asOf.
+ * - trustScore: every change to the base is recorded as
+ *   diff.trustScore = { from, to } — on the trail event of an annotate() or
+ *   a reaffirming ingest, and on the version an updating ingest wrote — so
+ *   the earliest change after asOf gives the value in force at asOf.
  * - contentRisk: the verdict stored on the snapshot version, with a
  *   reviewer's override only if the last toggle between that version's ingest
  *   and asOf turned it on.
  *
- * Not recorded, so not reconstructed: a `trustScore` passed to ingest() on an
- * update or reaffirm overwrites the base without keeping the prior value, and
- * with maxTrailEvents set the oldest annotations may be gone. In both cases
- * the base falls back to what the trail still shows.
+ * Not reconstructed: with maxTrailEvents set, the oldest annotations and
+ * reaffirms may be gone, and the base falls back to what the trail still
+ * shows. Records written before ingest recorded its trust changes carry no
+ * diff for them either.
  *
  * @param {object} e     — stored entity
  * @param {number} asOf  — Unix ms on the ingest-time axis
@@ -1633,13 +1658,21 @@ function _trustInputsAt(e, asOf) {
   }
 
   // Trail events are newest-first, so `<=` lets the older of two same-instant
-  // changes win.
+  // changes win. A version tied with a trail change came first only if it led
+  // into it: its `to` is the `from` already picked.
   let trustScore = e.trustScore;
   let firstLater = Infinity;
-  for (const ev of events.filter(annotated("trustScore"))) {
-    if (ev.ingestAt > asOf && ev.ingestAt <= firstLater) {
+  for (const ev of events) {
+    if (ev.diff?.trustScore && ev.ingestAt > asOf && ev.ingestAt <= firstLater) {
       firstLater = ev.ingestAt;
       trustScore = ev.diff.trustScore.from;
+    }
+  }
+  for (const v of e.versions || []) {
+    const change = v.diff?.trustScore;
+    if (change && v.timestamp > asOf && (v.timestamp < firstLater || (v.timestamp === firstLater && change.to === trustScore))) {
+      firstLater = v.timestamp;
+      trustScore = change.from;
     }
   }
 
@@ -2383,6 +2416,7 @@ async function getHistory(id, { allowedWorkspaces } = {}) {
       classification:    v.classification || e.classification || "internal",
       linkIds:           v.linkIds || [],
       contentRisk:       v.contentRisk || null,
+      ...(v.diff ? { diff: v.diff } : {}),
     })),
     trailEvents: [...(e.trailEvents || [])].reverse(), // oldest-first for readability
   };
@@ -2808,8 +2842,9 @@ async function getStartupSummary({
 // existed.
 //
 // Trust changes that are reflected only in scoring (e.g. recency-weighted decay)
-// are NOT trail events. Only explicit annotate({ trustScore }) calls and
-// contradiction-flagging produce trail entries.
+// are NOT trail events. Only explicit writes of the base — annotate() or
+// ingest() with a `trustScore`, each carrying diff.trustScore = { from, to } —
+// and contradiction-flagging produce trail entries.
 
 /**
  * Read-only projection of every memory mutation across the store. Sorted by

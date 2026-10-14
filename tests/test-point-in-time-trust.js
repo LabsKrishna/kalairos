@@ -64,6 +64,7 @@ const Q   = "Atlas billing service release approved";
 const APPROVED = "Atlas billing service release is approved for production after the security review by the platform team on the main cluster in the east region this week";
 const DENIED   = APPROVED.replace("is approved", "is not approved");     // negation flip: contradicts
 const AMENDED  = DENIED.replace("this week", "this month");               // same claim, reworded: resolves
+const REWORDED = APPROVED.replace("this week", "this month");             // same claim, reworded: agrees
 
 // The trust surface of the one result: what a replay must hold still.
 const trustOf = (res) => {
@@ -135,6 +136,78 @@ const trustOf = (res) => {
     assert.equal(later.trustBreakdown.base, 0.2, "a replay after the annotation sees it");
     assert.equal(later.trustScore, 0.2);
     assert.equal((await lib.query(Q)).results[0].trustScore, 0.2, "control: current state sees it");
+  });
+
+  await test("an updating ingest with trustScore after asOf does not change the replayed base trust", async () => {
+    await fresh();
+    const asOf = t0 + DAY;
+    const id = await lib.ingest(APPROVED, { timestamp: t0, source: { type: "user" } });
+    const before = trustOf(await lib.queryAt(Q, asOf));
+    const base = before.trustBreakdown.base;
+    assert.notEqual(base, 0.15, "fixture: the later write must move the base");
+
+    await lib.ingest(REWORDED, { timestamp: t0 + 2 * DAY, source: { type: "user" }, trustScore: 0.15 });
+    const h = await lib.getHistory(id);
+    assert.equal(h.versions.length, 2, "fixture: the write is a revision of the same record");
+
+    const after = trustOf(await lib.queryAt(Q, asOf));
+    assert.deepEqual(after, before, "the new base landed after asOf");
+    assert.deepEqual(h.versions[1].diff, { trustScore: { from: base, to: 0.15 } }, "the version records the change");
+
+    const later = trustOf(await lib.queryAt(Q, t0 + 2 * DAY));
+    assert.equal(later.trustBreakdown.base, 0.15, "a replay after the write sees it");
+    assert.equal(later.trustScore, 0.15);
+    assert.equal((await lib.query(Q)).results[0].trustScore, 0.15, "control: current state sees it");
+
+    const ev = (await lib.trail({ entity: id })).find(e => e.versionId === h.versions[1].versionId);
+    assert.deepEqual(ev.diff, { trustScore: { from: base, to: 0.15 } }, "the trail shows the change");
+  });
+
+  await test("a reaffirming ingest with trustScore after asOf does not change the replayed base trust", async () => {
+    await fresh();
+    const asOf = t0 + DAY;
+    const id = await lib.ingest(APPROVED, { timestamp: t0, source: { type: "user" } });
+    const before = trustOf(await lib.queryAt(Q, asOf));
+    const base = before.trustBreakdown.base;
+
+    await lib.ingest(APPROVED, { timestamp: t0 + 2 * DAY, source: { type: "user" }, trustScore: 0.15 });
+    const h = await lib.getHistory(id);
+    assert.equal(h.versions.length, 1, "fixture: identical content and source is a reaffirm, not a version");
+
+    const after = trustOf(await lib.queryAt(Q, asOf));
+    assert.deepEqual(after, before, "the new base landed after asOf");
+    const ev = (await lib.trail({ entity: id })).find(e => e.action === "reaffirmed");
+    assert.deepEqual(ev.diff, { trustScore: { from: base, to: 0.15 } }, "the reaffirm records the change");
+
+    const later = trustOf(await lib.queryAt(Q, t0 + 2 * DAY));
+    assert.equal(later.trustBreakdown.base, 0.15, "a replay after the reaffirm sees it");
+    assert.equal((await lib.query(Q)).results[0].trustScore, 0.15, "control: current state sees it");
+  });
+
+  await test("each replay sees the base in force at its instant across ingest and annotate writes", async () => {
+    await fresh();
+    const id = await lib.ingest(APPROVED, { timestamp: t0, source: { type: "user" } });
+    const base = trustOf(await lib.queryAt(Q, t0)).trustBreakdown.base;
+    await lib.ingest(REWORDED, { timestamp: t0 + 2 * DAY, source: { type: "user" }, trustScore: 0.3 });
+    await lib.ingest(REWORDED, { timestamp: t0 + 4 * DAY, source: { type: "user" }, trustScore: 0.6 });
+    await lib.annotate(id, { trustScore: 0.9, who: { user: "reviewer" }, why: "verified with the source" });
+
+    const baseAt = async (asOf) => trustOf(await lib.queryAt(Q, asOf)).trustBreakdown.base;
+    assert.equal(await baseAt(t0 + DAY), base, "before any write: the source default");
+    assert.equal(await baseAt(t0 + 3 * DAY), 0.3, "after the revision");
+    assert.equal(await baseAt(t0 + 5 * DAY), 0.6, "after the reaffirm");
+    assert.equal(await baseAt(Date.now() + DAY), 0.9, "after the annotation");
+  });
+
+  await test("an ingest that leaves the base unchanged records no diff", async () => {
+    await fresh();
+    const id = await lib.ingest(APPROVED, { timestamp: t0, source: { type: "user" }, trustScore: 0.4 });
+    await lib.ingest(REWORDED, { timestamp: t0 + DAY, source: { type: "user" } });
+    await lib.ingest(REWORDED, { timestamp: t0 + 2 * DAY, source: { type: "user" }, trustScore: 0.4 });
+    const h = await lib.getHistory(id);
+    assert.equal(h.versions.length, 2, "fixture: one revision, then a reaffirm");
+    for (const v of h.versions) assert.ok(!("diff" in v), `${v.versionId} carries no diff`);
+    for (const ev of await lib.trail({ entity: id })) assert.ok(!("diff" in ev), `${ev.versionId} carries no diff`);
   });
 
   await test("a later flagged revision does not penalise the clean version a replay scores", async () => {

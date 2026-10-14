@@ -28,7 +28,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `trustScore` and `trustBreakdown` from `queryAt(text, asOf)` now come from
   what had been recorded by `asOf`: the versions ingested by then, recency
   from the version returned (and any reaffirm by then), the base trust score
-  as it stood then (reconstructed from `annotate()` changes on the trail),
+  as it stood then (rewound through every recorded change to it since),
   and the returned version's content-risk verdict, with a reviewer's override
   only if it was made by then. In the prior-auth benchmark, trust drift fell
   from 40% of cases (max Δ 0.27) to 0 and trust citing later contradictions
@@ -38,14 +38,23 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scores the same snapshot as `queryAt(until)`, so its trust follows.
   `query()` output is unchanged, and `queryValidAt` deliberately keeps trust
   from everything known now: it asks what was true, with today's knowledge.
+- **A `trustScore` passed to `ingest()` is recorded.** On an update or a
+  reaffirm it used to overwrite the stored base without keeping the value it
+  replaced, so a `queryAt` replay from before that write reported the newer
+  base. The write now records `diff.trustScore = { from, to }`, the shape
+  `annotate()` already uses: on the new version for an update (in
+  `getHistory()` and on that version's `trail()` event), and on the
+  `reaffirmed` trail event for a reaffirm. A write that leaves the base
+  unchanged records nothing, so its version and trail event look exactly as
+  before.
 
 ### Known issues
 
-- **A `trustScore` passed to `ingest()` on an update or reaffirm is not
-  recorded on the trail**, so a `queryAt` replay from before that write
-  reports the newer base. The same applies to annotations dropped by a
-  `maxTrailEvents` cap. Changes made through `annotate()` are reconstructed
-  exactly.
+- **Some base trust changes cannot be replayed.** Annotations and reaffirms
+  dropped by a `maxTrailEvents` cap, and `ingest()` trust changes written
+  before this release, carry no record of the value they replaced, so a
+  `queryAt` replay from before them reports the newer base. Every other
+  change is reconstructed exactly.
 
 ## [1.9.1] — 2026-10-13
 

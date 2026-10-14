@@ -64,9 +64,9 @@ Reference case + 300 generated cases, seed 114, 2026-10-14: **every floor met**,
 
 The two trust rows were first published ungated, as a known gap: trust drift in 0.40 of cases (max Δ 0.27), and a trust explanation citing a later contradiction in 0.30. Record content in a replay was already exact, but trust was scored against the entity's full version history, so a reversal recorded on day 5 lowered the trust a day-2 replay reported and the explanation named it. In the reference case the determination read 0.90 on the decision day and 0.63 when replayed for the same day.
 
-`queryAt` now computes trust from what had been recorded by `asOf`: only versions received by then, recency from the version it returns, the base trust score as it stood then (reconstructed from the `annotate()` changes on the trail), and that version's content-risk verdict, with a reviewer's override only if it was made by then. Both rows are 0 and gated.
+`queryAt` now computes trust from what had been recorded by `asOf`: only versions received by then, recency from the version it returns, the base trust score as it stood then, and that version's content-risk verdict, with a reviewer's override only if it was made by then. Both rows are 0 and gated.
 
-One limit remains, and it does not occur in this workload: a `trustScore` passed to `ingest()` on an update overwrites the base without recording the value it replaced, so a replay from before that write reports the newer base. Changes made through `annotate()` are reconstructed exactly.
+The base is rewound through every recorded change to it. `annotate()` and an `ingest()` that passes a `trustScore` both record the value they replaced as `diff.trustScore = { from, to }`, so a replay reports the base in force on the replay date, whichever of them moved it later.
 
 ## What this is not
 

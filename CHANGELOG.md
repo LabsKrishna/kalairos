@@ -4,6 +4,29 @@ All notable changes to Kalairos. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Prior-authorization replay benchmark** (`npm run bench:prior-auth`,
+  CI-gated). Replays synthetic prior-authorization decisions after late
+  records, reversals, corrections and policy revisions have landed, and
+  checks that `queryAt` shows only what the reviewer had, `queryValidAt`
+  shows what was true (including records that arrived late), the policy in
+  force on the request date comes back, the decision-day checkpoint is
+  intact, and authorship survives. Every floor is exact and met. A control
+  run on current state proves the leakage metric can see a leak.
+  `node bench/prior-auth/case.js` narrates the reference case. See
+  `bench/prior-auth/README.md`.
+
+### Known issues
+
+- **Trust is not point-in-time.** A `queryAt` replay scores trust against the
+  entity's full version history, so a contradiction recorded after `asOf`
+  lowers the replayed trust and appears in its breakdown. The new benchmark
+  measures this (40% of cases, max Δ 0.27) and reports it ungated until fixed.
+  Record content in a replay is unaffected.
+
 ## [1.9.1] — 2026-10-13
 
 Headline: **a fresh install now works the way the README says it does.**

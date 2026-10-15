@@ -155,6 +155,21 @@ async function withServer(fn) {
     });
   });
 
+  // A host that crashes closes all three pipes at once. The write it sent
+  // last still lands, and neither the reply nor a log line, both with nowhere
+  // to go, may crash the server before it has flushed.
+  await test("exits cleanly when the client vanishes mid-request", async () => {
+    await withServer(async (server) => {
+      await server.handshake();
+      server.send({ id: 99, method: "tools/call", params: { name: "kalairos_remember", arguments: { text: FACT } } });
+      server.child.stdin.end();
+      server.child.stdout.destroy();
+      server.child.stderr.destroy();
+      await server.exitsCleanly();
+      assert.ok(server.stored(FACT), "the write is on disk");
+    });
+  });
+
   // Windows has no catchable SIGTERM or SIGINT: kill() ends the process outright.
   if (process.platform === "win32") {
     console.log("  ⏭️   SIGTERM and SIGINT cases skipped: Windows cannot deliver a catchable signal");

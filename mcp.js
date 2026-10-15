@@ -318,8 +318,8 @@ tool(
 // run until its event loop emptied on its own, and on 1.9.0 the loop never
 // did: idle worker threads held it open, so servers outlived their clients by
 // days. Now every sign that the client is gone, or wants the server gone,
-// runs the same shutdown once: stdin ending or closing, the transport
-// closing, SIGTERM or SIGINT.
+// runs the same shutdown once: stdin ending or closing, a failed write to
+// stdout, the transport closing, SIGTERM or SIGINT.
 
 const SHUTDOWN_TIMEOUT_MS = 5_000;
 let shuttingDown = null;
@@ -373,6 +373,12 @@ async function main() {
   transport.onclose = () => shutdown("transport closed"); // connect() calls this before its own handler
   process.stdin.on("end", () => shutdown("stdin ended"));
   process.stdin.on("close", () => shutdown("stdin closed"));
+  // Writes to a client that has gone fail with EPIPE, and an unhandled stream
+  // error kills the process on the spot, mid-write. A failed reply means the
+  // client is gone; a failed log line (the engine logs as it writes) has
+  // nowhere else to go.
+  process.stdout.on("error", (err) => shutdown(`stdout ${err.code || "failed"}`));
+  process.stderr.on("error", () => {});
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 

@@ -66,6 +66,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before the client left still lands and is answered, flushes the store,
   and exits with code 0. A shutdown that stalls is cut off after 5 seconds
   with code 1.
+- **`kalairos-mcp` keeps the last write of a client that vanishes
+  mid-request.** A host that crashes closes stdin, stdout and stderr at
+  once. The engine logs as it writes, so a log line hit the closed stderr,
+  and the unhandled `EPIPE` killed the server before the write reached
+  disk; a reply to the closed stdout could do the same. Failed writes to
+  stderr are now ignored, a failed write to stdout starts the shutdown
+  above, and the write lands.
 
 ### Known issues
 

@@ -19,6 +19,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `node bench/prior-auth/case.js` narrates the reference case. See
   `bench/prior-auth/README.md`.
 
+### Changed
+
+- **`kalairos-mcp` loads the engine on the first tool call.** The server
+  used to run `init()` before it answered the handshake, so it read the
+  whole store, loaded the embedder and started a worker thread per CPU
+  whether or not its client ever called a tool. Hosts such as Claude Code
+  start a server per session, and most sessions never call a memory tool.
+  Measured on macOS with 10 CPUs and a 30-entity store, an idle server with
+  the neural embedder now holds **35MB instead of 318MB**, runs 7 threads
+  instead of 26, and answers `initialize` in 101ms instead of 275ms. With
+  bag-of-words it holds 35MB instead of 111MB. The first tool call pays for
+  the load instead: 213ms with the neural embedder and 31ms with
+  bag-of-words, against 17ms and 5ms before. Later calls take what they
+  took before. Calls that arrive while the engine loads share that one
+  load. A load that fails, such as an unreadable store, is now that call's
+  tool error and the next call tries again; it used to stop the server at
+  boot.
+
 ### Fixed
 
 - **`queryAt` trust is point-in-time.** A replay used to score trust against
@@ -55,6 +73,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `until` arrives as `null`. A missing `since` was 0 rather than -Infinity,
   which dropped anything stamped before 1970. Both bounds are now
   open-ended when omitted.
+- **`kalairos-mcp` exits when its client goes away.** The stdio server had
+  no shutdown path: nothing listened for stdin ending, and SIGTERM and
+  SIGINT went unhandled, so it ran until its event loop emptied on its own.
+  On 1.9.0 that never happened, because the worker pool's idle threads held
+  the loop open, and servers whose client had exited kept running for days
+  at about 260MB each. The server now shuts down when stdin ends or closes,
+  when its transport closes, and on SIGTERM or SIGINT. It stops reading
+  requests, lets tool calls already running finish, so a write sent just
+  before the client left still lands and is answered, flushes the store,
+  and exits with code 0. A shutdown that stalls is cut off after 5 seconds
+  with code 1.
+- **`kalairos-mcp` keeps the last write of a client that vanishes
+  mid-request.** A host that crashes closes stdin, stdout and stderr at
+  once. The engine logs as it writes, so a log line hit the closed stderr,
+  and the unhandled `EPIPE` killed the server before the write reached
+  disk; a reply to the closed stdout could do the same. Failed writes to
+  stderr are now ignored, a failed write to stdout starts the shutdown
+  above, and the write lands.
 
 ### Known issues
 

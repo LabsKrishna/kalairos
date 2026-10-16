@@ -260,9 +260,9 @@ async function seeded() {
         { text: "alpha bravo charlie delta" },
         { text: "gated echo foxtrot golf" },
       ]);
-      await atGate; // the first item is in memory, unflushed
+      await atGate; // the batch is past its first item, held in its second
 
-      const rejected = "alpha bravo charlie hotel"; // links to the batch's first item
+      const rejected = "alpha bravo charlie hotel"; // similar to the batch's first item
       const append = failNext("appendEntity");
       try {
         await assert.rejects(lib.remember(rejected, { who }), append.err);

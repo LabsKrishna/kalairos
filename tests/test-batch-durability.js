@@ -95,7 +95,7 @@ const HELD = "delta echo foxtrot";
     await lib.init({ dataFile, embedFn: gate.embed, embeddingDim: DIM });
     try {
       const batch = lib.ingestBatch([{ text: "alpha bravo charlie" }, { text: HELD }]);
-      await gate.reached; // first item applied, second held in its embed
+      await gate.reached; // first item prepared, second held in its embed
 
       const id = await lib.remember("golf hotel india", { who });
       assert.ok(onDisk(dataFile).has(id), "the acknowledged write is not on disk");

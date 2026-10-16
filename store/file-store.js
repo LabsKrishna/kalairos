@@ -6,6 +6,8 @@
 // Durability contract (CLAUDE.md §18):
 //   * Writes call fsync before returning, so an acknowledged write survives
 //     a power loss on filesystems that honour fsync.
+//   * A failed append leaves the file as it found it: whatever it wrote is
+//     truncated away before the error is rethrown.
 //   * persistAll uses tmp-file + atomic rename. Both the tmp file and the
 //     parent directory are fsync'd so the rename is durable.
 //   * If the process crashes after the tmp is written but before rename,
@@ -37,12 +39,49 @@ function _writeFileSyncDurable(file, data) {
 }
 
 function _appendSyncDurable(file, data) {
+  const buf = Buffer.from(data, "utf8");
   const fd = fs.openSync(file, "a");
   try {
-    fs.writeSync(fd, data);
-    fs.fsyncSync(fd);
+    // Where the file ends now, so a failed append can put it back. A row cut
+    // off partway has no newline, and the next append would join onto it: the
+    // reload skips the joined line, losing that next row, which WAS
+    // acknowledged. A whole row whose fsync failed would come back on reload
+    // though its write rejected.
+    const size = fs.fstatSync(fd).size;
+    try {
+      _writeAll(fd, buf);
+      fs.fsyncSync(fd);
+    } catch (err) {
+      _truncateBack(fd, size, file);
+      throw err;
+    }
   } finally {
     fs.closeSync(fd);
+  }
+}
+
+// writeSync can return having written only part of the buffer, with no error:
+// a disk that fills mid-row reports the bytes it took, and the next call is
+// the one that raises ENOSPC. Keep writing until the buffer is out or a call
+// throws.
+function _writeAll(fd, buf) {
+  let off = 0;
+  while (off < buf.length) {
+    const n = fs.writeSync(fd, buf, off, buf.length - off);
+    if (n <= 0) throw new Error(`write stalled after ${off} of ${buf.length} bytes`);
+    off += n;
+  }
+}
+
+// Undo a failed append. Best effort: the caller rethrows the append's own
+// error either way, since that is what failed. If the undo fails too, say so,
+// because the file may now hold bytes nobody acknowledged.
+function _truncateBack(fd, size, file) {
+  try {
+    fs.ftruncateSync(fd, size);
+    fs.fsyncSync(fd);
+  } catch (err) {
+    console.warn(`[kalairos] FileStore: could not undo a failed append to ${path.basename(file)}: ${err.message}`);
   }
 }
 

@@ -90,6 +90,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   changed, created or removed is restored, including its versions, trail
   events and the links on its neighbours, before the next write runs. Other
   writes are untouched, so a batch running at the same time keeps its items.
+- **A failed append no longer leaves bytes in the JSONL file.** Adding a row
+  writes it, then fsyncs it. When either step failed, the write rejected but
+  what had reached the file stayed there. A row cut off partway (a full
+  disk, say) had no newline, so the next successful append joined onto it
+  and a reload skipped the joined line as malformed. The row lost was that
+  next one, which had been acknowledged. A whole row whose fsync failed came
+  back on reload. A short write, where fewer bytes land than were asked for
+  and no error is raised, was not checked at all, so a torn row was
+  acknowledged. A failed append now truncates the file back to its size
+  before the write and rethrows the original error, and a short write keeps
+  writing until the row is out or the disk reports an error.
 
 ### Known issues
 
@@ -104,6 +115,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   memory and the next flush writes them. Other writes run between a batch's
   items and can change the same entities, so undoing the batch is not yet
   safe.
+- **A crash in the middle of an append can still cost the next row.** A
+  failed append is undone, but a process that dies mid-write cannot undo
+  anything. The reload skips the partial row, and the next append joins
+  onto it, so that row is skipped on the reload after, unless a full
+  rewrite of the file happens first.
 
 ## [1.9.1] — 2026-10-13
 

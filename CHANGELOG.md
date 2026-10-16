@@ -80,6 +80,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Each of those writes now rejects with the persist error, as a lone write's
   already did, and the queue keeps taking writes. Writes still share a single
   flush and still settle only after it.
+- **A write that failed to persist no longer reaches disk later.** A write
+  whose persist failed (a full disk, say) rejected, but what it had changed
+  stayed in memory. Reads served it, and the next flush, which rewrites the
+  whole JSONL file from memory, put it on disk along with some later,
+  unrelated write, so a reload brought back a write the caller had been told
+  failed. This held for a lone write and for writes coalesced into one flush.
+  A write that rejects now leaves memory as it found it: every entity it
+  changed, created or removed is restored, including its versions, trail
+  events and the links on its neighbours, before the next write runs. Other
+  writes are untouched, so a batch running at the same time keeps its items.
 
 ### Known issues
 
@@ -88,6 +98,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before this release, carry no record of the value they replaced, so a
   `queryAt` replay from before them reports the newer base. Every other
   change is reconstructed exactly.
+- **A batch whose own flush fails keeps its items in memory.** When the
+  single flush at the end of `ingestBatch()`, `extractFacts()` or
+  `importMarkdown()` fails, the call rejects, but the items it wrote stay in
+  memory and the next flush writes them. Other writes run between a batch's
+  items and can change the same entities, so undoing the batch is not yet
+  safe.
 
 ## [1.9.1] — 2026-10-13
 

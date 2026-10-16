@@ -61,7 +61,9 @@ function enospc() {
     { code: "ENOSPC", syscall: "write" });
 }
 
-// The bytes a writeSync call was asked to write, from either signature.
+// The bytes a writeSync call was asked to write, from either signature. The
+// stubs pass the call's position on, since the store writes at an explicit
+// offset rather than through an append handle.
 function asked(data, offset, length) {
   if (typeof data === "string") return Buffer.from(data, "utf8");
   const start = offset ?? 0;
@@ -92,9 +94,9 @@ const half = (bytes) => Math.floor(bytes.length / 2);
   await test("a write that stops partway and throws is undone", () => {
     const { file, store, config, before } = seeded();
     const err = enospc();
-    const restore = stub("writeSync", file, (real, fd, data, offset, length) => {
+    const restore = stub("writeSync", file, (real, fd, data, offset, length, position) => {
       const bytes = asked(data, offset, length);
-      real.call(fs, fd, bytes, 0, half(bytes));
+      real.call(fs, fd, bytes, 0, half(bytes), position);
       throw err;
     });
     try {
@@ -112,9 +114,9 @@ const half = (bytes) => Math.floor(bytes.length / 2);
     const { file, store, config, before } = seeded();
     const err = enospc();
     let calls = 0;
-    const restore = stub("writeSync", file, (real, fd, data, offset, length) => {
+    const restore = stub("writeSync", file, (real, fd, data, offset, length, position) => {
       const bytes = asked(data, offset, length);
-      if (++calls === 1) return real.call(fs, fd, bytes, 0, half(bytes));
+      if (++calls === 1) return real.call(fs, fd, bytes, 0, half(bytes), position);
       throw err;
     });
     try {
@@ -129,10 +131,10 @@ const half = (bytes) => Math.floor(bytes.length / 2);
   await test("a short write that the next call finishes lands as one whole row", () => {
     const { file, store, config } = seeded();
     let first = true;
-    const restore = stub("writeSync", file, (real, fd, data, offset, length) => {
+    const restore = stub("writeSync", file, (real, fd, data, offset, length, position) => {
       const bytes = asked(data, offset, length);
-      if (first) { first = false; return real.call(fs, fd, bytes, 0, half(bytes)); }
-      return real.call(fs, fd, bytes);
+      if (first) { first = false; return real.call(fs, fd, bytes, 0, half(bytes), position); }
+      return real.call(fs, fd, bytes, 0, bytes.length, position);
     });
     try {
       store.appendEntity({ id: 3, text: "written in two calls" }, config);
@@ -207,9 +209,9 @@ const half = (bytes) => Math.floor(bytes.length / 2);
     try {
       const a = await lib.ingest("alpha bravo charlie delta", { who });
       const err = enospc();
-      const restore = stub("writeSync", dataFile, (real, fd, data, offset, length) => {
+      const restore = stub("writeSync", dataFile, (real, fd, data, offset, length, position) => {
         const bytes = asked(data, offset, length);
-        real.call(fs, fd, bytes, 0, half(bytes));
+        real.call(fs, fd, bytes, 0, half(bytes), position);
         throw err;
       });
       try {

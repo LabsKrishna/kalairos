@@ -40,7 +40,10 @@ function _writeFileSyncDurable(file, data) {
 
 function _appendSyncDurable(file, data) {
   const buf = Buffer.from(data, "utf8");
-  const fd = fs.openSync(file, "a");
+  // Not "a": on Windows an O_APPEND handle has no right to truncate, so the
+  // undo below would fail with EPERM. Writing at the end explicitly is the
+  // same thing for the single writer this store allows.
+  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT);
   try {
     // Where the file ends now, so a failed append can put it back. A row cut
     // off partway has no newline, and the next append would join onto it: the
@@ -49,7 +52,7 @@ function _appendSyncDurable(file, data) {
     // though its write rejected.
     const size = fs.fstatSync(fd).size;
     try {
-      _writeAll(fd, buf);
+      _writeAll(fd, buf, size);
       fs.fsyncSync(fd);
     } catch (err) {
       _truncateBack(fd, size, file);
@@ -62,12 +65,12 @@ function _appendSyncDurable(file, data) {
 
 // writeSync can return having written only part of the buffer, with no error:
 // a disk that fills mid-row reports the bytes it took, and the next call is
-// the one that raises ENOSPC. Keep writing until the buffer is out or a call
-// throws.
-function _writeAll(fd, buf) {
+// the one that raises ENOSPC. Keep writing, from file position `pos`, until
+// the buffer is out or a call throws.
+function _writeAll(fd, buf, pos) {
   let off = 0;
   while (off < buf.length) {
-    const n = fs.writeSync(fd, buf, off, buf.length - off);
+    const n = fs.writeSync(fd, buf, off, buf.length - off, pos + off);
     if (n <= 0) throw new Error(`write stalled after ${off} of ${buf.length} bytes`);
     off += n;
   }

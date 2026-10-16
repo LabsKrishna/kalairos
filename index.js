@@ -1096,7 +1096,14 @@ async function ingest(text, opts) {
 // The body of ingest(). batchedIO is true only from inside _withBatchedIO,
 // whose flush covers the write; see _withWriteLock. Kept off the public
 // signature so no caller can ask for an acknowledgement before fsync.
-async function _ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false, who, why, effectiveAt } = {}, batchedIO = false) {
+async function _ingest(text, opts, batchedIO = false) {
+  return _withWriteLock(await _prepareIngest(text, opts), batchedIO);
+}
+
+// Phase 1 of an ingest: validate, embed and enrich, outside the write lock.
+// Resolves with phase 2, the synchronous lock body that applies the write and
+// returns the entity id. Nothing before that body reads or changes the store.
+async function _prepareIngest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false, who, why, effectiveAt } = {}) {
   _assertInit();
 
   const ts       = timestamp || Date.now();
@@ -1145,7 +1152,7 @@ async function _ingest(text, { type = "text", timestamp, metadata = {}, tags = [
   // ── Phase 2: critical section (serialised via write lock) ─────────────────
   // All store reads, mutations, graph relinking, and persistence happen here.
   // The body is synchronous so the lock is held for the minimum possible time.
-  return _withWriteLock(() => {
+  return () => {
     // ── Find closest existing entity of the same type ───────────────────────
     // Two tiers: versionThreshold for direct updates, consolidationThreshold for
     // near-duplicate detection so the same fact expressed differently merges
@@ -1382,7 +1389,7 @@ async function _ingest(text, { type = "text", timestamp, metadata = {}, tags = [
     _appendEntity(entity);
     console.error(`[kalairos] Created entity ${id} [${type}]`);
     return id;
-  }, batchedIO);
+  };
 }
 
 /**

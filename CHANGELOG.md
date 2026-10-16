@@ -101,6 +101,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   acknowledged. A failed append now truncates the file back to its size
   before the write and rethrows the original error, and a short write keeps
   writing until the row is out or the disk reports an error.
+- **A full rewrite of the JSONL file can no longer truncate it.** Updates,
+  deletes, batches and `shutdown()` rewrite the whole file: they write a
+  temp file and rename it over the store. That write was one call whose byte
+  count was ignored, so when the disk filled partway, the torn temp file was
+  fsync'd and renamed into place, and every row past the cut was gone on the
+  next start. The rewrite now keeps writing until the whole file is out, or
+  throws the disk's error and leaves the store as it was.
 
 ### Known issues
 

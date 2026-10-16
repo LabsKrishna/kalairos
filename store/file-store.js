@@ -29,9 +29,11 @@ const READ_CHUNK_BYTES = 1 << 20; // 1MB
 function _writeFileSyncDurable(file, data) {
   // Open + write + fsync + close, then fsync the parent directory so the
   // dirent for `file` is durable too. Required for crash-consistent renames.
+  // A short write here would leave a torn tmp file that then gets renamed
+  // over the store, so it goes through _writeAll like an append does.
   const fd = fs.openSync(file, "w");
   try {
-    fs.writeSync(fd, data);
+    _writeAll(fd, Buffer.from(data, "utf8"), 0);
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);

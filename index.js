@@ -131,7 +131,7 @@ let CFG         = { ...DEFAULTS };
 let store       = null;        // StoreAdapter (FileStore or PgStore)
 let _pool       = null;        // persistent WorkerPool
 let _initialized = false;
-let _skipIO        = 0;    // ref-counted; > 0 suppresses per-item I/O during batch ops
+let _skipIO        = false; // true only while a write-lock body runs whose I/O a later flush covers
 
 // Embedding cache — see _embed. A Map is the LRU: insertion order is iteration
 // order, so re-inserting on a hit moves an entry to the back and the oldest is
@@ -203,9 +203,9 @@ function _newId() { return _nextId++; }
 //
 //  1. Coalescing: _drainWrites() uses setImmediate so writes that arrive while
 //     embeddings are in flight accumulate before the drain runs. When ≥ 2 writes
-//     are pending, _skipIO is bumped for the batch and _persistAll() is called
-//     once at the end instead of once per write. Under sustained load (100s–1000s
-//     of concurrent ingests) this collapses N file-syncs into 1 per event-loop
+//     are pending, per-write I/O is skipped and _persistAll() is called once at
+//     the end instead of once per write. Under sustained load (100s–1000s of
+//     concurrent ingests) this collapses N file-syncs into 1 per event-loop
 //     tick, the dominant throughput bottleneck.
 //
 //  2. Backpressure: if _pendingWrites already holds writeQueueMax entries, new
@@ -215,14 +215,21 @@ function _newId() { return _nextId++; }
 //
 // All fn bodies must be synchronous (no await inside the lock). This keeps the
 // critical section fast and avoids nested lock acquisition.
+//
+// batchedIO marks a write made by a batch op (see _withBatchedIO), whose own
+// flush when it finishes covers the write, so the body may skip its I/O. Every
+// other write reaches disk before its promise settles, even while a batch op
+// is in flight. Suppression is decided per write, never for the whole process:
+// a batch holds the open window across its awaits, and an unrelated write that
+// lands inside it is acknowledged to a caller that is not waiting on the batch.
 
-function _withWriteLock(fn) {
+function _withWriteLock(fn, batchedIO = false) {
   const max = CFG.writeQueueMax;
   if (_pendingWrites.length >= max) {
     return Promise.reject(emitError(Err.writeQueueFull(_pendingWrites.length, max)));
   }
   return new Promise((resolve, reject) => {
-    _pendingWrites.push({ fn, resolve, reject });
+    _pendingWrites.push({ fn, batchedIO, resolve, reject });
     if (!_draining) {
       _draining = true;
       // Defer so writes that arrive in the same tick can accumulate first.
@@ -237,26 +244,24 @@ function _drainWrites() {
     const batch   = _pendingWrites.splice(0); // grab everything pending right now
     const isMulti = batch.length > 1;
 
-    // Suppress per-item I/O for multi-write batches; one flush covers them all.
-    if (isMulti) _skipIO++;
-
     const settled = [];
     for (const item of batch) {
+      // Skip this write's own I/O when a later flush covers it: the single
+      // flush below for a multi-write batch, or its batch op's own flush.
+      _skipIO = isMulti || item.batchedIO;
       try {
         settled.push({ ok: true,  resolve: item.resolve, value: item.fn() });
       } catch (err) {
         settled.push({ ok: false, reject:  item.reject,  error: err });
+      } finally {
+        _skipIO = false;
       }
     }
 
-    if (isMulti) {
-      _skipIO--;
-      // _persistAll() honours the outer _skipIO counter: if we are nested inside
-      // an ingestBatch/_extractFacts call (skipIO > 0), this is a no-op — the
-      // caller's own _persistAll() will flush at the end of its loop. Otherwise
-      // this is the single flush for the entire micro-batch.
-      _persistAll();
-    }
+    // The single flush for the micro-batch. Skipped only when every write in
+    // it belongs to a batch op, which flushes when it finishes; anything else
+    // must be on disk before its promise settles.
+    if (isMulti && batch.some(item => !item.batchedIO)) _persistAll();
 
     // Settle all promises after the flush so callers receive confirmed IDs.
     for (const s of settled) {
@@ -469,7 +474,7 @@ async function init(overrides = {}) {
   if (_pool) { await _pool.stop(); _pool = null; }
 
   CFG            = { ...DEFAULTS, ...overrides };
-  _skipIO        = 0;      // reset batch-suppress counter
+  _skipIO        = false;  // reset per-write I/O suppression
   _pendingWrites = [];     // drop any queued mutations from previous session
   _draining      = false;  // drain state reset
   // Not merely stale — WRONG. init() may install a different embedFn or a
@@ -636,7 +641,7 @@ function _serializeForIO(entity) {
 }
 
 function _persistAll() {
-  if (_skipIO > 0) return;
+  if (_skipIO) return;
 
   const rows = Array.from(store.values()).map(_serializeForIO);
   try {
@@ -676,24 +681,19 @@ function _persistAll() {
   }
 }
 
-// Run a batch of ingests as a single I/O transaction: suppress per-item
-// persistence via the _skipIO counter, always restore it (even on throw),
-// then flush once with _persistAll(). On error, the counter is restored but
-// the flush is skipped — matching the hand-rolled try/finally this replaces.
+// Run a batch of ingests as a single I/O transaction: the body ingests each
+// item with _ingest(text, opts, true), which skips that write's own I/O, then
+// this flushes once with _persistAll(). On error the flush is skipped. Only
+// the batch's own writes are deferred; a concurrent write from any other
+// caller persists as usual.
 async function _withBatchedIO(fn) {
-  _skipIO++;
-  let result;
-  try {
-    result = await fn();
-  } finally {
-    _skipIO--;
-  }
+  const result = await fn();
   _persistAll();
   return result;
 }
 
 function _appendEntity(entity) {
-  if (_skipIO > 0) return;
+  if (_skipIO) return;
   const row = _serializeForIO(entity);
   try {
     const result = store.appendEntity(row, CFG);
@@ -1014,7 +1014,14 @@ function _pruneCrossWorkspaceLinks() {
  * @param {{ type?, timestamp?, metadata?, tags?, source?, classification? }} opts
  * @returns {number} stable entity ID (never changes across updates)
  */
-async function ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false, who, why, effectiveAt } = {}) {
+async function ingest(text, opts) {
+  return _ingest(text, opts, false);
+}
+
+// The body of ingest(). batchedIO is true only from inside _withBatchedIO,
+// whose flush covers the write; see _withWriteLock. Kept off the public
+// signature so no caller can ask for an acknowledgement before fsync.
+async function _ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false, who, why, effectiveAt } = {}, batchedIO = false) {
   _assertInit();
 
   const ts       = timestamp || Date.now();
@@ -1298,7 +1305,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     _appendEntity(entity);
     console.error(`[kalairos] Created entity ${id} [${type}]`);
     return id;
-  });
+  }, batchedIO);
 }
 
 /**
@@ -1355,7 +1362,7 @@ async function ingestBatch(items, { allowedWorkspaces } = {}) {
     const ids = [];
     for (const item of items) {
       const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore } = item || {};
-      ids.push(await ingest(text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, allowedWorkspaces }));
+      ids.push(await _ingest(text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, allowedWorkspaces }, true));
     }
     return ids;
   });
@@ -1385,11 +1392,11 @@ async function extractFacts(text, opts = {}) {
   const ids = await _withBatchedIO(async () => {
     const out = [];
     for (const fact of facts) {
-      out.push(await ingest(fact, {
+      out.push(await _ingest(fact, {
         ...opts,
         metadata: { ...(opts.metadata || {}), extractedFrom: safeText.slice(0, 200) },
         allowedWorkspaces: opts.allowedWorkspaces,
-      }));
+      }, true));
     }
     return out;
   });
@@ -2519,7 +2526,7 @@ async function importMarkdown(mdText, defaults = {}) {
       const opts = fact.type
         ? { ...defaults, type: fact.type, allowedWorkspaces }
         : { ...defaults, allowedWorkspaces };
-      out.push(await ingest(fact.text, opts));
+      out.push(await _ingest(fact.text, opts, true));
     }
     return out;
   });

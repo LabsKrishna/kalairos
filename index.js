@@ -217,23 +217,21 @@ function _newId() { return _nextId++; }
 // All fn bodies must be synchronous (no await inside the lock). This keeps the
 // critical section fast and avoids nested lock acquisition.
 //
-// batchedIO marks a write made by a batch op (see _withBatchedIO), whose own
-// flush when it finishes covers the write, so the body may skip its I/O. Every
-// other write reaches disk before its promise settles, even while a batch op
-// is in flight. Suppression is decided per write, never for the whole process:
-// a batch holds the open window across its awaits, and an unrelated write that
-// lands inside it is acknowledged to a caller that is not waiting on the batch.
+// A batch op is one write like any other (see _ingestAll). I/O suppression is
+// decided per write by _drainWrites and never held across an await, so every
+// write reaches disk before its promise settles, even while a batch op is
+// being prepared.
 //
 // A body must _touch(id) each entity before it changes, adds or removes it, so
 // a write that rejects can be taken back out of memory (see Write rollback).
 
-function _withWriteLock(fn, batchedIO = false) {
+function _withWriteLock(fn) {
   const max = CFG.writeQueueMax;
   if (_pendingWrites.length >= max) {
     return Promise.reject(emitError(Err.writeQueueFull(_pendingWrites.length, max)));
   }
   return new Promise((resolve, reject) => {
-    _pendingWrites.push({ fn, batchedIO, resolve, reject });
+    _pendingWrites.push({ fn, resolve, reject });
     if (!_draining) {
       _draining = true;
       // Defer so writes that arrive in the same tick can accumulate first.
@@ -251,9 +249,8 @@ function _drainWrites() {
 
       const settled = [];
       for (const item of batch) {
-        // Skip this write's own I/O when a later flush covers it: the single
-        // flush below for a multi-write batch, or its batch op's own flush.
-        _skipIO = isMulti || item.batchedIO;
+        // Skip this write's own I/O when the single flush below covers it.
+        _skipIO = isMulti;
         const undo = _undo = new Map();
         try {
           settled.push({ ok: true,  item, undo, value: item.fn() });
@@ -266,15 +263,13 @@ function _drainWrites() {
         }
       }
 
-      // The single flush for the micro-batch. Skipped only when every write in
-      // it belongs to a batch op, which flushes when it finishes; anything else
-      // must be on disk before its promise settles. A sync store rethrows I/O
-      // errors here; none of these writes reached disk, so each one that would
-      // have resolved rejects with that error, as a single write's would, and
-      // is taken back out of memory. Newest first: each journal holds what its
+      // The single flush for the micro-batch. A sync store rethrows I/O errors
+      // here; none of these writes reached disk, so each one that would have
+      // resolved rejects with that error, as a single write's would, and is
+      // taken back out of memory. Newest first: each journal holds what its
       // write saw, which includes the writes before it.
       let flushError = null;
-      if (isMulti && batch.some(item => !item.batchedIO)) {
+      if (isMulti) {
         try { _persistAll(); } catch (err) {
           flushError = err;
           for (let i = settled.length - 1; i >= 0; i--) {
@@ -1079,14 +1074,7 @@ function _pruneCrossWorkspaceLinks() {
  * @returns {number} stable entity ID (never changes across updates)
  */
 async function ingest(text, opts) {
-  return _ingest(text, opts, false);
-}
-
-// The body of ingest(). batchedIO is true only from inside _withBatchedIO,
-// whose flush covers the write; see _withWriteLock. Kept off the public
-// signature so no caller can ask for an acknowledgement before fsync.
-async function _ingest(text, opts, batchedIO = false) {
-  return _withWriteLock(await _prepareIngest(text, opts), batchedIO);
+  return _withWriteLock(await _prepareIngest(text, opts));
 }
 
 // Phase 1 of an ingest: validate, embed and enrich, outside the write lock.

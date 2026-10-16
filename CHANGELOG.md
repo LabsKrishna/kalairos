@@ -66,6 +66,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   batch that finished while the first was still running. Only a batch's own
   items now wait for its single flush; every other write reaches the JSONL
   file, and the SQLite index when enabled, before it is acknowledged.
+- **`shutdown()` runs queued writes before its final flush.** A write already
+  queued behind the write lock when `shutdown()` started ran only if tearing
+  down the worker pool happened to yield to the event loop first. With a pool
+  that stopped at once, `shutdown()` resolved with the write still queued and
+  a following `init()` dropped it. Queued writes now run first, while the
+  store is open.
 
 ### Known issues
 

@@ -11,6 +11,8 @@
 // fsync'd. Each test holds a batch open on a slow embed, makes an unrelated
 // write, and reads the JSONL straight off disk after the acknowledgement:
 // what is in the file at that moment is exactly what survives a SIGKILL.
+// The last case holds shutdown() to the same rule for a write already queued
+// when it starts.
 // Run: node tests/test-batch-durability.js
 "use strict";
 
@@ -20,6 +22,7 @@ const os     = require("os");
 const path   = require("path");
 
 const lib = require("../index");
+const { WorkerPool } = require("../worker-pool");
 
 let passed = 0, failed = 0;
 async function test(name, fn) {
@@ -221,6 +224,35 @@ const HELD = "delta echo foxtrot";
     } finally {
       gate.release();
       await lib.shutdown();
+    }
+  });
+
+  console.log("\n=== a write queued at shutdown() is durable ===\n");
+
+  // A write whose lock body is queued but not yet run when shutdown() starts
+  // used to depend on something inside shutdown() yielding a macrotask so the
+  // drain's setImmediate could fire. Terminating worker threads happens to do
+  // that; a pool that stops at once does not, and shutdown() then resolved
+  // with the write still queued (and a following init() dropped it).
+  await test("a write queued when shutdown() starts is on disk when it resolves", async () => {
+    const dataFile = freshDataFile();
+    await lib.init({ dataFile, embedFn: makeMockEmbedder(), embeddingDim: DIM });
+    const realStop = WorkerPool.prototype.stop;
+    let pool = null;
+    WorkerPool.prototype.stop = async function () { pool = this; };
+    try {
+      const write = lib.remember("golf hotel india", { who });
+      // Let the ingest reach the write queue. Its embed and checks resolve as
+      // microtasks, so no macrotask (the drain's setImmediate) runs here.
+      for (let i = 0; i < 1000; i++) await null;
+
+      await lib.shutdown();
+      assert.deepEqual(textsOnDisk(dataFile), ["golf hotel india"],
+        "shutdown() resolved before the queued write reached disk");
+      await write;
+    } finally {
+      WorkerPool.prototype.stop = realStop;
+      if (pool) await realStop.call(pool);
     }
   });
 

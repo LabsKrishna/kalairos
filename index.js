@@ -3048,6 +3048,10 @@ async function listCheckpoints({ workspace } = {}) {
  */
 async function shutdown() {
   if (!_initialized) return; // safe to call even if init() was never called
+  // Run writes already queued behind the lock now, while the store is open,
+  // rather than counting on something below to yield to the drain's
+  // setImmediate. A stale setImmediate later finds the queue empty.
+  _drainWrites();
   _persistAll(); // final flush to backing store
   _embedCache.clear();
   if (_pool) { await _pool.stop(); _pool = null; }

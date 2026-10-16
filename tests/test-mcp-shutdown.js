@@ -10,6 +10,7 @@
 // Each case starts the server with a ref'd timer preloaded, standing in for
 // any handle that holds the loop, so only a deliberate exit passes. A clean
 // exit is prompt, with code 0, and leaves the client's last write on disk.
+// A shutdown that fails or stalls must still end the process, with code 1.
 // Run: node tests/test-mcp-shutdown.js
 "use strict";
 
@@ -20,7 +21,9 @@ const path   = require("path");
 const { spawn } = require("child_process");
 
 const MCP            = path.join(__dirname, "..", "mcp.js");
+const ENGINE         = path.join(__dirname, "..", "index.js");
 const EXIT_WITHIN_MS = 5_000;
+const SHUTDOWN_TIMEOUT_MS = 5_000; // how long mcp.js lets a shutdown run before exiting 1
 const FACT           = "Deploys go out every Friday afternoon";
 
 let passed = 0, failed = 0;
@@ -36,16 +39,22 @@ async function test(name, fn) {
   }
 }
 
+// The end of a server's stderr, for failure messages.
+const tail = (text) => text.trim().split("\n").slice(-20).join("\n");
+
 // Run fn against a fresh server, then make sure it is gone and its directory
-// removed whatever fn did.
-async function withServer(fn) {
+// removed whatever fn did. `preload` is extra code run in the server before
+// mcp.js, after the ref'd timer.
+async function withServer(fn, { preload = "" } = {}) {
   const dir      = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-mcp-shutdown-"));
   const dataFile = path.join(dir, "data.kalairos");
   const holdOpen = path.join(dir, "hold-open.js");
-  fs.writeFileSync(holdOpen, "setInterval(() => {}, 1 << 30);\n");
+  fs.writeFileSync(holdOpen, `setInterval(() => {}, 1 << 30);\n${preload}\n`);
 
+  // Bag-of-words everywhere, as in CI: the model cache is found through the
+  // home directory, and shutdown does not depend on the embedder.
   const child = spawn(process.execPath, ["--require", holdOpen, MCP], {
-    env: { ...process.env, KALAIROS_DATA_FILE: dataFile },
+    env: { ...process.env, KALAIROS_DATA_FILE: dataFile, HOME: dir, USERPROFILE: dir },
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -73,11 +82,11 @@ async function withServer(fn) {
     request(method, params) {
       const id = ++nextId;
       const reply = new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error(`${method} timed out\n${stderr}`)), 60_000);
+        const timer = setTimeout(() => reject(new Error(`${method} timed out\n${tail(stderr)}`)), 60_000);
         pending.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
         exited.then(({ code, signal }) => {
           clearTimeout(timer);
-          reject(new Error(`server exited (code ${code}, signal ${signal}) before answering ${method}\n${stderr}`));
+          reject(new Error(`server exited (code ${code}, signal ${signal}) before answering ${method}\n${tail(stderr)}`));
         });
       });
       server.send({ id, method, params });
@@ -97,15 +106,21 @@ async function withServer(fn) {
       server.send({ method: "notifications/initialized" });
     },
 
-    // Clean means on its own, within the deadline, with code 0 and no signal.
-    async exitsCleanly() {
+    // Resolves to how the server exited, failing if it is still running after `within` ms.
+    async exit(within = EXIT_WITHIN_MS) {
       let timer;
-      const deadline = new Promise((resolve) => { timer = setTimeout(resolve, EXIT_WITHIN_MS, "running"); });
+      const deadline = new Promise((resolve) => { timer = setTimeout(resolve, within, "running"); });
       const result = await Promise.race([exited, deadline]);
       clearTimeout(timer);
-      assert.notEqual(result, "running", `server still running ${EXIT_WITHIN_MS}ms after its client left\n${stderr}`);
+      assert.notEqual(result, "running", `server still running ${within}ms after its client left\n${tail(stderr)}`);
+      return result;
+    },
+
+    // Clean means on its own, within the deadline, with code 0 and no signal.
+    async exitsCleanly() {
+      const result = await server.exit();
       assert.deepEqual(result, { code: 0, signal: null },
-        `server exited with code ${result.code}, signal ${result.signal}\n${stderr}`);
+        `server exited with code ${result.code}, signal ${result.signal}\n${tail(stderr)}`);
     },
 
     stored(text) {
@@ -115,6 +130,7 @@ async function withServer(fn) {
     },
 
     child,
+    stderr: () => stderr,
   };
 
   try {
@@ -168,6 +184,50 @@ async function withServer(fn) {
       await server.exitsCleanly();
       assert.ok(server.stored(FACT), "the write is on disk");
     });
+  });
+
+  // Exiting with output still queued for stdout drops it. Here the client
+  // stops reading while a reply far larger than the pipe buffers is in
+  // flight, closes stdin, and reads again a moment later. The reply must
+  // arrive whole before the server exits.
+  await test("delivers a large last reply whole before exiting", async () => {
+    await withServer(async (server) => {
+      await server.handshake();
+      const items = Array.from({ length: 1000 }, (_, i) => ({ text: `Note ${i}: ${`entry${i} `.repeat(400)}` }));
+      await server.call("kalairos_batch_store", { items });
+      server.child.stdout.pause();
+      const reply = server.call("kalairos_export", {});
+      server.child.stdin.end();
+      setTimeout(() => server.child.stdout.resume(), 300);
+      const exported = JSON.stringify(await reply);
+      assert.ok(exported.length > 500_000, `the export is too small to outgrow the pipe (${exported.length} bytes)`);
+      assert.match(exported, /Note 999:/, "the reply arrived whole");
+      await server.exitsCleanly();
+    });
+  });
+
+  // A failed final flush must not report success.
+  await test("exits 1 when the final flush fails", async () => {
+    const preload = `require(${JSON.stringify(ENGINE)}).shutdown = async () => { throw new Error("disk full"); };`;
+    await withServer(async (server) => {
+      await server.handshake();
+      server.child.stdin.end();
+      const { code } = await server.exit();
+      assert.equal(code, 1, tail(server.stderr()));
+      assert.match(server.stderr(), /shutdown failed: disk full/);
+    }, { preload });
+  });
+
+  // The process must not outlive its client even when shutdown hangs.
+  await test("exits 1 when shutdown stalls", async () => {
+    const preload = `require(${JSON.stringify(ENGINE)}).shutdown = () => new Promise(() => {});`;
+    await withServer(async (server) => {
+      await server.handshake();
+      server.child.stdin.end();
+      const { code } = await server.exit(SHUTDOWN_TIMEOUT_MS + EXIT_WITHIN_MS);
+      assert.equal(code, 1, tail(server.stderr()));
+      assert.match(server.stderr(), /shutdown took over 5000ms/);
+    }, { preload });
   });
 
   // Windows has no catchable SIGTERM or SIGINT: kill() ends the process outright.

@@ -1,12 +1,16 @@
 // test-torn-writes.js — no write tears the JSONL file in a way that loses rows
 //
-// persistAll wrote its tmp file with a single writeSync and ignored the count
-// it returned. A disk that fills mid-write reports the bytes it took with no
-// error (only the next call raises ENOSPC), so the torn tmp file was fsync'd
-// and renamed over the store, truncating it.
+// Two ways a row could be lost after the append path learned to undo itself:
+//   * persistAll wrote its tmp file with a single writeSync and ignored the
+//     count it returned. A disk that fills mid-write reports the bytes it took
+//     with no error (only the next call raises ENOSPC), so the torn tmp file
+//     was fsync'd and renamed over the store, truncating it.
+//   * A process that dies mid-append leaves part of a row with no newline. A
+//     reload skips it, and the next append used to join onto it, so that row,
+//     which was acknowledged, was skipped on the reload after.
 //
 // What must hold: persistAll writes every row or throws and leaves the store
-// byte-identical.
+// byte-identical, and an append after a torn tail survives a reload.
 // Run: node tests/test-torn-writes.js
 "use strict";
 
@@ -15,6 +19,7 @@ const fs     = require("fs");
 const os     = require("os");
 const path   = require("path");
 
+const lib = require("../index");
 const { FileStore } = require("../store/file-store");
 
 let passed = 0, failed = 0;
@@ -33,6 +38,12 @@ function quiet(fn) {
   console.warn = (...a) => warned.push(a.join(" "));
   try { fn(); } finally { console.warn = warn; }
   return warned;
+}
+
+async function muted(fn) {
+  const warn = console.warn;
+  console.warn = () => {};
+  try { return await fn(); } finally { console.warn = warn; }
 }
 
 const ids = (file) => {
@@ -97,6 +108,18 @@ function persisted() {
   return { file, store, config: { dataFile: file }, before: fs.readFileSync(file) };
 }
 
+/** A store file holding ROWS by the real append path, then `tail` with no newline. */
+function torn(tail) {
+  const file  = freshFile();
+  const store = new FileStore();
+  for (const r of ROWS) store.appendEntity(r, { dataFile: file });
+  fs.appendFileSync(file, tail);
+  return { file, store, config: { dataFile: file } };
+}
+
+/** The first `keep` bytes of a row as JSON, the way a crash would leave it. */
+const partial = (row, keep) => Buffer.from(JSON.stringify(row), "utf8").subarray(0, keep);
+
 (async () => {
   console.log("\n=== persistAll: a short write to the tmp file ===\n");
 
@@ -134,6 +157,103 @@ function persisted() {
 
     assertUnchanged(file, before);
     assert.deepEqual(ids(file), [1, 2]);
+  });
+
+  console.log("\n=== an append after a crash tore the last row ===\n");
+
+  await test("a row appended after a torn tail survives a reload", () => {
+    const { file, store, config } = torn(partial({ id: 3, text: "never acknowledged" }, 20));
+    assert.deepEqual(ids(file), [1, 2]);
+
+    const warned = quiet(() => store.appendEntity({ id: 4, text: "acknowledged" }, config));
+    assert.deepEqual(ids(file), [1, 2, 4]);
+    assert.ok(warned.some(w => /partway through a row/.test(w)), `no warning about the torn tail: ${warned}`);
+  });
+
+  await test("a tail torn inside a multi-byte character does not take the next row", () => {
+    const row  = { id: 3, text: "🌍🌍🌍" };
+    const json = Buffer.from(JSON.stringify(row), "utf8");
+    const cut  = json.indexOf(Buffer.from("🌍", "utf8")) + 2; // mid-emoji
+    const { file, store, config } = torn(json.subarray(0, cut));
+
+    quiet(() => store.appendEntity({ id: 4, text: "acknowledged" }, config));
+    assert.deepEqual(ids(file), [1, 2, 4]);
+  });
+
+  // A whole row that never got its newline (the crash came between the two,
+  // or someone edited the file by hand) loads today. The next append must
+  // not join onto it and take both down.
+  await test("a whole last row with no newline survives the next append", () => {
+    const { file, store, config } = torn(JSON.stringify({ id: 3, text: "no newline" }));
+    assert.deepEqual(ids(file), [1, 2, 3]);
+
+    quiet(() => store.appendEntity({ id: 4, text: "acknowledged" }, config));
+    assert.deepEqual(ids(file), [1, 2, 3, 4]);
+  });
+
+  await test("a failed append to a torn file leaves it byte-identical", () => {
+    const { file, store, config } = torn(partial({ id: 3, text: "never acknowledged" }, 20));
+    const before = fs.readFileSync(file);
+    const err = enospc();
+    const restore = stub("writeSync", file, (real, fd, data, offset, length, position) => {
+      const bytes = asked(data, offset, length);
+      real.call(fs, fd, bytes, 0, half(bytes), position);
+      throw err;
+    });
+    try {
+      quiet(() => assert.throws(() => store.appendEntity({ id: 4, text: "rejected" }, config), e => e === err));
+    } finally { restore(); }
+    assertUnchanged(file, before);
+
+    quiet(() => store.appendEntity({ id: 5, text: "acknowledged after the failure" }, config));
+    assert.deepEqual(ids(file), [1, 2, 5]);
+  });
+
+  await test("a clean file gets no blank lines and a new file no leading newline", () => {
+    const file   = freshFile();
+    const store  = new FileStore();
+    const config = { dataFile: file };
+    const warned = quiet(() => { for (const r of NEXT) store.appendEntity(r, config); });
+    assert.equal(fs.readFileSync(file, "utf8"), jsonl(NEXT));
+    assert.deepEqual(warned, []);
+  });
+
+  console.log("\n=== through the engine ===\n");
+
+  // The data loss, end to end: reopen a store whose last row a crash tore,
+  // ingest, and read the JSONL as the next start would, with no rewrite in
+  // between. Before the fix the ingest joined onto the torn row and was gone.
+  await test("an ingest after reopening a torn store survives a reload", async () => {
+    const dataFile = freshFile();
+    const DIM = 64;
+    const vocab = new Map();
+    const embedFn = async (text) => {
+      const vec = new Array(DIM).fill(0);
+      for (const w of String(text).toLowerCase().match(/[a-z]+/g) || []) {
+        if (!vocab.has(w)) vocab.set(w, vocab.size);
+        vec[vocab.get(w) % DIM]++;
+      }
+      const mag = Math.sqrt(vec.reduce((s, v) => s + v * v, 0)) || 1;
+      return vec.map(v => v / mag);
+    };
+    const who = { agent: "torn-writes-test" };
+
+    await lib.init({ dataFile, embedFn, embeddingDim: DIM });
+    let a;
+    try {
+      a = await lib.ingest("alpha bravo charlie delta", { who });
+    } finally { await lib.shutdown(); }
+
+    // The crash: part of a row reached the file, then the process died.
+    fs.appendFileSync(dataFile, partial({ id: a + 1, text: "echo foxtrot golf hotel" }, 24));
+
+    await muted(() => lib.init({ dataFile, embedFn, embeddingDim: DIM }));
+    try {
+      const c = await muted(() => lib.ingest("sierra tango uniform victor", { who }));
+      assert.deepEqual(ids(dataFile), [a, c]);
+    } finally {
+      await lib.shutdown();
+    }
   });
 
   console.log("\n────────────────────────────────────────────────────────────");

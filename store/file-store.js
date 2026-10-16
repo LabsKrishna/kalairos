@@ -8,6 +8,8 @@
 //     a power loss on filesystems that honour fsync.
 //   * A failed append leaves the file as it found it: whatever it wrote is
 //     truncated away before the error is rethrown.
+//   * A row that a crash cut off partway is never joined onto: the next
+//     append starts on a new line, and loadRaw skips the partial row.
 //   * persistAll uses tmp-file + atomic rename. Both the tmp file and the
 //     parent directory are fsync'd so the rename is durable.
 //   * If the process crashes after the tmp is written but before rename,
@@ -41,11 +43,12 @@ function _writeFileSyncDurable(file, data) {
 }
 
 function _appendSyncDurable(file, data) {
-  const buf = Buffer.from(data, "utf8");
+  let buf = Buffer.from(data, "utf8");
   // Not "a": on Windows an O_APPEND handle has no right to truncate, so the
   // undo below would fail with EPERM. Writing at the end explicitly is the
-  // same thing for the single writer this store allows.
-  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT);
+  // same thing for the single writer this store allows. Read-write, so the
+  // last byte can be checked.
+  const fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT);
   try {
     // Where the file ends now, so a failed append can put it back. A row cut
     // off partway has no newline, and the next append would join onto it: the
@@ -53,6 +56,13 @@ function _appendSyncDurable(file, data) {
     // acknowledged. A whole row whose fsync failed would come back on reload
     // though its write rejected.
     const size = fs.fstatSync(fd).size;
+    // No newline at the end means a crash cut a row off partway, so no undo
+    // ran. Start on a fresh line so this row does not join onto it. The
+    // partial row stays, and a load skips it, until the next full rewrite.
+    if (size > 0 && !_endsWithNewline(fd, size)) {
+      console.warn(`[kalairos] FileStore: ${path.basename(file)} ends partway through a row, likely from a crash during an append; starting this row on a new line`);
+      buf = Buffer.concat([NEWLINE, buf]);
+    }
     try {
       _writeAll(fd, buf, size);
       fs.fsyncSync(fd);
@@ -63,6 +73,13 @@ function _appendSyncDurable(file, data) {
   } finally {
     fs.closeSync(fd);
   }
+}
+
+const NEWLINE = Buffer.from("\n");
+
+function _endsWithNewline(fd, size) {
+  const last = Buffer.alloc(1);
+  return fs.readSync(fd, last, 0, 1, size - 1) === 1 && last[0] === NEWLINE[0];
 }
 
 // writeSync can return having written only part of the buffer, with no error:

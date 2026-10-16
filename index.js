@@ -239,37 +239,46 @@ function _withWriteLock(fn, batchedIO = false) {
 }
 
 function _drainWrites() {
-  // Loop: after each batch, check if new items arrived while we were settling.
-  while (_pendingWrites.length > 0) {
-    const batch   = _pendingWrites.splice(0); // grab everything pending right now
-    const isMulti = batch.length > 1;
+  try {
+    // Loop: after each batch, check if new items arrived while we were settling.
+    while (_pendingWrites.length > 0) {
+      const batch   = _pendingWrites.splice(0); // grab everything pending right now
+      const isMulti = batch.length > 1;
 
-    const settled = [];
-    for (const item of batch) {
-      // Skip this write's own I/O when a later flush covers it: the single
-      // flush below for a multi-write batch, or its batch op's own flush.
-      _skipIO = isMulti || item.batchedIO;
-      try {
-        settled.push({ ok: true,  resolve: item.resolve, value: item.fn() });
-      } catch (err) {
-        settled.push({ ok: false, reject:  item.reject,  error: err });
-      } finally {
-        _skipIO = false;
+      const settled = [];
+      for (const item of batch) {
+        // Skip this write's own I/O when a later flush covers it: the single
+        // flush below for a multi-write batch, or its batch op's own flush.
+        _skipIO = isMulti || item.batchedIO;
+        try {
+          settled.push({ ok: true,  item, value: item.fn() });
+        } catch (err) {
+          settled.push({ ok: false, item, error: err });
+        } finally {
+          _skipIO = false;
+        }
+      }
+
+      // The single flush for the micro-batch. Skipped only when every write in
+      // it belongs to a batch op, which flushes when it finishes; anything else
+      // must be on disk before its promise settles. A sync store rethrows I/O
+      // errors here; none of these writes reached disk, so each one that would
+      // have resolved rejects with that error, as a single write's would.
+      let flushError = null;
+      if (isMulti && batch.some(item => !item.batchedIO)) {
+        try { _persistAll(); } catch (err) { flushError = err; }
+      }
+
+      // Settle all promises after the flush so callers receive confirmed IDs.
+      for (const s of settled) {
+        if (!s.ok)           s.item.reject(s.error);
+        else if (flushError) s.item.reject(flushError);
+        else                 s.item.resolve(s.value);
       }
     }
-
-    // The single flush for the micro-batch. Skipped only when every write in
-    // it belongs to a batch op, which flushes when it finishes; anything else
-    // must be on disk before its promise settles.
-    if (isMulti && batch.some(item => !item.batchedIO)) _persistAll();
-
-    // Settle all promises after the flush so callers receive confirmed IDs.
-    for (const s of settled) {
-      if (s.ok) s.resolve(s.value);
-      else      s.reject(s.error);
-    }
+  } finally {
+    _draining = false;
   }
-  _draining = false;
 }
 
 // Canonicalizes provenance input. Accepts a string shorthand ("user", "agent", ...)

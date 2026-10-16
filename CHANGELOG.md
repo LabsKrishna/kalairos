@@ -55,6 +55,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `until` arrives as `null`. A missing `since` was 0 rather than -Infinity,
   which dropped anything stamped before 1970. Both bounds are now
   open-ended when omitted.
+- **`kalairos-mcp` exits when its client goes away.** The stdio server had
+  no shutdown path: nothing listened for stdin ending, and SIGTERM and
+  SIGINT went unhandled, so it ran until its event loop emptied on its own.
+  On 1.9.0 that never happened, because the worker pool's idle threads held
+  the loop open, and servers whose client had exited kept running for days
+  at about 260MB each. The server now shuts down when stdin ends or closes,
+  when its transport closes, and on SIGTERM or SIGINT. It stops reading
+  requests, lets tool calls already running finish, so a write sent just
+  before the client left still lands and is answered, flushes the store,
+  and exits with code 0. A shutdown that stalls is cut off after 5 seconds
+  with code 1.
+- **`kalairos-mcp` keeps the last write of a client that vanishes
+  mid-request.** A host that crashes closes stdin, stdout and stderr at
+  once. The engine logs as it writes, so a log line hit the closed stderr,
+  and the unhandled `EPIPE` killed the server before the write reached
+  disk; a reply to the closed stdout could do the same. Failed writes to
+  stderr are now ignored, a failed write to stdout starts the shutdown
+  above, and the write lands.
 
 ### Known issues
 

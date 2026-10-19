@@ -33,11 +33,12 @@ async function test(name, fn) {
   }
 }
 
+const freePort = require("./free-port");
+
 const ROOT = path.join(__dirname, "..");
-// A random high port, as in test-server-auth.js, so concurrent runs in other
-// checkouts don't collide.
-const PORT = 30000 + Math.floor(Math.random() * 20000);
-const BASE = `http://127.0.0.1:${PORT}`;
+// A port the OS hands out, so concurrent runs in other checkouts don't
+// collide. Set before the first server starts.
+let PORT, BASE;
 
 const day = (iso) => Date.parse(`${iso}T12:00:00Z`);
 
@@ -134,6 +135,8 @@ async function seed(kal) {
 
 (async function run() {
   console.log("\n── keys, fields and links over REST ─────────────────────────\n");
+  PORT = await freePort();
+  BASE = `http://127.0.0.1:${PORT}`;
 
   await test("REST: every write route carries key, fields and links; describe reads both clocks", async () => {
     await withServer(async () => {

@@ -75,6 +75,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   needs `forceNew` on first writes or lowered version and consolidation
   thresholds. Identity misses stay at 0, and every metric matches the run
   before the change.
+- **MCP writes name their agent.** Every write through `kalairos-mcp` is
+  attributed to `{ type: "agent", actor }`, with `who.agent` on its trail
+  events. The actor is `KALAIROS_MCP_AGENT`, or else the name the host gives
+  in the MCP handshake (for example `claude-code`). `kalairos_remember` used
+  to write as an unnamed agent (trail: "anon"), so no MCP agent could contest
+  another's change to a key. `kalairos_batch_store` and
+  `kalairos_extract_facts` used to write as the user, with the user's default
+  trust (0.90 rather than an agent's 0.75).
 - **`importMarkdown()` takes each section's type from its `Type` line**,
   which keeps its case, instead of lowercasing the `## [id] TYPE` header.
   Type is part of a key's identity, so `priorAuth:PA-1001` used to come back

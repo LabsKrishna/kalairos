@@ -20,11 +20,10 @@ const { spawn } = require("child_process");
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-mcp-"));
 
-(async () => {
-  console.log("\n=== MCP stdio channel ===\n");
-
+// Starts the real server on this test's data file. extraEnv picks the agent.
+function startServer(extraEnv = {}) {
   const child = spawn(process.execPath, [path.join(__dirname, "..", "mcp.js")], {
-    env: { ...process.env, KALAIROS_DATA_FILE: path.join(dir, "data.kalairos") },
+    env: { ...process.env, KALAIROS_DATA_FILE: path.join(dir, "data.kalairos"), ...extraEnv },
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -63,11 +62,30 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-mcp-"));
     assert.ok(r.result?.isError, `${name} should have failed: ${JSON.stringify(r.error || r.result)}`);
     return r.result.content[0].text;
   };
+  const handshake = async (clientName) => {
+    const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: clientName, version: "0" } });
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+    return init;
+  };
+  // kill() only sends the signal; the next server must not open the data file
+  // while this one still holds it.
+  const stop = () => new Promise(resolve => {
+    if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    child.once("exit", resolve);
+    child.kill();
+  });
+  return { child, rpc, tool, toolError, handshake, stop, nonProtocol };
+}
+
+(async () => {
+  console.log("\n=== MCP stdio channel ===\n");
+
+  const { rpc, tool, toolError, handshake, stop, nonProtocol } = startServer();
+  let second = null;
 
   try {
-    const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "0" } });
+    const init = await handshake("test");
     assert.strictEqual(init.result.serverInfo.version, require("../package.json").version, "serverInfo reports the package version");
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
     console.log("  [ok] handshake reports the real package version");
 
     await tool("kalairos_remember", { text: "Deploys go out every Friday afternoon" });
@@ -139,12 +157,42 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-mcp-"));
     assert.match(await toolError("kalairos_remember", { text: "Stray link", links: [{ rel: "under", to: "policy:IB-114" }] }), /key/);
     console.log("  [ok] unknown things are null; bad addresses and keyless links are refused");
 
-    // Let any trailing writes land before checking the channel.
+    // ── Every write names its agent ───────────────────────────────────────
+    const policyHistory = await tool("kalairos_history", { id: v1.id });
+    assert.deepStrictEqual(policyHistory.versions.map(v => v.source), [
+      { type: "agent", actor: "test" }, { type: "agent", actor: "test" },
+    ], "writes are attributed to the host named in the handshake");
+    assert.deepStrictEqual(policyHistory.versions[1].who, { agent: "test" });
+    console.log("  [ok] writes carry the agent named in the handshake");
+
+    // A second agent on the same store, named by KALAIROS_MCP_AGENT (which
+    // wins over its handshake), changes the first agent's key: contested.
     await new Promise(r => setTimeout(r, 200));
     assert.deepStrictEqual(nonProtocol, [], `stdout carried non-protocol output:\n${nonProtocol.join("\n")}`);
+    await stop();
+    const heldUntil = Date.now();
+    second = startServer({ KALAIROS_MCP_AGENT: "intake-bot" });
+    await second.handshake("other-host");
+    await second.tool("kalairos_remember", {
+      text: "IB-114 now asks for four weeks.",
+      type: "policy", key: "IB-114", fields: { therapyWeeks: 4 }, effectiveAt: "2026-07-01",
+    });
+    const contested = await second.tool("kalairos_describe", { address: "policy:IB-114" });
+    assert.strictEqual(contested.contested, true, "another agent's change to a key is contested");
+    const reason = (await second.tool("kalairos_history", { id: v1.id })).versions[2].delta.contestReason;
+    assert.match(reason, /agent:intake-bot/);
+    assert.match(reason, /agent:test/);
+    const asHeld = await second.tool("kalairos_describe", { address: "policy:IB-114", asOf: heldUntil });
+    assert.deepStrictEqual(asHeld.fields, { therapyWeeks: 12 }, "the holder's version stays readable");
+    console.log("  [ok] a second agent changing the first agent's key is contested");
+
+    // Let any trailing writes land before checking the channel.
+    await new Promise(r => setTimeout(r, 200));
+    assert.deepStrictEqual(second.nonProtocol, [], `stdout carried non-protocol output:\n${second.nonProtocol.join("\n")}`);
     console.log("  [ok] stdout carried only JSON-RPC messages");
   } finally {
-    child.kill();
+    await stop();
+    if (second) await second.stop();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 

@@ -588,6 +588,8 @@ GET  /describe?address=claim:D-101&validAt=2026-05-12&asOf=2026-07-20
 
 `kalairos_remember` and the HTTP write routes take `key`, `fields` and `links` as `remember()` does. `kalairos_describe`, `GET /describe` and the remote client's `describe(address, { asOf?, validAt?, workspaceId? })` return what `describe()` returns, with times in Unix ms or ISO-8601. Unlike `kalairos_recall` and `POST /query`, they take `asOf` and `validAt` together.
 
+Every MCP write is an agent's: `{ type: "agent", actor }`, where the actor is `KALAIROS_MCP_AGENT` or else the host's name from the MCP handshake. So when one agent changes a key another agent set, the write is marked `contested`.
+
 ---
 
 ## Configuration
@@ -609,6 +611,7 @@ GET  /describe?address=claim:D-101&validAt=2026-05-12&asOf=2026-07-20
 | `KALAIROS_PORT`                  | `3000`  | HTTP server port                           |
 | `KALAIROS_HOST`                  | `127.0.0.1` | HTTP server bind address (`0.0.0.0` for remote access) |
 | `KALAIROS_DATA_FILE`             | `./data.kalairos` | Data file for `init()`, the server, the MCP server and the CLI |
+| `KALAIROS_MCP_AGENT`             | the host's name | The agent the MCP server attributes every write to (default: the name the host gives in the MCP handshake, e.g. `claude-code`) |
 | `KALAIROS_MODEL_DIR`             | `~/.kalairos` | Where the neural embedder is downloaded and loaded from |
 | `KALAIROS_INDEX_SQLITE`          | unset   | `1` enables the SQLite index (needs the optional `better-sqlite3`) |
 

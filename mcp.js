@@ -9,6 +9,8 @@
 // Environment variables:
 //   KALAIROS_DATA_FILE  — path to data file (default: ./data.kalairos)
 //   KALAIROS_MCP_NAME   — server name shown to host (default: "kalairos")
+//   KALAIROS_MCP_AGENT  — the agent every write is attributed to (default: the
+//                         host's name from the MCP handshake, e.g. "claude-code")
 "use strict";
 
 const { McpServer }            = require("@modelcontextprotocol/sdk/server/mcp.js");
@@ -38,6 +40,24 @@ const server = new McpServer(
   { capabilities: { tools: {} } },
 );
 
+// Who is writing. Every write through this server is an agent's, named by
+// KALAIROS_MCP_AGENT or else by the host in the MCP handshake, so provenance,
+// the audit trail and the contested-write rule can tell one agent from
+// another. Unnamed, every MCP writer looks the same, and none could contest
+// another's change to a key.
+function writer() {
+  const name = process.env.KALAIROS_MCP_AGENT || server.server.getClientVersion()?.name || null;
+  return name
+    ? { source: { type: "agent", actor: name }, who: { agent: name } }
+    : { source: { type: "agent" } };
+}
+
+const linkSchema = z.object({
+  rel: z.string().describe("How this thing relates to the other, e.g. 'under', 'supports'"),
+  to:  z.string().describe("Address of the other thing, \"type:key\", e.g. \"policy:IB-114\""),
+  one: z.boolean().optional().describe("true when this thing has at most one link of this rel at a time (a claim is under one policy): pointing it elsewhere replaces the link instead of adding another"),
+});
+
 // ─── Tools ───────────────────────────────────────────────────────────────────
 // Tools covering the full agent memory lifecycle.
 
@@ -56,15 +76,11 @@ server.tool(
     effectiveAt:    z.union([z.number(), z.string()]).optional().describe("Event time this value became true (Unix ms or ISO-8601 string). Defaults to ingest time. For metric/series types, a strictly later effectiveAt retires the previous value into a closed valid interval — both readings stay queryable via recall(asOf)"),
     key:            z.string().optional().describe("The real identifier of the thing this memory is about, e.g. a claim or policy number. Identity becomes workspace + type + key: the write updates the record holding that key, or creates it, and similar wording never merges two keys. Pass the same type every time. Its address is \"type:key\", e.g. \"claim:D-101\", for links and kalairos_describe"),
     fields:         z.object({}).passthrough().optional().describe("Structured facts about the thing, e.g. { \"billed\": 14200, \"dos\": \"2026-05-12\" }. Versioned with the text and compared exactly on keyed writes; fields left out carry forward from the previous version"),
-    links:          z.array(z.object({
-      rel: z.string().describe("How this thing relates to the other, e.g. 'under', 'supports'"),
-      to:  z.string().describe("Address of the other thing, \"type:key\", e.g. \"policy:IB-114\""),
-      one: z.boolean().optional().describe("true when this thing has at most one link of this rel at a time (a claim is under one policy): pointing it elsewhere replaces the link instead of adding another"),
-    })).optional().describe("Typed links from this thing to others, by address. Requires key. Each link is stored as its own record with versions and provenance; read them back with kalairos_describe"),
+    links:          z.array(linkSchema).optional().describe("Typed links from this thing to others, by address. Requires key. Each link is stored as its own record with versions and provenance; read them back with kalairos_describe"),
   },
   async ({ text, type, tags, metadata, importance, memoryType, workspaceId, effectiveAt, key, fields, links }) => {
     try {
-      const id = await dbx.remember(text, { type, tags, metadata, importance, memoryType, workspaceId, effectiveAt, key, fields, links });
+      const id = await dbx.remember(text, { type, tags, metadata, importance, memoryType, workspaceId, effectiveAt, key, fields, links, ...writer() });
       return ok({ id });
     } catch (err) { return fail(err); }
   },
@@ -206,7 +222,10 @@ server.tool(
   },
   async ({ items }) => {
     try {
-      const ids = await dbx.ingestBatch(items);
+      // Written as the same agent as kalairos_remember. Left to ingest's
+      // default, a batch was the user's word, with the user's trust.
+      const by  = writer();
+      const ids = await dbx.ingestBatch(items.map(item => ({ ...item, ...by })));
       return ok({ ids, count: ids.length });
     } catch (err) { return fail(err); }
   },
@@ -224,7 +243,7 @@ server.tool(
   },
   async ({ text, type, tags, workspaceId }) => {
     try {
-      const result = await dbx.extractFacts(text, { type, tags, workspaceId });
+      const result = await dbx.extractFacts(text, { type, tags, workspaceId, ...writer() });
       return ok(result);
     } catch (err) { return fail(err); }
   },

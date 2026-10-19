@@ -52,6 +52,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with optional `asOf`, `validAt` (Unix ms or ISO-8601) and `workspaceId`,
   and returns what `describe()` returns. Unlike `kalairos_recall`, `asOf` and
   `validAt` combine.
+- **Keys over HTTP.** The write routes (`POST /ingest`, `/remember`,
+  `/ingest/batch` and a scope's `/agent/:id/remember`) take `key`, `fields`
+  and `links`. `GET /describe?address=type:key` takes optional `asOf`,
+  `validAt` (Unix ms or ISO-8601) and `workspaceId`, needs read access to that
+  workspace, and answers `null` when the thing isn't there on those clocks.
+  The remote client calls it as `describe(address, { asOf, validAt,
+  workspaceId })`.
 
 ### Changed
 

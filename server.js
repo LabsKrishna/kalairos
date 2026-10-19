@@ -105,7 +105,7 @@ function _wrap(fn) {
 // ─── Shared body extraction for ingest-like endpoints ────────────────────────
 
 function _ingestParams(body) {
-  const { text, type = "text", timestamp, effectiveAt, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM, importance, trustScore } = body || {};
+  const { text, type = "text", timestamp, effectiveAt, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM, importance, trustScore, key, fields, links } = body || {};
   const p = { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM: !!useLLM };
   // effectiveAt is the event-time axis (§14) — when the fact became true in the
   // world, as opposed to `timestamp`, which is when we learned it. Without it on
@@ -115,7 +115,20 @@ function _ingestParams(body) {
   if (effectiveAt != null) p.effectiveAt = effectiveAt;
   if (importance  != null) p.importance  = Number(importance);
   if (trustScore  != null) p.trustScore  = Number(trustScore);
+  // A thing's identity, facts and links ("Keys, fields and links" in
+  // index.js). Passed as sent: the engine refuses a malformed one before
+  // anything is written, rather than letting similarity decide identity.
+  if (key    != null) p.key    = key;
+  if (fields != null) p.fields = fields;
+  if (links  != null) p.links  = links;
   return p;
+}
+
+// Times in a query string arrive as text. All digits is Unix ms; anything
+// else goes to the engine as ISO-8601, which rejects what doesn't parse.
+function _timeParam(value) {
+  if (value == null || value === "") return undefined;
+  return /^-?\d+$/.test(value) ? Number(value) : value;
 }
 
 // ─── Auth Middleware ─────────────────────────────────────────────────────────
@@ -250,6 +263,24 @@ app.post("/query", _requireAuth("read"), _wrap(async (req) => {
     case "since/until": return await lib.queryRange(text, since, until, opts);
     default:            return await lib.query(text, opts);
   }
+}));
+
+// GET /describe?address=type:key[&asOf=&validAt=&workspaceId=]
+// One keyed thing and its links, read on both clocks. Unlike /query's modes,
+// asOf and validAt combine: what was true at validAt, as known at asOf. Each
+// takes Unix ms or ISO-8601. Answers null when the thing isn't there on those
+// clocks.
+app.get("/describe", _requireAuth("read"), _wrap(async (req) => {
+  const { address, asOf, validAt, workspaceId } = req.query;
+  if (typeof address !== "string" || !address.trim()) {
+    throw { code: Codes.VALIDATION, message: "address query param is required (\"type:key\", e.g. claim:D-101)" };
+  }
+  return lib.describe(address, {
+    asOf:              _timeParam(asOf),
+    validAt:           _timeParam(validAt),
+    workspaceId,
+    allowedWorkspaces: req.allowedWorkspaces,
+  });
 }));
 
 app.post("/entities/batch", _requireAuth("read"), _wrap(async (req) => {
@@ -638,13 +669,15 @@ lib.init({ strictEmbeddings: false }).then(() => {
       console.log("  WARNING: listening beyond loopback with auth disabled. Anyone who can reach this port can read and delete every memory.");
     }
     console.log("Endpoints:");
-    console.log("  POST   /ingest                  { text, type?, metadata?, tags?, timestamp?, source?, classification?, retention?, memoryType?, workspaceId?, useLLM? }");
-    console.log("  POST   /remember                { text, type?, metadata?, tags?, timestamp?, source?, classification?, retention?, memoryType?, workspaceId?, useLLM? }");
+    console.log("  POST   /ingest                  { text, type?, metadata?, tags?, timestamp?, source?, classification?, retention?, memoryType?, workspaceId?, useLLM?, key?, fields?, links? }");
+    console.log("  POST   /remember                { text, type?, metadata?, tags?, timestamp?, source?, classification?, retention?, memoryType?, workspaceId?, useLLM?, key?, fields?, links? }");
     console.log("  POST   /ingest/batch            { items: [{text, type?, ...}] }");
     console.log("  POST   /ingest/timeseries       { label, points: [{timestamp,value}], metadata?, tags? }");
     console.log("  POST   /ingest/file             { filePath, tags?, metadata? }");
     console.log("  POST   /query                   { text, limit?, maxTokens?, filter?, asOf? | validAt? | since?+until? }");
     console.log("                                  asOf = ingest time (what we believed); validAt = event time (what was true)");
+    console.log("  GET    /describe?address=type:key&asOf&validAt&workspaceId");
+    console.log("                                  one keyed thing and its links; asOf and validAt combine");
     console.log("  GET    /entity/:id");
     console.log("  DELETE /entity/:id              { deletedBy? } → soft delete");
     console.log("  DELETE /entity/:id/purge        → permanent hard delete");

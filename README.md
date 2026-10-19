@@ -575,14 +575,18 @@ await io.ingestFile("./notes.md");
 const trail = await history.trail({ entity: id });
 ```
 
-### MCP
+### MCP and HTTP
 
 ```text
 kalairos_remember  { text, type?, key?, fields?, links?, effectiveAt?, workspaceId?, ... }
 kalairos_describe  { address, asOf?, validAt?, workspaceId? }
+
+POST /ingest, /remember   { text, type?, key?, fields?, links?, ... }
+POST /ingest/batch        { items: [{ text, type?, key?, fields?, links?, ... }] }
+GET  /describe?address=claim:D-101&validAt=2026-05-12&asOf=2026-07-20
 ```
 
-`kalairos_remember` takes `key`, `fields` and `links` as `remember()` does. `kalairos_describe` returns what `describe()` returns, with times in Unix ms or ISO-8601; unlike `kalairos_recall`, it takes `asOf` and `validAt` together.
+`kalairos_remember` and the HTTP write routes take `key`, `fields` and `links` as `remember()` does. `kalairos_describe`, `GET /describe` and the remote client's `describe(address, { asOf?, validAt?, workspaceId? })` return what `describe()` returns, with times in Unix ms or ISO-8601. Unlike `kalairos_recall` and `POST /query`, they take `asOf` and `validAt` together.
 
 ---
 
@@ -624,7 +628,7 @@ kalairos_describe  { address, asOf?, validAt?, workspaceId? }
 npx kalairos          # starts on 127.0.0.1:3000
 ```
 
-Core endpoints mirror the flat API (`/remember`, `/query`, `/history/:id`, etc.). See `server.js` for the full route list.
+Core endpoints mirror the flat API (`/remember`, `/query`, `/describe`, `/history/:id`, etc.). See `server.js` for the full route list.
 
 The server listens on loopback only. To serve other machines, set `KALAIROS_HOST=0.0.0.0` and turn on auth: create an owner with `POST /auth/principals` (`{ "id": "ops", "name": "Ops", "workspaces": { "default": "owner" } }`, which returns its token once), then `POST /auth/enable`. From then on every route, including the `/auth/*` routes, needs `Authorization: Bearer <token>`. Auth settings live in memory, so repeat this after a restart.
 

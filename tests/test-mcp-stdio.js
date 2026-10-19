@@ -5,6 +5,10 @@
 // injected a "[kalairos] query: 1.1ms" line into the JSON-RPC stream.
 // This drives the real server through a handshake, a write and a recall,
 // and fails on any stdout line that is not a JSON-RPC message.
+//
+// It also drives keys over the wire: kalairos_remember with key, fields and
+// links, and kalairos_describe on both clocks. Agents reach the engine
+// through MCP, so a key that doesn't survive this hop isn't usable.
 // Run: node tests/test-mcp-stdio.js
 "use strict";
 
@@ -16,11 +20,10 @@ const { spawn } = require("child_process");
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-mcp-"));
 
-(async () => {
-  console.log("\n=== MCP stdio channel ===\n");
-
+// Starts the real server on this test's data file. extraEnv picks the agent.
+function startServer(extraEnv = {}) {
   const child = spawn(process.execPath, [path.join(__dirname, "..", "mcp.js")], {
-    env: { ...process.env, KALAIROS_DATA_FILE: path.join(dir, "data.kalairos") },
+    env: { ...process.env, KALAIROS_DATA_FILE: path.join(dir, "data.kalairos"), ...extraEnv },
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -53,11 +56,36 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-mcp-"));
     assert.ok(!r.error && !r.result.isError, `${name} failed: ${JSON.stringify(r.error || r.result)}`);
     return JSON.parse(r.result.content[0].text);
   };
+  // A call the server must refuse: returns the tool's error text.
+  const toolError = async (name, args) => {
+    const r = await rpc("tools/call", { name, arguments: args });
+    assert.ok(r.result?.isError, `${name} should have failed: ${JSON.stringify(r.error || r.result)}`);
+    return r.result.content[0].text;
+  };
+  const handshake = async (clientName) => {
+    const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: clientName, version: "0" } });
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+    return init;
+  };
+  // kill() only sends the signal; the next server must not open the data file
+  // while this one still holds it.
+  const stop = () => new Promise(resolve => {
+    if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    child.once("exit", resolve);
+    child.kill();
+  });
+  return { child, rpc, tool, toolError, handshake, stop, nonProtocol };
+}
+
+(async () => {
+  console.log("\n=== MCP stdio channel ===\n");
+
+  const { rpc, tool, toolError, handshake, stop, nonProtocol } = startServer();
+  let second = null;
 
   try {
-    const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "0" } });
+    const init = await handshake("test");
     assert.strictEqual(init.result.serverInfo.version, require("../package.json").version, "serverInfo reports the package version");
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
     console.log("  [ok] handshake reports the real package version");
 
     await tool("kalairos_remember", { text: "Deploys go out every Friday afternoon" });
@@ -68,12 +96,123 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-mcp-"));
     assert.ok(recall.results?.length > 0 || recall.count > 0 || Array.isArray(recall), "recall returns a result");
     console.log("  [ok] remember and recall work over stdio");
 
-    // Let any trailing writes land before checking the channel.
+    // ── Keys, fields and links ────────────────────────────────────────────
+    // Keyed identity never consults similarity, so these hold under either
+    // embedder.
+    const { tools } = (await rpc("tools/list", {})).result;
+    const byName = Object.fromEntries(tools.map(t => [t.name, t]));
+    const rememberProps = byName.kalairos_remember.inputSchema.properties;
+    for (const p of ["key", "fields", "links"]) assert.ok(rememberProps[p], `kalairos_remember takes ${p}`);
+    const describeSchema = byName.kalairos_describe?.inputSchema;
+    assert.ok(describeSchema, "kalairos_describe is registered");
+    assert.deepStrictEqual(describeSchema.required, ["address"], "address is the one required argument");
+    for (const p of ["asOf", "validAt", "workspaceId"]) assert.ok(describeSchema.properties[p], `kalairos_describe takes ${p}`);
+    console.log("  [ok] kalairos_remember advertises key, fields and links; kalairos_describe is listed");
+
+    const beforeKeys = Date.now() - 1;
+    const v1 = await tool("kalairos_remember", {
+      text: "Ironbark policy IB-114: six weeks of conservative therapy.",
+      type: "policy", key: "IB-114", fields: { therapyWeeks: 6 }, effectiveAt: "2026-01-01",
+    });
+    const v2 = await tool("kalairos_remember", {
+      text: "IB-114 revised: twelve weeks before surgery.",
+      type: "policy", key: "IB-114", fields: { therapyWeeks: 12 }, effectiveAt: "2026-07-01",
+    });
+    assert.strictEqual(v2.id, v1.id, "a reworded write with the same key lands on its record");
+    const claim = await tool("kalairos_remember", {
+      text: "Claim for lumbar microdiscectomy at L5-S1.",
+      type: "claim", key: "D-101", fields: { dos: "2026-05-12", billed: 14200 }, effectiveAt: "2026-05-12",
+      links: [{ rel: "under", to: "policy:IB-114", one: true }],
+    });
+    console.log("  [ok] a reworded write with the same key lands on its record");
+
+    const now = await tool("kalairos_describe", { address: "claim:D-101" });
+    assert.strictEqual(now.id, claim.id);
+    assert.strictEqual(now.key, "D-101");
+    assert.deepStrictEqual(now.fields, { dos: "2026-05-12", billed: 14200 });
+    assert.deepStrictEqual(now.links.map(l => [l.rel, l.to]), [["under", "policy:IB-114"]]);
+    assert.strictEqual(now.links[0].thing.fields.therapyWeeks, 12, "now, the link reads the policy as it stands");
+    const policy = await tool("kalairos_describe", { address: "policy:IB-114" });
+    assert.deepStrictEqual(policy.linkedFrom.map(l => [l.rel, l.from]), [["under", "claim:D-101"]]);
+    console.log("  [ok] kalairos_describe returns fields and links from both ends");
+
+    // Event time as ISO, then both clocks at once in ms.
+    const onDos = await tool("kalairos_describe", { address: "claim:D-101", validAt: "2026-05-12T12:00:00Z" });
+    assert.strictEqual(onDos.links[0].thing.fields.therapyWeeks, 6, "on the date of service, the policy in force then");
+    const both = await tool("kalairos_describe", {
+      address: "claim:D-101", validAt: Date.parse("2026-05-12T12:00:00Z"), asOf: Date.now() + 60_000,
+    });
+    assert.strictEqual(both.links[0].thing.fields.therapyWeeks, 6, "validAt and asOf combine");
+    assert.strictEqual(both.validAt, Date.parse("2026-05-12T12:00:00Z"), "the clocks are echoed as ms");
+    assert.strictEqual(await tool("kalairos_describe", { address: "claim:D-101", asOf: new Date(beforeKeys).toISOString() }), null,
+      "nothing about the claim had been recorded yet");
+    assert.strictEqual(await tool("kalairos_describe", { address: "claim:D-101", validAt: "2026-05-01" }), null,
+      "the claim was not yet true before the date of service");
+    console.log("  [ok] kalairos_describe reads validAt and asOf, in ms or ISO-8601");
+
+    assert.strictEqual(await tool("kalairos_describe", { address: "claim:D-999" }), null, "an unknown key is null, not an error");
+    assert.strictEqual(await tool("kalairos_describe", { address: "claim:D-101", workspaceId: "elsewhere" }), null,
+      "a key belongs to its workspace");
+    assert.match(await toolError("kalairos_describe", { address: "D-101" }), /address/);
+    assert.match(await toolError("kalairos_remember", { text: "Stray link", links: [{ rel: "under", to: "policy:IB-114" }] }), /key/);
+    console.log("  [ok] unknown things are null; bad addresses and keyless links are refused");
+
+    // ── Every write names its agent ───────────────────────────────────────
+    const policyHistory = await tool("kalairos_history", { id: v1.id });
+    assert.deepStrictEqual(policyHistory.versions.map(v => v.source), [
+      { type: "agent", actor: "test" }, { type: "agent", actor: "test" },
+    ], "writes are attributed to the host named in the handshake");
+    assert.deepStrictEqual(policyHistory.versions[1].who, { agent: "test" });
+    console.log("  [ok] writes carry the agent named in the handshake");
+
+    // A second agent on the same store, named by KALAIROS_MCP_AGENT (which
+    // wins over its handshake), changes the first agent's key: contested.
     await new Promise(r => setTimeout(r, 200));
     assert.deepStrictEqual(nonProtocol, [], `stdout carried non-protocol output:\n${nonProtocol.join("\n")}`);
+    await stop();
+    const heldUntil = Date.now();
+    second = startServer({ KALAIROS_MCP_AGENT: "intake-bot" });
+    await second.handshake("other-host");
+    await second.tool("kalairos_remember", {
+      text: "IB-114 now asks for four weeks.",
+      type: "policy", key: "IB-114", fields: { therapyWeeks: 4 }, effectiveAt: "2026-07-01",
+    });
+    const contested = await second.tool("kalairos_describe", { address: "policy:IB-114" });
+    assert.strictEqual(contested.contested, true, "another agent's change to a key is contested");
+    const reason = (await second.tool("kalairos_history", { id: v1.id })).versions[2].delta.contestReason;
+    assert.match(reason, /agent:intake-bot/);
+    assert.match(reason, /agent:test/);
+    const asHeld = await second.tool("kalairos_describe", { address: "policy:IB-114", asOf: heldUntil });
+    assert.deepStrictEqual(asHeld.fields, { therapyWeeks: 12 }, "the holder's version stays readable");
+    console.log("  [ok] a second agent changing the first agent's key is contested");
+
+    // kalairos_batch_store carries keys, fields, links and event time.
+    const batch = await second.tool("kalairos_batch_store", { items: [
+      { text: "Physical therapy discharge summary: eight weeks completed.", type: "record", key: "D-101/pt",
+        fields: { therapyWeeks: 8 }, effectiveAt: "2026-04-28", links: [{ rel: "supports", to: "claim:D-101" }] },
+      { text: "Lumbar MRI report: nerve root compression at L5-S1.", type: "record", key: "D-101/mri",
+        effectiveAt: "2026-03-30", links: [{ rel: "supports", to: "claim:D-101" }] },
+    ] });
+    assert.strictEqual(batch.count, 2);
+    const onDosNow = await second.tool("kalairos_describe", { address: "claim:D-101", validAt: "2026-05-12T12:00:00Z" });
+    assert.deepStrictEqual(onDosNow.linkedFrom.map(l => l.from).sort(), ["record:D-101/mri", "record:D-101/pt"],
+      "batched links keep their event time, so both records were in force on the date of service");
+    const pt = await second.tool("kalairos_describe", { address: "record:D-101/pt" });
+    assert.deepStrictEqual(pt.fields, { therapyWeeks: 8 });
+    assert.deepStrictEqual(pt.version.source, { type: "agent", actor: "intake-bot" }, "a batch is written as the agent, not the user");
+    const again = await second.tool("kalairos_batch_store", { items: [
+      { text: "PT discharge summary, reworded.", type: "record", key: "D-101/pt", effectiveAt: "2026-04-28" },
+    ] });
+    assert.deepStrictEqual(again.ids, [batch.ids[0]], "a batched key lands on its record");
+    console.log("  [ok] kalairos_batch_store carries keys, fields, links and effectiveAt");
+
+    // Let any trailing writes land before checking the channel.
+    await new Promise(r => setTimeout(r, 200));
+    assert.deepStrictEqual(second.nonProtocol, [], `stdout carried non-protocol output:\n${second.nonProtocol.join("\n")}`);
     console.log("  [ok] stdout carried only JSON-RPC messages");
   } finally {
-    child.kill();
+    await stop();
+    if (second) await second.stop();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 

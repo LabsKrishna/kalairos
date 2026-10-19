@@ -35,6 +35,16 @@ function withOverride(value, fn) {
   }
 }
 
+// A test that awaits something nothing will settle doesn't fail on its own:
+// the event loop empties, Node exits 0 partway through this file, and npm test
+// carries on as if every test had passed. Make that exit a failure.
+let finished = false;
+process.on("exit", () => {
+  if (finished) return;
+  console.log("\n  ❌  exited before the last test finished: a test awaited something that never settled");
+  process.exitCode = 1;
+});
+
 (async () => {
 
 // ── availableCpus ────────────────────────────────────────────────────────────
@@ -203,6 +213,7 @@ console.log(`\n${"─".repeat(60)}`);
 const total = passed + failed;
 console.log(`  ${passed}/${total} passed${failed ? `  (${failed} failed)` : " ✅"}`);
 console.log(`${"─".repeat(60)}\n`);
+finished = true;
 process.exit(failed > 0 ? 1 : 0);
 
 })();

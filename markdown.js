@@ -21,6 +21,12 @@ function entityToMarkdownLines(e, { includeHistory = false } = {}) {
   lines.push("");
   lines.push(`- **ID:** ${e.id}`);
   lines.push(`- **Type:** ${e.type || "text"}`);
+  // A thing's key and fields, which parseMarkdownFacts reads back so an
+  // import lands on the same thing. Entities without them export as before.
+  // A link is a keyed record whose fields hold { from, rel, to }, so it
+  // comes back as a link.
+  if (e.key != null)    lines.push(`- **Key:** ${e.key}`);
+  if (e.fields != null) lines.push(`- **Fields:** ${JSON.stringify(e.fields)}`);
   lines.push(`- **Memory type:** ${e.memoryType || "long-term"}`);
   lines.push(`- **Workspace:** ${e.workspaceId || "default"}`);
   lines.push(`- **Classification:** ${e.classification || "internal"}`);
@@ -67,20 +73,29 @@ function renderExport(entities, { includeHistory = false } = {}) {
  * into fact descriptors ready for ingest. Pure — no ingestion happens here.
  *
  * Returns `{ mode, facts }`:
- *   - mode "structured": facts are `{ type, text }`, one per `## [id] TYPE`
- *     section (metadata/history lines stripped). Type comes from the header.
+ *   - mode "structured": facts are `{ type, text, key?, fields? }`, one per
+ *     `## [id] TYPE` section (metadata/history lines stripped). Type comes
+ *     from the section's `- **Type:**` line, which keeps its case, or else
+ *     the header; key and fields from its `- **Key:**` and `- **Fields:**`
+ *     lines, when it has them.
  *   - mode "bullets": facts are `{ text }`, one per bullet/plain line; the
  *     caller supplies the type from its defaults.
  *   - mode "empty": nothing parseable.
  *
+ * Throws when a Fields line isn't a JSON object: importing the thing without
+ * its facts would be silent loss.
+ *
  * @param {string} mdText
- * @returns {{ mode: "structured"|"bullets"|"empty", facts: Array<{type?: string, text: string}> }}
+ * @returns {{ mode: "structured"|"bullets"|"empty", facts: Array<{type?: string, text: string, key?: string, fields?: object}> }}
  */
 function parseMarkdownFacts(mdText) {
   const text = String(mdText || "");
   if (!text.trim()) return { mode: "empty", facts: [] };
 
   const headerRe = /^##\s+\[(\d+)\]\s+(.+)/;
+  const typeRe   = /^- \*\*Type:\*\*\s*(.+)$/;
+  const keyRe    = /^- \*\*Key:\*\*\s*(.+)$/;
+  const fieldsRe = /^- \*\*Fields:\*\*\s*(.+)$/;
   const lines = text.split("\n");
   const sections = [];
   let currentSection = null;
@@ -89,12 +104,21 @@ function parseMarkdownFacts(mdText) {
     const headerMatch = line.match(headerRe);
     if (headerMatch) {
       if (currentSection) sections.push(currentSection);
-      currentSection = { type: headerMatch[2].trim().toLowerCase(), lines: [] };
+      currentSection = { id: headerMatch[1], type: headerMatch[2].trim().toLowerCase(), lines: [] };
       continue;
     }
     if (currentSection) {
-      // Skip metadata / history / separator / blockquote lines.
+      // Skip metadata / history / separator / blockquote lines, reading back
+      // the ones that make up a thing's identity: type, key and fields.
       const trimmed = line.trim();
+      // Version history closes a section, and its numbered entries are past
+      // versions, not this one's text.
+      if (/^###\s+Version History\b/.test(trimmed)) { currentSection.inHistory = true; continue; }
+      if (currentSection.inHistory) continue;
+      let m;
+      if ((m = trimmed.match(typeRe)))   { currentSection.type   = m[1].trim(); continue; }
+      if ((m = trimmed.match(keyRe)))    { currentSection.key    = m[1].trim(); continue; }
+      if ((m = trimmed.match(fieldsRe))) { currentSection.fields = _parseFieldsLine(m[1], currentSection.id); continue; }
       if (/^- \*\*/.test(trimmed) || /^###/.test(trimmed) || /^---$/.test(trimmed) || /^>/.test(trimmed)) continue;
       if (trimmed) currentSection.lines.push(trimmed);
     }
@@ -106,7 +130,10 @@ function parseMarkdownFacts(mdText) {
     for (const sec of sections) {
       const factText = sec.lines.join(" ").trim();
       if (!factText) continue;
-      facts.push({ type: sec.type === "text" ? "text" : sec.type, text: factText });
+      const fact = { type: sec.type === "text" ? "text" : sec.type, text: factText };
+      if (sec.key != null)    fact.key    = sec.key;
+      if (sec.fields != null) fact.fields = sec.fields;
+      facts.push(fact);
     }
     return { mode: "structured", facts };
   }
@@ -117,6 +144,17 @@ function parseMarkdownFacts(mdText) {
     .filter(l => l.length > 0 && !l.startsWith("#") && !l.startsWith(">"));
   if (!bullets.length) return { mode: "empty", facts: [] };
   return { mode: "bullets", facts: bullets.map(text => ({ text })) };
+}
+
+// A Fields line is the JSON object entityToMarkdownLines wrote.
+function _parseFieldsLine(raw, sectionId) {
+  let fields;
+  try { fields = JSON.parse(raw); }
+  catch (err) { throw new Error(`Section [${sectionId}]: the Fields line is not valid JSON (${err.message})`); }
+  if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
+    throw new Error(`Section [${sectionId}]: the Fields line must be a JSON object`);
+  }
+  return fields;
 }
 
 module.exports = { entityToMarkdownLines, renderExport, parseMarkdownFacts };

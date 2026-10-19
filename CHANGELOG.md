@@ -47,6 +47,28 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   corroboration, not a contest, and doesn't take the key over. The poisoning
   benchmark gains a `key-overwrite` attack: defended, 6/6, and compromised
   with the rule switched off.
+- **Keys over MCP.** `kalairos_remember` and each `kalairos_batch_store`
+  item take `key`, `fields` and `links` (batch items also take
+  `effectiveAt`). The new `kalairos_describe` tool takes an `address`
+  (`"type:key"`) with optional `asOf`, `validAt` (Unix ms or ISO-8601) and
+  `workspaceId`, and returns what `describe()` returns. Unlike
+  `kalairos_recall`, `asOf` and `validAt` combine.
+- **Keys over HTTP.** The write routes (`POST /ingest`, `/remember`,
+  `/ingest/batch` and a scope's `/agent/:id/remember`) take `key`, `fields`
+  and `links`. `GET /describe?address=type:key` takes optional `asOf`,
+  `validAt` (Unix ms or ISO-8601) and `workspaceId`, needs read access to that
+  workspace, and answers `null` when the thing isn't there on those clocks.
+  The remote client calls it as `describe(address, { asOf, validAt,
+  workspaceId })`.
+- **Keys through markdown.** `exportMarkdown()` writes a keyed thing's `Key`
+  and `Fields` lines and `importMarkdown()` reads them back, so an import
+  lands each section on its `type` and `key` with its fields. A link is a
+  keyed record of type `link` whose fields hold `{ from, rel, to }`, so it
+  comes back as a link that `describe()` reads, and a later write to it
+  versions the imported record. A `Fields` line that isn't a JSON object
+  fails the import before anything is written, and `importMarkdown()`
+  refuses `key`, `fields` or `links` in its defaults. Only the current
+  version travels, and an import writes every section to one workspace.
 
 ### Changed
 
@@ -54,9 +76,36 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   needs `forceNew` on first writes or lowered version and consolidation
   thresholds. Identity misses stay at 0, and every metric matches the run
   before the change.
+- **MCP writes name their agent.** Every write through `kalairos-mcp` is
+  attributed to `{ type: "agent", actor }`, with `who.agent` on its trail
+  events. The actor is `KALAIROS_MCP_AGENT`, or else the name the host gives
+  in the MCP handshake (for example `claude-code`). `kalairos_remember` used
+  to write as an unnamed agent (trail: "anon"), so no MCP agent could contest
+  another's change to a key. `kalairos_batch_store` and
+  `kalairos_extract_facts` used to write as the user, with the user's default
+  trust (0.90 rather than an agent's 0.75).
+- **`importMarkdown()` takes each section's type from its `Type` line**,
+  which keeps its case, instead of lowercasing the `## [id] TYPE` header.
+  Type is part of a key's identity, so `priorAuth:PA-1001` used to come back
+  as `priorauth:PA-1001`.
 
 ### Fixed
 
+- **Importing an `includeHistory` export keeps each entity's text.** The
+  numbered version-history lines were read as part of the text, so
+  `kalairos export --include-history` followed by `kalairos import`, the
+  README's own example, appended every past version to the current one.
+- **`ingestBatch()` keeps each item's `effectiveAt`, `importance`, `who` and
+  `why`.** It dropped them, so a batched fact took effect when it was
+  ingested rather than when it became true, and `POST /ingest/batch` couldn't
+  backdate anything.
+- **`shutdown()` finishes when a query is in flight.** A scoring job's reply
+  that landed while `shutdown()` was stopping the worker pool unref'd that
+  worker, so Node could exit before the worker did: `shutdown()` never
+  returned, and the store and the SQLite index were never closed.
+  `tests/test-cpu.js` covers this, but when it happened the test exited 0
+  partway through, so `npm test` passed with four tests skipped. It now fails
+  when it exits early.
 - **`queryAt` trust is point-in-time.** A replay used to score trust against
   the entity's full version history and its current annotations, so a
   contradiction, correction or annotation recorded after `asOf` changed the

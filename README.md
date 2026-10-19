@@ -575,6 +575,22 @@ await io.ingestFile("./notes.md");
 const trail = await history.trail({ entity: id });
 ```
 
+### MCP and HTTP
+
+```text
+kalairos_remember     { text, type?, key?, fields?, links?, effectiveAt?, workspaceId?, ... }
+kalairos_batch_store  { items: [{ text, type?, key?, fields?, links?, effectiveAt?, ... }] }
+kalairos_describe     { address, asOf?, validAt?, workspaceId? }
+
+POST /ingest, /remember   { text, type?, key?, fields?, links?, ... }
+POST /ingest/batch        { items: [{ text, type?, key?, fields?, links?, ... }] }
+GET  /describe?address=claim:D-101&validAt=2026-05-12&asOf=2026-07-20
+```
+
+`kalairos_remember`, `kalairos_batch_store` and the HTTP write routes take `key`, `fields` and `links` as `remember()` does. `kalairos_describe`, `GET /describe` and the remote client's `describe(address, { asOf?, validAt?, workspaceId? })` return what `describe()` returns, with times in Unix ms or ISO-8601. Unlike `kalairos_recall` and `POST /query`, they take `asOf` and `validAt` together.
+
+Every MCP write is an agent's: `{ type: "agent", actor }`, where the actor is `KALAIROS_MCP_AGENT` or else the host's name from the MCP handshake. So when one agent changes a key another agent set, the write is marked `contested`.
+
 ---
 
 ## Configuration
@@ -596,6 +612,7 @@ const trail = await history.trail({ entity: id });
 | `KALAIROS_PORT`                  | `3000`  | HTTP server port                           |
 | `KALAIROS_HOST`                  | `127.0.0.1` | HTTP server bind address (`0.0.0.0` for remote access) |
 | `KALAIROS_DATA_FILE`             | `./data.kalairos` | Data file for `init()`, the server, the MCP server and the CLI |
+| `KALAIROS_MCP_AGENT`             | the host's name | The agent the MCP server attributes every write to (default: the name the host gives in the MCP handshake, e.g. `claude-code`) |
 | `KALAIROS_MODEL_DIR`             | `~/.kalairos` | Where the neural embedder is downloaded and loaded from |
 | `KALAIROS_INDEX_SQLITE`          | unset   | `1` enables the SQLite index (needs the optional `better-sqlite3`) |
 
@@ -615,7 +632,7 @@ const trail = await history.trail({ entity: id });
 npx kalairos          # starts on 127.0.0.1:3000
 ```
 
-Core endpoints mirror the flat API (`/remember`, `/query`, `/history/:id`, etc.). See `server.js` for the full route list.
+Core endpoints mirror the flat API (`/remember`, `/query`, `/describe`, `/history/:id`, etc.). See `server.js` for the full route list.
 
 The server listens on loopback only. To serve other machines, set `KALAIROS_HOST=0.0.0.0` and turn on auth: create an owner with `POST /auth/principals` (`{ "id": "ops", "name": "Ops", "workspaces": { "default": "owner" } }`, which returns its token once), then `POST /auth/enable`. From then on every route, including the `/auth/*` routes, needs `Authorization: Bearer <token>`. Auth settings live in memory, so repeat this after a restart.
 
@@ -631,6 +648,8 @@ npx kalairos import memory.md                           # ingest back
 ```
 
 Checkpoint it into git, share it across agents, hand-edit it when debugging.
+
+A keyed thing exports with `Key` and `Fields` lines, and an import lands it on the same `type` and `key` with its fields. Links are keyed records of type `link`, so they come back as links that `describe()` reads. Only the current version travels, written at the time of the import, so `asOf` and `validAt` reads of imported things start there. An import writes every section to the one workspace it is given (`workspaceId`, or `default`), so the same key exported from two workspaces lands on one thing.
 
 ---
 

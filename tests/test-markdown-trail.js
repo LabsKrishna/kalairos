@@ -97,6 +97,44 @@ const INIT_OPTS = {
     assert.ok(out.includes("Source:** tool (bot)"), "source actor missing");
   });
 
+  await test("a keyed thing renders Key and Fields lines, read back with its exact type", () => {
+    const now = Date.now();
+    const e = {
+      id: 3, type: "priorAuth", key: "PA-1001/imaging", fields: { units: 2, codes: ["72148"] },
+      text: "Lumbar MRI request.", createdAt: now, updatedAt: now,
+    };
+    const md = entityToMarkdownLines(e).join("\n");
+    assert.ok(md.includes("- **Key:** PA-1001/imaging"), "key line missing");
+    assert.ok(md.includes('- **Fields:** {"units":2,"codes":["72148"]}'), "fields line missing");
+    assert.deepEqual(parseMarkdownFacts(md).facts, [{
+      type: "priorAuth", text: "Lumbar MRI request.", key: "PA-1001/imaging", fields: { units: 2, codes: ["72148"] },
+    }], "the Type line keeps the case the header loses");
+  });
+
+  await test("an unkeyed entity has no Key or Fields line", () => {
+    const now = Date.now();
+    const md = entityToMarkdownLines({ id: 4, type: "fact", text: "plain", createdAt: now, updatedAt: now }).join("\n");
+    assert.ok(!md.includes("**Key:**") && !md.includes("**Fields:**"));
+  });
+
+  await test("parseMarkdownFacts: version history stays out of the text", () => {
+    const now = Date.now();
+    const e = {
+      id: 8, type: "fact", text: "Deploys need two approvals", createdAt: now, updatedAt: now,
+      versions: [ // stored newest-first
+        { timestamp: now,      text: "Deploys need two approvals", delta: { type: "update", summary: "approvals changed" } },
+        { timestamp: now - 10, text: "Deploys need one approval" },
+      ],
+    };
+    const md = entityToMarkdownLines(e, { includeHistory: true }).join("\n");
+    assert.deepEqual(parseMarkdownFacts(md).facts, [{ type: "fact", text: "Deploys need two approvals" }]);
+  });
+
+  await test("parseMarkdownFacts: a Fields line that isn't a JSON object throws, naming the section", () => {
+    assert.throws(() => parseMarkdownFacts("## [5] CLAIM\nbody\n- **Fields:** {billed: 1}"), /\[5\].*not valid JSON/);
+    assert.throws(() => parseMarkdownFacts("## [5] CLAIM\nbody\n- **Fields:** [1, 2]"), /\[5\].*JSON object/);
+  });
+
   console.log("\n── markdown export/import through the public API ────────────────");
   await lib.init(INIT_OPTS);
 
@@ -107,7 +145,7 @@ const INIT_OPTS = {
   const noteId = await lib.ingest("Retro notes live in the shared drive",
     { type: "text", tags: ["docs"], workspaceId: "w2", who: { agent: "agent-2" } });
 
-  let exported;
+  let exported, exportedWithHistory, headTexts;
   await test("exportMarkdown renders every alive entity with metadata", async () => {
     exported = await lib.exportMarkdown();
     assert.ok(exported.startsWith("# Kalairos — Memory Export"));
@@ -119,6 +157,8 @@ const INIT_OPTS = {
   await test("exportMarkdown honors includeHistory and filter", async () => {
     const withHistory = await lib.exportMarkdown({ includeHistory: true });
     assert.ok(withHistory.includes("### Version History"), "versioned fact must render history");
+    exportedWithHistory = withHistory;
+    headTexts = [(await lib.get(factId)).text, (await lib.get(noteId)).text];
     const onlyText = await lib.exportMarkdown({ filter: { type: "text" } });
     assert.ok(!onlyText.includes(`## [${factId}]`), "type filter must exclude facts");
     assert.ok(onlyText.includes(`## [${noteId}]`));
@@ -139,6 +179,14 @@ const INIT_OPTS = {
     assert.ok(back.text.length > 0);
   });
 
+  await test("importMarkdown of an includeHistory export imports each entity's current text", async () => {
+    await lib.shutdown();
+    await lib.init(INIT_OPTS);
+    const { ids } = await lib.importMarkdown(exportedWithHistory);
+    const texts = await Promise.all(ids.map(async id => (await lib.get(id)).text));
+    assert.deepEqual(texts.sort(), [...headTexts].sort(), "history lines leaked into the imported text");
+  });
+
   await test("importMarkdown ingests bullet lists with caller defaults", async () => {
     const { imported, ids } = await lib.importMarkdown("- alpha bullet point memo\n- beta bullet point memo",
       { tags: ["imported"], workspaceId: "w3" });
@@ -150,6 +198,83 @@ const INIT_OPTS = {
 
   await test("importMarkdown of empty text is a no-op", async () => {
     assert.deepEqual(await lib.importMarkdown("   "), { imported: 0, ids: [] });
+  });
+
+  console.log("\n── keys, fields and links through markdown ──────────────────────");
+  await lib.shutdown();
+  await lib.init(INIT_OPTS);
+
+  const LIBRARY = { type: "file", actor: "payer policy library" };
+  const CLAIMS  = { type: "tool", actor: "clearinghouse" };
+  await lib.ingest("Policy IB-114: six weeks of conservative therapy.", {
+    type: "policy", key: "IB-114", fields: { therapyWeeks: 6 }, source: LIBRARY,
+  });
+  await lib.ingest("Policy TG-207: four weeks of therapy.", {
+    type: "policy", key: "TG-207", fields: { therapyWeeks: 4 }, source: LIBRARY,
+  });
+  await lib.ingest("Claim for lumbar microdiscectomy at L5-S1.", {
+    type: "claim", key: "D-101", fields: { dos: "2026-05-12", billed: 14200 },
+    links: [{ rel: "under", to: "policy:IB-114", one: true }], source: CLAIMS,
+  });
+  await lib.ingest("Prior authorization request for the procedure.", {
+    type: "priorAuth", key: "PA-1001", links: [{ rel: "for", to: "claim:D-101" }], source: CLAIMS,
+  });
+  const keyedBefore = await lib.describe("claim:D-101");
+  const keyedMd     = await lib.exportMarkdown();
+
+  // What a reader compares: the thing, and both ends of every link.
+  const shape = (d) => ({
+    type: d.type, key: d.key, text: d.text, fields: d.fields,
+    links:      d.links.map(l => [l.rel, l.to, l.thing?.fields ?? null]),
+    linkedFrom: d.linkedFrom.map(l => [l.rel, l.from, l.thing?.type ?? null]),
+  });
+
+  await test("a link exports as a keyed record holding its ends", () => {
+    assert.ok(keyedMd.includes("- **Key:** D-101"));
+    assert.ok(keyedMd.includes('- **Fields:** {"from":"claim:D-101","rel":"under","to":"policy:IB-114"}'));
+    assert.ok(keyedMd.includes('- **Key:** ["claim:D-101","under"]'), "a one-link's key names its thing and rel");
+  });
+
+  let importedIds;
+  await test("keys, fields and links survive an export and import", async () => {
+    await lib.shutdown();
+    await lib.init(INIT_OPTS);
+    const { imported, ids } = await lib.importMarkdown(keyedMd);
+    importedIds = ids;
+    assert.equal(imported, 6, "four things and two links");
+    assert.deepEqual(shape(await lib.describe("claim:D-101")), shape(keyedBefore));
+    const pa = await lib.describe("priorAuth:PA-1001");
+    assert.ok(pa, "a mixed-case type keeps its case, so its address still resolves");
+    assert.deepEqual(pa.links.map(l => [l.rel, l.to]), [["for", "claim:D-101"]]);
+    const links = (await lib.listEntities({ type: "link", limit: 10 })).entities;
+    assert.ok(links.length === 2 && links.every(l => l.key && l.fields?.from && l.fields?.rel && l.fields?.to),
+      "links come back as keyed link records, not plain text");
+  });
+
+  await test("importing the same file again lands on the same things", async () => {
+    const { ids } = await lib.importMarkdown(keyedMd);
+    assert.deepEqual(ids, importedIds);
+  });
+
+  await test("an imported link is the same link: re-pointing it adds a version", async () => {
+    await lib.ingest("Claim for lumbar microdiscectomy at L5-S1.", {
+      type: "claim", key: "D-101", links: [{ rel: "under", to: "policy:TG-207", one: true }],
+    });
+    const d = await lib.describe("claim:D-101");
+    assert.deepEqual(d.links.map(l => l.to), ["policy:TG-207"]);
+    assert.ok(importedIds.includes(d.links[0].linkId), "the link record is the imported one");
+    assert.equal((await lib.getHistory(d.links[0].linkId)).versionCount, 2);
+  });
+
+  await test("importMarkdown refuses a key, fields or links for the whole file", async () => {
+    await assert.rejects(lib.importMarkdown(keyedMd, { key: "D-101" }), /defaults can't set key/);
+    await assert.rejects(lib.importMarkdown("- a fact", { fields: { billed: 1 } }), /defaults can't set fields/);
+  });
+
+  await test("a Fields line that isn't JSON fails the import before anything is written", async () => {
+    const md = "## [1] CLAIM\n\nGood claim.\n\n- **Key:** D-201\n\n## [2] CLAIM\n\nBad claim.\n\n- **Key:** D-202\n- **Fields:** {billed: 1}\n";
+    await assert.rejects(lib.importMarkdown(md), (e) => e.code === "ERR_VALIDATION" && /\[2\]/.test(e.message));
+    assert.equal(await lib.describe("claim:D-201"), null, "the readable section wasn't written either");
   });
 
   console.log("\n── trail() projection ───────────────────────────────────────────");

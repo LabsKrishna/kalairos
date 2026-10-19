@@ -209,7 +209,7 @@ server.tool(
 // 8. kalairos_batch_store — store many at once
 server.tool(
   "kalairos_batch_store",
-  "Store multiple memories in a single call. Deduplication and version detection apply to each item. Returns array of entity IDs.",
+  "Store multiple memories in a single call. Deduplication and version detection apply to each item, and an item with a key lands on the record holding that key, as in kalairos_remember. Returns array of entity IDs.",
   {
     items: z.array(z.object({
       text:        z.string().describe("Memory content"),
@@ -218,6 +218,10 @@ server.tool(
       metadata:    z.object({}).passthrough().optional(),
       memoryType:  z.enum(["short-term", "long-term", "working"]).optional(),
       workspaceId: z.string().optional(),
+      effectiveAt: z.union([z.number(), z.string()]).optional().describe("Event time this became true (Unix ms or ISO-8601); see kalairos_remember"),
+      key:         z.string().optional().describe("The real identifier of the thing; see kalairos_remember"),
+      fields:      z.object({}).passthrough().optional().describe("Structured facts about the thing; see kalairos_remember"),
+      links:       z.array(linkSchema).optional().describe("Typed links to other things by address. Requires key; see kalairos_remember"),
     })).describe("Array of memories to store"),
   },
   async ({ items }) => {

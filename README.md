@@ -578,15 +578,16 @@ const trail = await history.trail({ entity: id });
 ### MCP and HTTP
 
 ```text
-kalairos_remember  { text, type?, key?, fields?, links?, effectiveAt?, workspaceId?, ... }
-kalairos_describe  { address, asOf?, validAt?, workspaceId? }
+kalairos_remember     { text, type?, key?, fields?, links?, effectiveAt?, workspaceId?, ... }
+kalairos_batch_store  { items: [{ text, type?, key?, fields?, links?, effectiveAt?, ... }] }
+kalairos_describe     { address, asOf?, validAt?, workspaceId? }
 
 POST /ingest, /remember   { text, type?, key?, fields?, links?, ... }
 POST /ingest/batch        { items: [{ text, type?, key?, fields?, links?, ... }] }
 GET  /describe?address=claim:D-101&validAt=2026-05-12&asOf=2026-07-20
 ```
 
-`kalairos_remember` and the HTTP write routes take `key`, `fields` and `links` as `remember()` does. `kalairos_describe`, `GET /describe` and the remote client's `describe(address, { asOf?, validAt?, workspaceId? })` return what `describe()` returns, with times in Unix ms or ISO-8601. Unlike `kalairos_recall` and `POST /query`, they take `asOf` and `validAt` together.
+`kalairos_remember`, `kalairos_batch_store` and the HTTP write routes take `key`, `fields` and `links` as `remember()` does. `kalairos_describe`, `GET /describe` and the remote client's `describe(address, { asOf?, validAt?, workspaceId? })` return what `describe()` returns, with times in Unix ms or ISO-8601. Unlike `kalairos_recall` and `POST /query`, they take `asOf` and `validAt` together.
 
 Every MCP write is an agent's: `{ type: "agent", actor }`, where the actor is `KALAIROS_MCP_AGENT` or else the host's name from the MCP handshake. So when one agent changes a key another agent set, the write is marked `contested`.
 

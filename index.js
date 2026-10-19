@@ -1550,7 +1550,8 @@ async function remember(text, opts = {}) {
 
 /**
  * Ingest multiple items atomically — persists once at the end instead of after each item.
- * @param {Array<{ text: string, type?, metadata?, tags?, timestamp?, source?, classification? }>} items
+ * Each item takes the options ingest() does, effectiveAt and key included.
+ * @param {Array<{ text: string, type?, metadata?, tags?, timestamp?, effectiveAt?, source?, classification?, key?, fields?, links? }>} items
  * @returns {number[]} array of entity IDs in the same order as input
  */
 async function ingestBatch(items, { allowedWorkspaces } = {}) {
@@ -1562,8 +1563,8 @@ async function ingestBatch(items, { allowedWorkspaces } = {}) {
   return _withBatchedIO(async () => {
     const ids = [];
     for (const item of items) {
-      const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, key, fields, links } = item || {};
-      ids.push(await ingest(text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, key, fields, links, allowedWorkspaces }));
+      const { text, type, timestamp, effectiveAt, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, importance, trustScore, who, why, key, fields, links } = item || {};
+      ids.push(await ingest(text, { type, timestamp, effectiveAt, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, importance, trustScore, who, why, key, fields, links, allowedWorkspaces }));
     }
     return ids;
   });

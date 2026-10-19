@@ -47,11 +47,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   corroboration, not a contest, and doesn't take the key over. The poisoning
   benchmark gains a `key-overwrite` attack: defended, 6/6, and compromised
   with the rule switched off.
-- **Keys over MCP.** `kalairos_remember` takes `key`, `fields` and `links`,
-  and the new `kalairos_describe` tool takes an `address` (`"type:key"`)
-  with optional `asOf`, `validAt` (Unix ms or ISO-8601) and `workspaceId`,
-  and returns what `describe()` returns. Unlike `kalairos_recall`, `asOf` and
-  `validAt` combine.
+- **Keys over MCP.** `kalairos_remember` and each `kalairos_batch_store`
+  item take `key`, `fields` and `links` (batch items also take
+  `effectiveAt`). The new `kalairos_describe` tool takes an `address`
+  (`"type:key"`) with optional `asOf`, `validAt` (Unix ms or ISO-8601) and
+  `workspaceId`, and returns what `describe()` returns. Unlike
+  `kalairos_recall`, `asOf` and `validAt` combine.
 - **Keys over HTTP.** The write routes (`POST /ingest`, `/remember`,
   `/ingest/batch` and a scope's `/agent/:id/remember`) take `key`, `fields`
   and `links`. `GET /describe?address=type:key` takes optional `asOf`,
@@ -90,6 +91,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ingestBatch()` keeps each item's `effectiveAt`, `importance`, `who` and
+  `why`.** It dropped them, so a batched fact took effect when it was
+  ingested rather than when it became true, and `POST /ingest/batch` couldn't
+  backdate anything.
 - **`shutdown()` finishes when a query is in flight.** A scoring job's reply
   that landed while `shutdown()` was stopping the worker pool unref'd that
   worker, so Node could exit before the worker did: `shutdown()` never

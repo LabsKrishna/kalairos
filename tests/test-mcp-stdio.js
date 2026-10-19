@@ -186,6 +186,26 @@ function startServer(extraEnv = {}) {
     assert.deepStrictEqual(asHeld.fields, { therapyWeeks: 12 }, "the holder's version stays readable");
     console.log("  [ok] a second agent changing the first agent's key is contested");
 
+    // kalairos_batch_store carries keys, fields, links and event time.
+    const batch = await second.tool("kalairos_batch_store", { items: [
+      { text: "Physical therapy discharge summary: eight weeks completed.", type: "record", key: "D-101/pt",
+        fields: { therapyWeeks: 8 }, effectiveAt: "2026-04-28", links: [{ rel: "supports", to: "claim:D-101" }] },
+      { text: "Lumbar MRI report: nerve root compression at L5-S1.", type: "record", key: "D-101/mri",
+        effectiveAt: "2026-03-30", links: [{ rel: "supports", to: "claim:D-101" }] },
+    ] });
+    assert.strictEqual(batch.count, 2);
+    const onDosNow = await second.tool("kalairos_describe", { address: "claim:D-101", validAt: "2026-05-12T12:00:00Z" });
+    assert.deepStrictEqual(onDosNow.linkedFrom.map(l => l.from).sort(), ["record:D-101/mri", "record:D-101/pt"],
+      "batched links keep their event time, so both records were in force on the date of service");
+    const pt = await second.tool("kalairos_describe", { address: "record:D-101/pt" });
+    assert.deepStrictEqual(pt.fields, { therapyWeeks: 8 });
+    assert.deepStrictEqual(pt.version.source, { type: "agent", actor: "intake-bot" }, "a batch is written as the agent, not the user");
+    const again = await second.tool("kalairos_batch_store", { items: [
+      { text: "PT discharge summary, reworded.", type: "record", key: "D-101/pt", effectiveAt: "2026-04-28" },
+    ] });
+    assert.deepStrictEqual(again.ids, [batch.ids[0]], "a batched key lands on its record");
+    console.log("  [ok] kalairos_batch_store carries keys, fields, links and effectiveAt");
+
     // Let any trailing writes land before checking the channel.
     await new Promise(r => setTimeout(r, 200));
     assert.deepStrictEqual(second.nonProtocol, [], `stdout carried non-protocol output:\n${second.nonProtocol.join("\n")}`);

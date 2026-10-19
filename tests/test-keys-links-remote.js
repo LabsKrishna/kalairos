@@ -159,6 +159,8 @@ async function seed(kal) {
       assert.equal(onDos.validAt, day("2026-05-12"), "a query-string ms value reaches the engine as a number");
       assert.equal(onDos.asOf, day("2026-07-20"));
       assert.ok(!onDos.linkedFrom.some(l => l.from === "record:D-101/op-note"), "the op note arrived after the denial");
+      assert.ok(onDos.linkedFrom.some(l => l.from === "record:D-101/pt"),
+        "the PT summary, sent through /ingest/batch with an earlier effectiveAt, was in force on the date of service");
       // The same instants in ISO-8601.
       const iso = await kal.describe("claim:D-101", { validAt: "2026-05-12T12:00:00Z", asOf: "2026-07-20T12:00:00Z" });
       assert.deepEqual(iso, onDos, "ISO-8601 and ms name the same instants");

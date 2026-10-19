@@ -151,6 +151,22 @@ const INIT_OPTS = {
     assert.strictEqual(h.versions[0].classification, "regulated");
   });
 
+  await test("ingestBatch forwards effectiveAt, importance, who and why", async () => {
+    // The last test's words, in a workspace of their own: a word the mock
+    // embedder hasn't seen would shift the slot of every word after it, and
+    // with it the scores later tests depend on.
+    const effectiveAt = Date.parse("2026-03-01T00:00:00Z");
+    const [id] = await lib.ingestBatch([{
+      text: "batched agent memory", workspaceId: "batch-forwarding", effectiveAt, importance: 0.9,
+      who: { agent: "batcher" }, why: "nightly import",
+    }]);
+    const v = (await lib.getHistory(id)).versions[0];
+    assert.strictEqual(v.effectiveAt, effectiveAt, "a batch item's event time was dropped");
+    assert.deepStrictEqual(v.who, { agent: "batcher" });
+    assert.strictEqual(v.why, "nightly import");
+    assert.strictEqual((await lib.get(id)).importance, 0.9);
+  });
+
   console.log("\n── update vs new entity ─────────────────────────────────────────");
 
   await lib.init(INIT_OPTS); // fresh

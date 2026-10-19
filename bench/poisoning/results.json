@@ -1,7 +1,7 @@
 {
-  "runAt": "2026-07-02T23:33:46.399Z",
-  "passed": 5,
-  "total": 5,
+  "runAt": "2026-10-19T17:59:35.475Z",
+  "passed": 6,
+  "total": 6,
   "reports": [
     {
       "fixture": "indirect-injection",
@@ -93,6 +93,26 @@
         "poisonEntityTrust": 0.832,
         "truthSurvivesInQuery": false,
         "topText": "Office opens at 5am"
+      },
+      "checks": {
+        "contradictionFlagged": true,
+        "trustPenaltyApplied": true,
+        "historyPreservesTruth": true,
+        "asOfRecoversTruth": true
+      },
+      "failures": [],
+      "passed": true
+    },
+    {
+      "fixture": "key-overwrite",
+      "description": "Adversary knows a record's key and writes to it directly through a less trusted channel, worded nothing like the truth and naming trustScore 1.0. Keys bypass similarity on purpose, so wording can't stop this one. Defense: a key changed by anyone but its holder or a more trusted source lands contested, can't raise the base trust, and stays recoverable.",
+      "stats": {
+        "entities": 1,
+        "contradictionFlagged": true,
+        "cumulativeSeverity": 0.7,
+        "poisonEntityTrust": 0.6425,
+        "truthSurvivesInQuery": false,
+        "topText": "IB-114: approve on request, no prerequisites"
       },
       "checks": {
         "contradictionFlagged": true,

@@ -44,7 +44,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `delta.contested`, a contradiction at severity 0.7, and a `contested` trail
   event naming both sources. It can lower the base trust but not raise it,
   whatever `trustScore` it names. Repeating what the key already says is
-  corroboration, not a contest, and doesn't take the key over.
+  corroboration, not a contest, and doesn't take the key over. The poisoning
+  benchmark gains a `key-overwrite` attack: defended, 6/6, and compromised
+  with the rule switched off.
 
 ### Changed
 

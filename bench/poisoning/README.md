@@ -25,6 +25,7 @@ Each fixture exercises the four signals: **contradiction flag**, **trust penalty
 | 3 | **Repetition / sybil** | Adversary writes many copies of the same lie from many different URIs to fake corroboration. | Contradiction fires on the first poison. URI-only variation no longer multiplies voices, so repetition cannot manufacture corroboration. |
 | 4 | **Drip poisoning** | Small numeric drift across many updates, each below the version-merge threshold. | Cumulative severity crosses the kill-switch (−0.6) and trust collapses to 0.1. Detection works. |
 | 5 | **Trust override** | Adversary ingests with `trustScore: 1.0` hoping to claim arbitrary trust. | `trustScore` is clamped on ingest, and the composite query-time trust still applies contradiction penalties. Works. |
+| 6 | **Key overwrite** | Adversary knows a record's key and writes to it directly from a less trusted source, worded nothing like the truth, naming `trustScore: 1.0`. Keys bypass similarity on purpose, so wording can't stop it. | The write lands contested: contradiction flag, trust penalty, base trust not raised, truth recoverable via asOf. With the contest rule switched off this fixture is compromised. |
 
 ## Current defense coverage
 
@@ -37,8 +38,9 @@ From a clean run (deterministic bag-of-words embedder, in-memory store):
 | repetition-attack   | yes | yes (0.73)  | yes | yes | **DEFENDED** |
 | drip-poison         | yes | yes (0.10, killed) | yes | yes | **DEFENDED** |
 | trust-override      | yes | yes (0.83)  | yes | yes | **DEFENDED** |
+| key-overwrite       | yes | yes (0.64)  | yes | yes | **DEFENDED** |
 
-**5 / 5 defended.** All five fire the contradiction flag, keep history intact, recover the truth via time-travel, and apply a measurable trust penalty to the poisoned entity.
+**6 / 6 defended.** All six fire the contradiction flag, keep history intact, recover the truth via time-travel, and apply a measurable trust penalty to the poisoned entity.
 
 ## Defense internals
 

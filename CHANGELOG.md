@@ -18,6 +18,33 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   run on current state proves the leakage metric can see a leak.
   `node bench/prior-auth/case.js` narrates the reference case. See
   `bench/prior-auth/README.md`.
+- **Keys, fields and links.** `ingest()` and `remember()` take `key`,
+  `fields` and `links`. A keyed write's identity is its workspace, `type` and
+  `key`: it lands on that record however it is worded, never merges with
+  another key, and neither unkeyed writes nor `consolidate()` land on it.
+  `key` with `forceNew` is refused.
+  `fields` holds structured facts beside the text. They version with it,
+  carry forward when a write leaves them out, and a keyed write compares them
+  exactly, recording `delta.fields` as `{ name: { from, to } }`. A field
+  change from the key's holder is a revision when it takes effect later and a
+  correction when it restates the same moment; neither is a contradiction.
+  `links: [{ rel, to, one? }]` points a keyed thing at another by address
+  (`"type:key"`). Each link is its own keyed record of type `link`, with
+  versions, provenance and trust, written in the same flush as the thing;
+  `one: true` keys it on the thing and `rel`, so pointing it elsewhere
+  versions the same link. Link records stay out of search. Query results,
+  `get()`, `getMany()` and `listEntities()` include `key` and `fields` (null
+  when absent), and `getHistory()` versions include `fields`.
+- **`describe(address, { asOf, validAt })`** returns one keyed thing and what
+  it links to and from, read on both clocks at once: what was true at
+  `validAt`, as known at `asOf`. Links resolve on the same clocks, so a link
+  never pins a version. Also on `scope()`, which reads its own workspace.
+- **Contested writes.** A change to a key from any source other than the one
+  that last set it uncontested, or a source type trusted more, lands with
+  `delta.contested`, a contradiction at severity 0.7, and a `contested` trail
+  event naming both sources. It can lower the base trust but not raise it,
+  whatever `trustScore` it names. Repeating what the key already says is
+  corroboration, not a contest, and doesn't take the key over.
 
 ### Fixed
 

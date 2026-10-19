@@ -167,6 +167,31 @@ flowchart LR
 
 Versions are **linear per entity** — each new version supersedes the previous; there is no branching. The "fork" effect happens *across* entities: when a `remember()` falls below the similarity threshold, it creates a new entity instead of a new version. Linearity is what keeps `queryAt(t)` well-defined: there is always one unambiguous answer to *"what did we believe about entity X at time T."*
 
+### Things with keys
+
+When a record has a real identifier (a claim number, a policy number), pass it as `key`. A keyed write lands on the thing with that `type` and `key` in its workspace however it is worded, and two keys never merge. `fields` holds the facts code reads off it, versioned with the text and compared exactly. `links` points it at other things by address (`"type:key"`), and each link is a fact with its own history. `describe(address, { validAt, asOf })` returns the thing and what it links to, read on both clocks: what was true at `validAt`, as known at `asOf`. A change to a key by anyone except the source that last set it, or a more trusted one, is marked `contested`: it lands flagged and with lower trust, and the earlier version stays readable with `asOf`.
+
+```js
+const library = { type: 'file', actor: 'payer policy library' };
+await kalairos.ingest('Policy IB-114: 6 weeks of therapy before surgery', {
+  type: 'policy', key: 'IB-114', fields: { therapyWeeks: 6 }, effectiveAt: '2026-01-01', source: library,
+});
+await kalairos.ingest('Policy IB-114: 12 weeks of therapy before surgery', {
+  type: 'policy', key: 'IB-114', fields: { therapyWeeks: 12 }, effectiveAt: '2026-06-01', source: library,
+});
+await kalairos.ingest('Claim for lumbar microdiscectomy, L5-S1', {
+  type: 'claim', key: 'D-101', fields: { billed: 14200 }, effectiveAt: '2026-05-12',
+  links: [{ rel: 'under', to: 'policy:IB-114', one: true }],
+  source: { type: 'tool', actor: 'clearinghouse' },
+});
+
+// The policy in force on the date of service, and on the day it was denied
+const onDos    = await kalairos.describe('claim:D-101', { validAt: '2026-05-12' });
+const atDenial = await kalairos.describe('claim:D-101', { validAt: '2026-07-20' });
+console.log(onDos.links[0].thing.fields);     // → { therapyWeeks: 6 }
+console.log(atDenial.links[0].thing.fields);  // → { therapyWeeks: 12 }
+```
+
 ---
 
 ## Every change leaves a breadcrumb. Important moments become checkpoints.
@@ -461,7 +486,7 @@ await kalairos.ingestFile(filePath, opts?)
 await kalairos.ingestTimeSeries(label, points, opts?)
 ```
 
-Options: `{ type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, importance, forceNew }`.
+Options: `{ type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, importance, forceNew, key, fields, links }`.
 
 ### Read
 
@@ -469,6 +494,7 @@ Options: `{ type, timestamp, metadata, tags, source, classification, retention, 
 await kalairos.query(text, { limit?, maxTokens?, filter? })
 await kalairos.queryAt(text, timestamp, { limit?, maxTokens?, filter? })
 await kalairos.queryRange(text, since, until, { limit?, maxTokens?, filter? })
+await kalairos.describe(address, { asOf?, validAt?, workspaceId? })
 await kalairos.get(id)
 await kalairos.getMany(ids)
 await kalairos.getHistory(id)

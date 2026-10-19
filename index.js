@@ -279,6 +279,124 @@ function _normalizeSource(input) {
   return out;
 }
 
+// ─── Keys, fields and links ──────────────────────────────────────────────────
+//
+// A key names one real thing within its type, the way a claim number or a
+// policy number does. A keyed write's identity is (workspace, type, key):
+// similarity is never consulted, so a reworded revision still lands on its
+// record and two records that merely read alike never merge. An address,
+// "type:key", is how one thing points at another.
+//
+// Fields are the facts code reads off a thing (a date of service, a billed
+// amount), kept beside the text instead of parsed back out of it. They
+// version with the text, and a keyed write compares them exactly.
+//
+// A link is a keyed record of type "link" whose fields are { from, rel, to },
+// so it has versions, provenance and trust like any other fact. It points at
+// an address, not a version: which version applies is read at query time, on
+// the reader's clocks. Its vector is empty, so it never matches a search.
+
+const LINK_TYPE = "link";
+
+// A contested write weighs as much as a numeric flip: enough to record a
+// `contested` trail event and dent trust, without treating it as proven false.
+const CONTEST_SEVERITY = 0.7;
+
+function _normalizeKey(input) {
+  if (input == null) return null;
+  const key = String(input).trim();
+  if (!key) throw emitError(Err.validation("key must be a non-empty string"));
+  return key;
+}
+
+function _parseAddress(address) {
+  const s = String(address ?? "").trim();
+  const i = s.indexOf(":");
+  if (i <= 0 || i === s.length - 1) {
+    throw emitError(Err.validation(`"${s}" is not an address; use "type:key", e.g. "claim:D-101"`));
+  }
+  return { type: s.slice(0, i), key: s.slice(i + 1) };
+}
+
+function _normalizeFields(input) {
+  if (input == null) return null;
+  if (typeof input !== "object" || Array.isArray(input)) {
+    throw emitError(Err.validation("fields must be a plain object"));
+  }
+  return JSON.parse(JSON.stringify(input));
+}
+
+// JSON with sorted keys, so two values compare equal however their keys were
+// ordered.
+function _stableJSON(v) {
+  if (Array.isArray(v)) return `[${v.map(_stableJSON).join(",")}]`;
+  if (v && typeof v === "object") {
+    return `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${_stableJSON(v[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(v ?? null);
+}
+
+// The fields that differ between two versions, as { name: { from, to } }.
+function _fieldChanges(from, to) {
+  const out = {};
+  for (const name of new Set([...Object.keys(from || {}), ...Object.keys(to || {})])) {
+    const a = from?.[name] ?? null, b = to?.[name] ?? null;
+    if (_stableJSON(a) !== _stableJSON(b)) out[name] = { from: a, to: b };
+  }
+  return out;
+}
+
+// links: [{ rel, to, one? }]. With `one: true` the thing has at most one link
+// of this rel at a time ("a claim is under one policy"), so the link is keyed
+// on (from, rel) and pointing it elsewhere is a new version of that link.
+// Otherwise it is keyed on all three, and many can coexist.
+function _normalizeLinks(input) {
+  if (input == null) return [];
+  if (!Array.isArray(input)) throw emitError(Err.validation("links must be an array of { rel, to }"));
+  return input.map(l => {
+    const rel = String(l?.rel ?? "").trim();
+    if (!rel) throw emitError(Err.validation("every link needs a rel"));
+    const { type, key } = _parseAddress(l.to);
+    return { rel, to: `${type}:${key}`, one: l.one === true };
+  });
+}
+
+// The entity holding (workspace, type, key): the live one, or with `asOf` the
+// one that existed at that ingest time.
+function _findKeyed(ws, type, key, asOf = null) {
+  for (const e of store.values()) {
+    if (e.key !== key || e.type !== type || _wsOf(e) !== ws) continue;
+    if (asOf == null ? _isAlive(e) : e.createdAt <= asOf && (e.deletedAt == null || e.deletedAt > asOf)) return e;
+  }
+  return null;
+}
+
+// Whose word a key rests on: whoever last changed it without being contested.
+// Repeating what a thing already says vouches for it but doesn't take it
+// over; otherwise an outsider could repeat a fact first and then change it
+// unchallenged.
+function _keyHolder(entity) {
+  const versions = entity.versions || []; // newest first
+  for (let i = 0; i < versions.length; i++) {
+    const v = versions[i], prior = versions[i + 1];
+    if (v.delta?.contested) continue;
+    if (!prior || v.text !== prior.text || _stableJSON(v.fields ?? null) !== _stableJSON(prior.fields ?? null)) return v.source;
+  }
+  return entity.source || { type: "user" };
+}
+
+// Why a change to an existing key is contested, or null when it isn't. Only
+// the holder, or a source trusted more than the holder, changes a key
+// quietly. Compared on source-type defaults, never a caller-supplied
+// trustScore, so a write can't talk its way past the rule.
+function _contestReason(entity, src) {
+  const holder = _keyHolder(entity);
+  if (holder.type === src.type && (holder.actor || null) === (src.actor || null)) return null;
+  if (_defaultTrustScore(src.type) > _defaultTrustScore(holder.type)) return null;
+  const name = (s) => (s.actor ? `${s.type}:${s.actor}` : s.type);
+  return `${name(src)} changed a key held by ${name(holder)}`;
+}
+
 // Returns true if the entity has NOT been soft-deleted.
 function _isAlive(entity) { return !entity.deletedAt; }
 
@@ -346,6 +464,7 @@ function _buildVersionRecord({
   previousVersionId,
   contentRisk,
   diff,
+  fields,
 }) {
   const ordinal     = (entity.versions?.length || 0) + 1;
   const versionId   = _makeVersionId(entity.id, ordinal);
@@ -376,6 +495,8 @@ function _buildVersionRecord({
     // — the shape annotate() records on its trail event. `delta` describes
     // the text; this describes the rest. Omitted when nothing else changed.
     ...(diff ? { diff } : {}),
+    // The thing's fields as of this version. Omitted when it has none.
+    ...(fields ? { fields } : {}),
   };
 }
 
@@ -398,7 +519,9 @@ function _serializeEntity(e, { truncateText } = {}) {
   return {
     id:             e.id,
     type:           e.type || "text",
+    key:            e.key ?? null,
     text,
+    fields:         e.fields ?? null,
     source:         e.source || { type: "user" },
     classification: e.classification || "internal",
     retention:      e.retention || { policy: "keep", expiresAt: null },
@@ -962,10 +1085,15 @@ function _relinkEntity(entity) {
   }
   entity.links.clear();
 
+  // Typed links are records, not neighbours by meaning: they take no
+  // similarity edges and give none.
+  if (entity.type === LINK_TYPE) return;
+
   const ws = _wsOf(entity);
   for (const [otherId, other] of store) {
     if (otherId === entity.id) continue;
     if (_wsOf(other) !== ws) continue;
+    if (other.type === LINK_TYPE) continue;
     if (cosine(entity.vector, other.vector) >= CFG.linkThreshold) {
       entity.links.add(otherId);
       other.links.add(entity.id);
@@ -1005,17 +1133,54 @@ function _pruneCrossWorkspaceLinks() {
  * Ingest text. Auto-detects whether this is an update to an existing entity
  * or a brand-new entity based on semantic similarity.
  *
+ * With `key`, identity is (workspace, type, key) instead: the write lands on
+ * the thing holding that key however it is worded. `fields` holds its facts,
+ * and `links: [{ rel, to: "type:key", one? }]` points it at other things.
+ * See "Keys, fields and links" above.
+ *
  * Provenance: every entity and every version records a `source` field describing
  * where the content came from — user input, an agent, a tool, a file, or the
  * system itself. Defaults to { type: "user" }. This is the foundation for audit
  * logs, deletion workflows, and trust signals.
  *
  * @param {string} text
- * @param {{ type?, timestamp?, metadata?, tags?, source?, classification? }} opts
+ * @param {{ type?, timestamp?, metadata?, tags?, source?, classification?, key?, fields?, links? }} opts
  * @returns {number} stable entity ID (never changes across updates)
  */
-async function ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false, who, why, effectiveAt } = {}) {
+async function ingest(text, opts = {}) {
+  let { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false, who, why, effectiveAt, key, fields, links } = opts;
   _assertInit();
+
+  const keyNorm   = _normalizeKey(key);
+  const fieldsIn  = _normalizeFields(fields);
+  const linkSpecs = _normalizeLinks(links);
+  if (keyNorm != null && forceNew) {
+    throw emitError(Err.validation("key and forceNew can't be combined: a key names one thing, and forceNew always makes another"));
+  }
+  if (linkSpecs.length && keyNorm == null) {
+    throw emitError(Err.validation("links need a key on the thing they start from"));
+  }
+
+  // A thing and the links it declares land together: one flush after the
+  // last write. Each link is ingested as its own keyed record, so identity,
+  // versioning and the contest rule treat it like any other fact.
+  if (linkSpecs.length) {
+    const at = timestamp || Date.now();
+    return _withBatchedIO(async () => {
+      const id   = await ingest(text, { ...opts, timestamp: at, links: undefined });
+      const from = `${type}:${keyNorm}`;
+      for (const l of linkSpecs) {
+        await ingest(`${from} ${l.rel} ${l.to}`, {
+          type:   LINK_TYPE,
+          key:    JSON.stringify(l.one ? [from, l.rel] : [from, l.rel, l.to]),
+          fields: { from, rel: l.rel, to: l.to },
+          source, classification, workspaceId, allowedWorkspaces, who, why, effectiveAt,
+          timestamp: at,
+        });
+      }
+      return id;
+    });
+  }
 
   const ts       = timestamp || Date.now();
   const rawText  = String(text || "");
@@ -1023,7 +1188,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     throw emitError(Err.textTooLong(rawText.length, CFG.maxTextLen));
   }
   const safeText = rawText;
-  const vector   = await _embed(safeText, false, type);
+  const vector   = type === LINK_TYPE ? _emptyEmbedding() : await _embed(safeText, false, type);
   const src      = _normalizeSource(source);
   const cls      = _normalizeClassification(classification);
   const ret      = _normalizeRetention(retention);
@@ -1055,7 +1220,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
   // Deliberately in Phase 1, outside the write lock: this can be a network
   // call, and holding the lock across it would serialise every concurrent
   // ingest behind one detector round-trip.
-  const riskVerdict = await _assessContentRisk(safeText, type);
+  const riskVerdict = type === LINK_TYPE ? null : await _assessContentRisk(safeText, type);
   if (riskVerdict?.flagged) {
     console.error(`[kalairos] ⚠ content-risk ${riskVerdict.score.toFixed(2)} (${riskVerdict.detector}) — trust will be reduced`);
   }
@@ -1072,13 +1237,18 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     // different tenant is a different fact, and merging across that boundary
     // would silently overwrite another tenant's memory.
     // forceNew=true bypasses this scan entirely — guarantees a new entity row.
+    // A keyed write skips it too: its key is its identity. And a keyed thing
+    // changes only through its key, so the scan never lands on one.
     let bestMatch = null, bestSim = 0;
     let consolidateMatch = null, consolidateSim = 0;
-    if (!forceNew) {
+    if (keyNorm != null) {
+      bestMatch = _findKeyed(ws, type, keyNorm);
+    } else if (!forceNew) {
       for (const entity of store.values()) {
         if (!_isAlive(entity)) continue;
         if (entity.type !== type) continue;
         if (_wsOf(entity) !== ws) continue;
+        if (entity.key != null) continue;
         const sim = cosine(vector, entity.vector);
         if (sim >= CFG.versionThreshold && sim > bestSim) {
           bestSim   = sim;
@@ -1098,7 +1268,8 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     // ── Update / Consolidation path: merge into existing entity ─────────────
     if (mergeTarget) {
       const latest = mergeTarget.versions[0];
-      const sameContent = latest && latest.text === safeText;
+      const sameFields  = !fieldsIn || _stableJSON(fieldsIn) === _stableJSON(mergeTarget.fields ?? null);
+      const sameContent = latest && latest.text === safeText && sameFields;
       const sameSource  = latest && (latest.source?.type === src.type)
                                   && ((latest.source?.actor || null) === (src.actor || null))
                                   && ((latest.source?.uri   || null) === (src.uri   || null));
@@ -1146,8 +1317,34 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       const isSeriesType       = type === "metric" || type === "series";
       const seriesSupersession = isSeriesType && newEffectiveAt > priorEffectiveAt;
 
-      const delta = buildDelta(mergeTarget.text, mergeTarget.vector, safeText, vector, { seriesSupersession });
+      // A keyed write that carries fields is judged on them, exactly, and on
+      // who wrote it, not on how its words differ. From the key's holder or a
+      // more trusted source, a field change is a correction when it restates
+      // the head's moment and otherwise an update (a revision when it takes
+      // effect later, history when earlier); none is a contradiction. From
+      // anyone else, any change is contested. Without fields, the text
+      // heuristics still judge the holder's own changes.
+      const keyed         = keyNorm != null;
+      const changes       = keyed && fieldsIn ? _fieldChanges(mergeTarget.fields, fieldsIn) : null;
+      const contestReason = keyed && !sameContent ? _contestReason(mergeTarget, src) : null;
+
+      const delta = buildDelta(mergeTarget.text, mergeTarget.vector, safeText, vector, { seriesSupersession: seriesSupersession || !!changes });
       if (isConsolidation) delta.type = "consolidation";
+      if (changes) {
+        const names = Object.keys(changes);
+        delta.fields     = changes;
+        delta.supersedes = names.length > 0 && newEffectiveAt > priorEffectiveAt;
+        if (names.length) {
+          delta.type    = newEffectiveAt === priorEffectiveAt ? "correction" : "update";
+          delta.summary = names.map(n => `${n}: ${_stableJSON(changes[n].from)} → ${_stableJSON(changes[n].to)}`).join("; ");
+        }
+      }
+      if (contestReason) {
+        delta.contested             = true;
+        delta.contestReason         = contestReason;
+        delta.contradicts           = true;
+        delta.contradictionSeverity = Math.max(delta.contradictionSeverity, CONTEST_SEVERITY);
+      }
 
       // Action selection: correction → corrected, anything else → superseded.
       const action = delta.type === "correction" ? ACTIONS.corrected : ACTIONS.superseded;
@@ -1161,9 +1358,14 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
 
       // Update trust score when explicitly provided; otherwise preserve existing.
       // Settled before the version is built so the version records the change.
-      const nextTrust = Number.isFinite(trustScore) ? Math.max(0, Math.min(1, trustScore))
-                      : Number.isFinite(mergeTarget.trustScore) ? mergeTarget.trustScore
-                      : _defaultTrustScore(src.type);
+      // A contested write may lower the base but never raise it, or naming a
+      // high trustScore would buy back what the contest takes away.
+      const askedTrust = Number.isFinite(trustScore) ? Math.max(0, Math.min(1, trustScore))
+                       : Number.isFinite(mergeTarget.trustScore) ? mergeTarget.trustScore
+                       : _defaultTrustScore(src.type);
+      const nextTrust  = contestReason && Number.isFinite(mergeTarget.trustScore)
+                       ? Math.min(askedTrust, mergeTarget.trustScore)
+                       : askedTrust;
 
       const versionRecord = _buildVersionRecord({
         entity:            mergeTarget,
@@ -1181,6 +1383,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
         previousVersionId: latest?.versionId || null,
         contentRisk:       riskVerdict,
         diff:              _trustDiff(mergeTarget.trustScore, nextTrust),
+        fields:            fieldsIn ?? mergeTarget.fields ?? null,
       });
       mergeTarget.versions.unshift(versionRecord);
 
@@ -1195,7 +1398,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
           versionId:         versionRecord.versionId + ":contested",
           action:            ACTIONS.contested,
           who:               whoNorm,
-          why:               whyText || delta.summary || null,
+          why:               delta.contestReason || whyText || delta.summary || null,
           effectiveAt:       newEffectiveAt,
           ingestAt:          ts,
           previousVersionId: latest?.versionId || null,
@@ -1220,6 +1423,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       mergeTarget.memoryType  = memoryType ? mt : mergeTarget.memoryType || _normalizeMemoryType();
       mergeTarget.workspaceId = ws; // the candidate scan guarantees this already matches
       mergeTarget.metadata  = { ...mergeTarget.metadata, ...metadata };
+      if (fieldsIn) mergeTarget.fields = fieldsIn;
       if (llmEnrichment) mergeTarget.metadata.llm = llmEnrichment;
       mergeTarget.tags      = Array.from(new Set([...(mergeTarget.tags || []), ...tags]));
       if (llmEnrichment) mergeTarget.llmKeywords = llmEnrichment.keywords;
@@ -1249,7 +1453,10 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
     const initialVersionId   = _makeVersionId(id, 1);
     const entity = {
       id, type,
+      // Present only on keyed things, so unkeyed rows are stored as before.
+      ...(keyNorm != null ? { key: keyNorm } : {}),
       text:      safeText,
+      ...(fieldsIn ? { fields: fieldsIn } : {}),
       vector,
       source:    src,
       classification: cls,
@@ -1289,6 +1496,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
         who:               whoNorm,
         why:               whyText,
         ...(riskVerdict ? { contentRisk: riskVerdict } : {}),
+        ...(fieldsIn ? { fields: fieldsIn } : {}),
       }],
       trailEvents: [],
     };
@@ -1354,8 +1562,8 @@ async function ingestBatch(items, { allowedWorkspaces } = {}) {
   return _withBatchedIO(async () => {
     const ids = [];
     for (const item of items) {
-      const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore } = item || {};
-      ids.push(await ingest(text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, allowedWorkspaces }));
+      const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, key, fields, links } = item || {};
+      ids.push(await ingest(text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, key, fields, links, allowedWorkspaces }));
     }
     return ids;
   });
@@ -1802,6 +2010,10 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
 
   let subset = _getAllAlive();
 
+  // Link records are structure, not content: they surface through describe(),
+  // not search, unless a filter asks for them by type.
+  if (merged.type !== LINK_TYPE) subset = subset.filter(e => e.type !== LINK_TYPE);
+
   // Workspace isolation: only return entities from allowed workspaces
   if (allowedWorkspaces) {
     subset = subset.filter(e => _wsAllowed(e, allowedWorkspaces));
@@ -1819,7 +2031,9 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
       return {
         id:        e.id,
         type:      e.type,
+        key:       e.key ?? null,
         text:      v.text,
+        fields:    v.fields ?? null,
         vector:    v.vector,
         updatedAt: v.timestamp,
         tags:      e.tags || [],
@@ -1846,7 +2060,9 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
       return {
         id:        e.id,
         type:      e.type,
+        key:       e.key ?? null,
         text:      v.text,
+        fields:    v.fields ?? null,
         vector:    v.vector,
         updatedAt: v.effectiveAt ?? v.timestamp,
         tags:      e.tags || [],
@@ -1894,7 +2110,9 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
       return {
         id:        e.id,
         type:      e.type,
+        key:       e.key ?? null,
         text:      scoreVersion.text,
+        fields:    scoreVersion.fields ?? null,
         vector:    scoreVersion.vector,
         updatedAt: scoreVersion.timestamp,
         tags:      e.tags || [],
@@ -1936,6 +2154,8 @@ async function _queryInternal(text, { limit = 10, maxTokens = null, filter = {},
       const breakdown = trustBreakdowns.get(r.id) || null;
       return {
         ...r,
+        key:            entity?.key ?? null,
+        fields:         entity?.fields ?? null,
         source:         entity?.source || { type: "user" },
         classification: entity?.classification || "internal",
         retention:      entity?.retention || { policy: "keep", expiresAt: null },
@@ -2187,7 +2407,8 @@ async function consolidate({ threshold, dryRun = false, type, allowedWorkspaces 
   // scan and the mutation loop must see a consistent store snapshot.
   return _withWriteLock(() => {
     const thresh = Number.isFinite(threshold) ? threshold : CFG.consolidationThreshold;
-    let alive  = _getAllAlive().filter(e => !type || e.type === type);
+    // Keyed things merge only by key, never by resemblance.
+    let alive  = _getAllAlive().filter(e => (!type || e.type === type) && e.key == null);
     if (allowedWorkspaces) alive = alive.filter(e => _wsAllowed(e, allowedWorkspaces));
 
     // Build clusters: union-find by similarity
@@ -2420,8 +2641,107 @@ async function getHistory(id, { allowedWorkspaces } = {}) {
       linkIds:           v.linkIds || [],
       contentRisk:       v.contentRisk || null,
       ...(v.diff ? { diff: v.diff } : {}),
+      ...(v.fields ? { fields: v.fields } : {}),
     })),
     trailEvents: [...(e.trailEvents || [])].reverse(), // oldest-first for readability
+  };
+}
+
+// ─── Describe ─────────────────────────────────────────────────────────────────
+
+/**
+ * Everything the store holds about one keyed thing, read on both clocks.
+ *
+ * `asOf` (ingest time) limits what had been recorded by then; `validAt`
+ * (event time) picks what was true at that instant. Together they answer
+ * "what was true at validAt, as known at asOf", the question an appeal or an
+ * audit turns on. Either alone reads like queryAt / queryValidAt. Links
+ * resolve on the same clocks, the link and the thing at its other end alike,
+ * so a link names a thing and never a frozen version of it. One hop: the
+ * things at the far ends come back without their own links.
+ *
+ * @param {string} address — "type:key", e.g. "claim:D-101"
+ * @param {{ asOf?, validAt?, workspaceId?, allowedWorkspaces? }} [opts]
+ *   asOf and validAt take Unix ms or ISO-8601.
+ * @returns {object|null} null when the thing was not yet recorded at asOf, or
+ *   not yet true at validAt
+ */
+async function describe(address, { asOf, validAt, workspaceId, allowedWorkspaces } = {}) {
+  _assertInit();
+  const { type, key } = _parseAddress(address);
+  const ws = _normalizeWorkspaceId(workspaceId);
+  if (!_wsAllowed({ workspaceId: ws }, allowedWorkspaces)) {
+    throw emitError(Err.forbidden(`No access to workspace "${ws}".`));
+  }
+  const clocks = {
+    asOf:    _normalizeTimestampInput(asOf, "asOf"),
+    validAt: _normalizeTimestampInput(validAt, "validAt"),
+  };
+
+  const thing = _readThing(ws, `${type}:${key}`, clocks);
+  if (!thing) return null;
+
+  const links = [], linkedFrom = [];
+  for (const e of store.values()) {
+    if (e.type !== LINK_TYPE || _wsOf(e) !== ws) continue;
+    const v = _versionOn(e, clocks);
+    const f = v?.fields;
+    if (!f) continue;
+    const via = { linkId: e.id, source: v.source || e.source, contested: !!v.delta?.contested };
+    if (f.from === thing.address) {
+      links.push({ rel: f.rel, to: f.to, thing: _readThing(ws, f.to, clocks), ...via });
+    } else if (f.to === thing.address) {
+      linkedFrom.push({ rel: f.rel, from: f.from, thing: _readThing(ws, f.from, clocks), ...via });
+    }
+  }
+  return { ...thing, links, linkedFrom, asOf: clocks.asOf, validAt: clocks.validAt };
+}
+
+// The version of `e` on the given clocks, or null if it was not yet recorded
+// at asOf, was forgotten by then, or was not yet true at validAt.
+function _versionOn(e, { asOf, validAt }) {
+  const existed = asOf == null
+    ? e.deletedAt == null
+    : e.createdAt <= asOf && (e.deletedAt == null || e.deletedAt > asOf);
+  if (!existed) return null;
+  const known = asOf == null ? e.versions : e.versions.filter(v => (v.ingestAt ?? v.timestamp) <= asOf);
+  if (!known.length) return null;
+  return validAt == null ? known[0] : _versionValidAt(known, validAt);
+}
+
+// One keyed thing as describe() reports it, or null.
+function _readThing(ws, address, clocks) {
+  const { type, key } = _parseAddress(address);
+  const e = _findKeyed(ws, type, key, clocks.asOf);
+  const v = e && _versionOn(e, clocks);
+  if (!v) return null;
+  const known = clocks.asOf == null ? e.versions : e.versions.filter(x => (x.ingestAt ?? x.timestamp) <= clocks.asOf);
+  const first = known[known.length - 1];
+  const { trust } = computeTrustSignals(clocks.asOf == null ? e : _trustInputsAt(e, clocks.asOf), {
+    now:               clocks.asOf ?? Date.now(),
+    recencyHalfLifeMs: CFG.recencyHalfLifeMs,
+  });
+  return {
+    address,
+    id:          e.id,
+    type:        e.type,
+    key:         e.key,
+    workspaceId: _wsOf(e),
+    text:        v.text,
+    fields:      v.fields ?? null,
+    version: {
+      versionId:   v.versionId,
+      ingestAt:    v.ingestAt ?? v.timestamp,
+      effectiveAt: v.effectiveAt ?? v.timestamp,
+      action:      v.action || null,
+      source:      v.source || e.source,
+      who:         v.who ?? null,
+      why:         v.why ?? null,
+    },
+    // When the store first learned of this thing.
+    knownSince:  first.ingestAt ?? first.timestamp,
+    contested:   !!v.delta?.contested,
+    trust,
   };
 }
 
@@ -2755,7 +3075,8 @@ async function getStartupSummary({
   const itemCap = maxItems || depthLimits[depth] || depthLimits.standard;
   const safeMaxTokens = Math.max(1, Math.floor(Number(maxTokens) || 500));
 
-  let candidates = _getAllAlive();
+  // Link records are structure, not memories to brief an agent on.
+  let candidates = _getAllAlive().filter(e => e.type !== LINK_TYPE || filter.type === LINK_TYPE);
   if (allowedWorkspaces) candidates = candidates.filter(e => _wsAllowed(e, allowedWorkspaces));
   if (Object.keys(filter).length) candidates = _applyFilter(candidates, filter);
 
@@ -3160,6 +3481,7 @@ module.exports = {
   queryAt,
   queryValidAt,
   queryRange,
+  describe,
   get,
   getMany,
   remove,

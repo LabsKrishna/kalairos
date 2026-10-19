@@ -142,6 +142,15 @@ async function seedClaim() {
     assert.equal(await lib.describe("claim:D-101"), null, "the default workspace has no D-101");
   });
 
+  await test("describe refuses a workspace the caller can't read", async () => {
+    await assert.rejects(
+      lib.describe("claim:D-101", { workspaceId: "north", allowedWorkspaces: ["south"] }),
+      /No access to workspace "north"/,
+    );
+    const d = await lib.describe("claim:D-101", { workspaceId: "north", allowedWorkspaces: ["north"] });
+    assert.equal(d.workspaceId, "north");
+  });
+
   console.log("\n── fields: exact facts, versioned with the text ─────────────────");
 
   await test("a later change by the holder is a revision, not a contradiction", async () => {
@@ -341,6 +350,8 @@ async function seedClaim() {
 
   await test("bad input is refused before anything is written", async () => {
     await assert.rejects(lib.ingest("x", { links: [{ rel: "under", to: "policy:IB-114" }] }), /key/);
+    await assert.rejects(lib.ingest("x", { key: "k", links: { rel: "under", to: "policy:IB-114" } }), /links must be an array/);
+    await assert.rejects(lib.ingest("x", { key: "   " }), /key must be a non-empty string/);
     await assert.rejects(lib.ingest("x", { key: "k", links: [{ rel: "under", to: "IB-114" }] }), /address/);
     await assert.rejects(lib.ingest("x", { key: "k", links: [{ to: "policy:IB-114" }] }), /rel/);
     await assert.rejects(lib.ingest("x", { key: "k", fields: ["not", "an", "object"] }), /fields/);

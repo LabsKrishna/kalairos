@@ -117,6 +117,19 @@ const INIT_OPTS = {
     assert.ok(!md.includes("**Key:**") && !md.includes("**Fields:**"));
   });
 
+  await test("parseMarkdownFacts: version history stays out of the text", () => {
+    const now = Date.now();
+    const e = {
+      id: 8, type: "fact", text: "Deploys need two approvals", createdAt: now, updatedAt: now,
+      versions: [ // stored newest-first
+        { timestamp: now,      text: "Deploys need two approvals", delta: { type: "update", summary: "approvals changed" } },
+        { timestamp: now - 10, text: "Deploys need one approval" },
+      ],
+    };
+    const md = entityToMarkdownLines(e, { includeHistory: true }).join("\n");
+    assert.deepEqual(parseMarkdownFacts(md).facts, [{ type: "fact", text: "Deploys need two approvals" }]);
+  });
+
   await test("parseMarkdownFacts: a Fields line that isn't a JSON object throws, naming the section", () => {
     assert.throws(() => parseMarkdownFacts("## [5] CLAIM\nbody\n- **Fields:** {billed: 1}"), /\[5\].*not valid JSON/);
     assert.throws(() => parseMarkdownFacts("## [5] CLAIM\nbody\n- **Fields:** [1, 2]"), /\[5\].*JSON object/);
@@ -132,7 +145,7 @@ const INIT_OPTS = {
   const noteId = await lib.ingest("Retro notes live in the shared drive",
     { type: "text", tags: ["docs"], workspaceId: "w2", who: { agent: "agent-2" } });
 
-  let exported;
+  let exported, exportedWithHistory, headTexts;
   await test("exportMarkdown renders every alive entity with metadata", async () => {
     exported = await lib.exportMarkdown();
     assert.ok(exported.startsWith("# Kalairos — Memory Export"));
@@ -144,6 +157,8 @@ const INIT_OPTS = {
   await test("exportMarkdown honors includeHistory and filter", async () => {
     const withHistory = await lib.exportMarkdown({ includeHistory: true });
     assert.ok(withHistory.includes("### Version History"), "versioned fact must render history");
+    exportedWithHistory = withHistory;
+    headTexts = [(await lib.get(factId)).text, (await lib.get(noteId)).text];
     const onlyText = await lib.exportMarkdown({ filter: { type: "text" } });
     assert.ok(!onlyText.includes(`## [${factId}]`), "type filter must exclude facts");
     assert.ok(onlyText.includes(`## [${noteId}]`));
@@ -162,6 +177,14 @@ const INIT_OPTS = {
     assert.equal(imported, 2, "both sections must import");
     const back = await lib.get(ids[0]);
     assert.ok(back.text.length > 0);
+  });
+
+  await test("importMarkdown of an includeHistory export imports each entity's current text", async () => {
+    await lib.shutdown();
+    await lib.init(INIT_OPTS);
+    const { ids } = await lib.importMarkdown(exportedWithHistory);
+    const texts = await Promise.all(ids.map(async id => (await lib.get(id)).text));
+    assert.deepEqual(texts.sort(), [...headTexts].sort(), "history lines leaked into the imported text");
   });
 
   await test("importMarkdown ingests bullet lists with caller defaults", async () => {

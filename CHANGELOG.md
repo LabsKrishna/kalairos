@@ -91,6 +91,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Importing an `includeHistory` export keeps each entity's text.** The
+  numbered version-history lines were read as part of the text, so
+  `kalairos export --include-history` followed by `kalairos import`, the
+  README's own example, appended every past version to the current one.
 - **`ingestBatch()` keeps each item's `effectiveAt`, `importance`, `who` and
   `why`.** It dropped them, so a batched fact took effect when it was
   ingested rather than when it became true, and `POST /ingest/batch` couldn't

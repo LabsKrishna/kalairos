@@ -111,6 +111,10 @@ function parseMarkdownFacts(mdText) {
       // Skip metadata / history / separator / blockquote lines, reading back
       // the ones that make up a thing's identity: type, key and fields.
       const trimmed = line.trim();
+      // Version history closes a section, and its numbered entries are past
+      // versions, not this one's text.
+      if (/^###\s+Version History\b/.test(trimmed)) { currentSection.inHistory = true; continue; }
+      if (currentSection.inHistory) continue;
       let m;
       if ((m = trimmed.match(typeRe)))   { currentSection.type   = m[1].trim(); continue; }
       if ((m = trimmed.match(keyRe)))    { currentSection.key    = m[1].trim(); continue; }

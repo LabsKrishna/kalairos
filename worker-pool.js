@@ -131,6 +131,11 @@ class WorkerPool {
   }
 
   _onMessage(idx, msg) {
+    // A reply that lands while stop() is terminating this worker changes
+    // nothing: stop() has already settled the job. Unref'ing the worker here
+    // would let the process exit before the worker does, so stop(), and the
+    // rest of shutdown() after it, would never finish.
+    if (this._stopping) return;
     const slot    = this._workers[idx];
     const pending = slot?.pending ?? null; // a worker may emit with no job in flight
     if (slot) {

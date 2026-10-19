@@ -82,6 +82,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`shutdown()` finishes when a query is in flight.** A scoring job's reply
+  that landed while `shutdown()` was stopping the worker pool unref'd that
+  worker, so Node could exit before the worker did: `shutdown()` never
+  returned, and the store and the SQLite index were never closed.
+  `tests/test-cpu.js` covers this, but when it happened the test exited 0
+  partway through, so `npm test` passed with four tests skipped. It now fails
+  when it exits early.
 - **`queryAt` trust is point-in-time.** A replay used to score trust against
   the entity's full version history and its current annotations, so a
   contradiction, correction or annotation recorded after `asOf` changed the

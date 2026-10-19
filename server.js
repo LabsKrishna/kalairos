@@ -661,7 +661,14 @@ lib.init({ strictEmbeddings: false }).then(() => {
   // KALAIROS_HOST=0.0.0.0 to serve remotely (the Dockerfile does), and enable
   // auth when you do.
   const HOST = process.env.KALAIROS_HOST || "127.0.0.1";
-  const server = app.listen(PORT, HOST, () => {
+  const server = app.listen(PORT, HOST, (err) => {
+    // Express 5 hands a listen error (port taken, port reserved) to this
+    // callback instead of throwing it. Ignored, it let the process exit 0
+    // having served nothing.
+    if (err) {
+      console.error(`[kalairos] Can't listen on ${HOST}:${PORT}: ${err.message}`);
+      process.exit(1);
+    }
     console.log(`Kalairos running on http://${HOST}:${PORT}`);
     if (HOST === "127.0.0.1" || HOST === "localhost" || HOST === "::1") {
       console.log("  (loopback only; set KALAIROS_HOST=0.0.0.0 to accept remote connections)");

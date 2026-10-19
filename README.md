@@ -645,6 +645,8 @@ npx kalairos import memory.md                           # ingest back
 
 Checkpoint it into git, share it across agents, hand-edit it when debugging.
 
+A keyed thing exports with `Key` and `Fields` lines, and an import lands it on the same `type` and `key` with its fields. Links are keyed records of type `link`, so they come back as links that `describe()` reads. Only the current version travels, written at the time of the import, so `asOf` and `validAt` reads of imported things start there. An import writes every section to the one workspace it is given (`workspaceId`, or `default`), so the same key exported from two workspaces lands on one thing.
+
 ---
 
 ## Migration note — `createAgent()` → `scope()`

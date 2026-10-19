@@ -59,6 +59,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   workspace, and answers `null` when the thing isn't there on those clocks.
   The remote client calls it as `describe(address, { asOf, validAt,
   workspaceId })`.
+- **Keys through markdown.** `exportMarkdown()` writes a keyed thing's `Key`
+  and `Fields` lines and `importMarkdown()` reads them back, so an import
+  lands each section on its `type` and `key` with its fields. A link is a
+  keyed record of type `link` whose fields hold `{ from, rel, to }`, so it
+  comes back as a link that `describe()` reads, and a later write to it
+  versions the imported record. A `Fields` line that isn't a JSON object
+  fails the import before anything is written, and `importMarkdown()`
+  refuses `key`, `fields` or `links` in its defaults. Only the current
+  version travels, and an import writes every section to one workspace.
 
 ### Changed
 
@@ -66,6 +75,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   needs `forceNew` on first writes or lowered version and consolidation
   thresholds. Identity misses stay at 0, and every metric matches the run
   before the change.
+- **`importMarkdown()` takes each section's type from its `Type` line**,
+  which keeps its case, instead of lowercasing the `## [id] TYPE` header.
+  Type is part of a key's identity, so `priorAuth:PA-1001` used to come back
+  as `priorauth:PA-1001`.
 
 ### Fixed
 

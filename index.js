@@ -2801,6 +2801,8 @@ async function getStatus({ allowedWorkspaces } = {}) {
 /**
  * Export entities as human-readable markdown.
  * Agents can read/write this format instead of touching .kalairos directly.
+ * A keyed thing carries Key and Fields lines that importMarkdown() reads
+ * back; link records are keyed things, so they export like any other.
  *
  * @param {{ filter?, includeHistory? }} opts
  * @returns {string} markdown string
@@ -2818,6 +2820,10 @@ async function exportMarkdown({ filter, includeHistory = false, allowedWorkspace
  * Parse a markdown file (in the exportMarkdown format) and ingest each section.
  * This lets agents write memories as markdown and round-trip into Kalairos.
  *
+ * A keyed section lands on its thing by type and key, with its fields, so a
+ * round trip keeps identity. Link records are keyed things whose fields hold
+ * { from, rel, to }, so they come back as links that describe() reads.
+ *
  * Also supports simple format: any line starting with "- " or "* " is treated
  * as a separate fact, making it easy for agents to just write bullet lists.
  *
@@ -2827,18 +2833,32 @@ async function exportMarkdown({ filter, includeHistory = false, allowedWorkspace
  */
 async function importMarkdown(mdText, defaults = {}) {
   _assertInit();
-  const { mode, facts } = parseMarkdownFacts(mdText);
+  // Each section names its own thing. A key, fields or links for the whole
+  // file would land every section on one thing, or stamp one thing's facts
+  // on all of them.
+  for (const opt of ["key", "fields", "links"]) {
+    if (defaults[opt] != null) {
+      throw emitError(Err.validation(`importMarkdown() takes each thing's key, fields and links from the markdown, so its defaults can't set ${opt}`));
+    }
+  }
+  // Parsed in full before anything is written: a section that can't be read
+  // fails the import instead of leaving it half done.
+  let parsed;
+  try { parsed = parseMarkdownFacts(mdText); }
+  catch (err) { throw emitError(Err.validation(err.message)); }
+  const { mode, facts } = parsed;
   if (mode === "empty") return { imported: 0, ids: [] };
 
   const allowedWorkspaces = defaults.allowedWorkspaces;
   const ids = await _withBatchedIO(async () => {
     const out = [];
     for (const fact of facts) {
-      // Structured sections carry their own type; bullet facts inherit it
-      // from the caller's defaults.
-      const opts = fact.type
-        ? { ...defaults, type: fact.type, allowedWorkspaces }
-        : { ...defaults, allowedWorkspaces };
+      // Structured sections carry their own type and, when keyed, their key
+      // and fields; bullet facts inherit the type from the caller's defaults.
+      const opts = { ...defaults, allowedWorkspaces };
+      if (fact.type)        opts.type   = fact.type;
+      if (fact.key != null) opts.key    = fact.key;
+      if (fact.fields)      opts.fields = fact.fields;
       out.push(await ingest(fact.text, opts));
     }
     return out;

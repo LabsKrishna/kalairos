@@ -575,6 +575,15 @@ await io.ingestFile("./notes.md");
 const trail = await history.trail({ entity: id });
 ```
 
+### MCP
+
+```text
+kalairos_remember  { text, type?, key?, fields?, links?, effectiveAt?, workspaceId?, ... }
+kalairos_describe  { address, asOf?, validAt?, workspaceId? }
+```
+
+`kalairos_remember` takes `key`, `fields` and `links` as `remember()` does. `kalairos_describe` returns what `describe()` returns, with times in Unix ms or ISO-8601; unlike `kalairos_recall`, it takes `asOf` and `validAt` together.
+
 ---
 
 ## Configuration

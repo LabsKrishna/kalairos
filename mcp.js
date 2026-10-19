@@ -44,7 +44,7 @@ const server = new McpServer(
 // 1. kalairos_remember — store or update a memory
 server.tool(
   "kalairos_remember",
-  "Store a memory. If similar content already exists, it is updated in-place (version history preserved). Returns the stable entity ID.",
+  "Store a memory. If similar content already exists, it is updated in-place (version history preserved). With a key, the key decides instead: the write lands on the record with that type and key, however it is worded. Returns the stable entity ID.",
   {
     text:           z.string().describe("The memory content to store (max 5000 chars)"),
     type:           z.string().optional().describe("Entity type (default: 'text'). Use 'metric' or 'series' for time-varying values: a later effectiveAt supersedes the prior reading as a new valid interval instead of flagging a contradiction"),
@@ -54,10 +54,17 @@ server.tool(
     memoryType:     z.enum(["short-term", "long-term", "working"]).optional().describe("Memory durability class (default: 'long-term')"),
     workspaceId:    z.string().optional().describe("Workspace/tenant isolation key (default: 'default')"),
     effectiveAt:    z.union([z.number(), z.string()]).optional().describe("Event time this value became true (Unix ms or ISO-8601 string). Defaults to ingest time. For metric/series types, a strictly later effectiveAt retires the previous value into a closed valid interval — both readings stay queryable via recall(asOf)"),
+    key:            z.string().optional().describe("The real identifier of the thing this memory is about, e.g. a claim or policy number. Identity becomes workspace + type + key: the write updates the record holding that key, or creates it, and similar wording never merges two keys. Pass the same type every time. Its address is \"type:key\", e.g. \"claim:D-101\", for links and kalairos_describe"),
+    fields:         z.object({}).passthrough().optional().describe("Structured facts about the thing, e.g. { \"billed\": 14200, \"dos\": \"2026-05-12\" }. Versioned with the text and compared exactly on keyed writes; fields left out carry forward from the previous version"),
+    links:          z.array(z.object({
+      rel: z.string().describe("How this thing relates to the other, e.g. 'under', 'supports'"),
+      to:  z.string().describe("Address of the other thing, \"type:key\", e.g. \"policy:IB-114\""),
+      one: z.boolean().optional().describe("true when this thing has at most one link of this rel at a time (a claim is under one policy): pointing it elsewhere replaces the link instead of adding another"),
+    })).optional().describe("Typed links from this thing to others, by address. Requires key. Each link is stored as its own record with versions and provenance; read them back with kalairos_describe"),
   },
-  async ({ text, type, tags, metadata, importance, memoryType, workspaceId, effectiveAt }) => {
+  async ({ text, type, tags, metadata, importance, memoryType, workspaceId, effectiveAt, key, fields, links }) => {
     try {
-      const id = await dbx.remember(text, { type, tags, metadata, importance, memoryType, workspaceId, effectiveAt });
+      const id = await dbx.remember(text, { type, tags, metadata, importance, memoryType, workspaceId, effectiveAt, key, fields, links });
       return ok({ id });
     } catch (err) { return fail(err); }
   },
@@ -294,6 +301,24 @@ server.tool(
     try {
       const result = await dbx.exportMarkdown({ type, memoryType, workspaceId, tags, includeHistory });
       return ok(result);
+    } catch (err) { return fail(err); }
+  },
+);
+
+// 15. kalairos_describe — one keyed thing and its links, on both clocks
+server.tool(
+  "kalairos_describe",
+  "Describe one keyed thing by its address (\"type:key\"): its text, fields, version, trust and whether it is contested, what it links to (links) and what links to it (linkedFrom), each with the thing at the other end. validAt picks what was true in the world at that moment; asOf limits the answer to what had been recorded by then. Unlike kalairos_recall, the two combine: validAt + asOf answers \"what was true at X, as known at Y\". Returns null when the workspace has no such thing, or it was not yet recorded at asOf or not yet true at validAt.",
+  {
+    address:     z.string().describe("The thing to describe, \"type:key\", e.g. \"claim:D-101\": the type and key it was stored with"),
+    asOf:        z.union([z.number(), z.string()]).optional().describe("Ingest time (Unix ms or ISO-8601): answer only from what had been recorded by this moment. Leave out to use everything recorded so far"),
+    validAt:     z.union([z.number(), z.string()]).optional().describe("Event time (Unix ms or ISO-8601): the version that was true in the world at this moment. Leave out for the latest version"),
+    workspaceId: z.string().optional().describe("Workspace the thing lives in (default: 'default')"),
+  },
+  async ({ address, asOf, validAt, workspaceId }) => {
+    try {
+      const thing = await dbx.describe(address, { asOf, validAt, workspaceId });
+      return ok(thing);
     } catch (err) { return fail(err); }
   },
 );

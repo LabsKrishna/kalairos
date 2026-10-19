@@ -47,6 +47,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   corroboration, not a contest, and doesn't take the key over. The poisoning
   benchmark gains a `key-overwrite` attack: defended, 6/6, and compromised
   with the rule switched off.
+- **Keys over MCP.** `kalairos_remember` takes `key`, `fields` and `links`,
+  and the new `kalairos_describe` tool takes an `address` (`"type:key"`)
+  with optional `asOf`, `validAt` (Unix ms or ISO-8601) and `workspaceId`,
+  and returns what `describe()` returns. Unlike `kalairos_recall`, `asOf` and
+  `validAt` combine.
 
 ### Changed
 

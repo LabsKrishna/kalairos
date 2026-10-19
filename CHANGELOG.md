@@ -46,6 +46,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whatever `trustScore` it names. Repeating what the key already says is
   corroboration, not a contest, and doesn't take the key over.
 
+### Changed
+
+- **The prior-auth replay writes every record with its key.** It no longer
+  needs `forceNew` on first writes or lowered version and consolidation
+  thresholds. Identity misses stay at 0, and every metric matches the run
+  before the change.
+
 ### Fixed
 
 - **`queryAt` trust is point-in-time.** A replay used to score trust against

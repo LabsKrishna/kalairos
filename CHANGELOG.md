@@ -72,6 +72,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that stopped at once, `shutdown()` resolved with the write still queued and
   a following `init()` dropped it. Queued writes now run first, while the
   store is open.
+- **A failed flush for coalesced writes rejects them.** Two or more writes
+  that reach the write lock in the same tick share one flush. When that flush
+  failed on the default file store (a full disk, say), the error escaped the
+  write queue as an uncaught exception, none of those writes' promises ever
+  settled, and the queue stayed marked busy, so no later write ran either.
+  Each of those writes now rejects with the persist error, as a lone write's
+  already did, and the queue keeps taking writes. Writes still share a single
+  flush and still settle only after it.
 
 ### Known issues
 

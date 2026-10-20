@@ -73,7 +73,11 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-mcp-"));
     assert.deepStrictEqual(nonProtocol, [], `stdout carried non-protocol output:\n${nonProtocol.join("\n")}`);
     console.log("  [ok] stdout carried only JSON-RPC messages");
   } finally {
-    child.kill();
+    // kill() only sends the signal, and the server flushes its store into
+    // `dir` as it shuts down. Wait for the exit before removing the directory.
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise((resolve) => { child.once("exit", resolve); child.kill(); });
+    }
     fs.rmSync(dir, { recursive: true, force: true });
   }
 

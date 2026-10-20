@@ -389,7 +389,7 @@ await test("ingestBatch leaves SQLite consistent after the batch flush", async (
   const sqlitePath = dataFile + ".sqlite";
 
   await lib.init(baseInitOpts(dataFile));
-  // ingestBatch suppresses per-item I/O via _skipIO and emits a single
+  // ingestBatch skips its items' own I/O and emits a single
   // _persistAll at the end. KAL-109 must keep SQLite consistent with the
   // post-batch JSONL.
   await lib.ingestBatch([
@@ -405,6 +405,47 @@ await test("ingestBatch leaves SQLite consistent after the batch flush", async (
   // last_jsonl_offset should match the actual JSONL size.
   const jsonlSize = fs.statSync(dataFile).size;
   assert.equal(snap.meta.last_jsonl_offset, String(jsonlSize),
+               "meta.last_jsonl_offset must match JSONL size after the batch flush");
+});
+
+await test("a write acknowledged mid-batch is mirrored, and the batch flush keeps SQLite in sync", async () => {
+  const dataFile   = freshDataFile();
+  const sqlitePath = dataFile + ".sqlite";
+
+  // Hold the batch's second item in its embed so the batch stays open.
+  const embed = makeMockEmbedder(64);
+  let release, entered;
+  const held    = new Promise(r => { release = r; });
+  const reached = new Promise(r => { entered = r; });
+  const gatedEmbed = async (text) => {
+    if (text === "batch row held") { entered(); await held; }
+    return embed(text);
+  };
+
+  await lib.init({ ...baseInitOpts(dataFile), embedFn: gatedEmbed });
+  try {
+    const batch = lib.ingestBatch([{ text: "batch row first" }, { text: "batch row held" }]);
+    await reached;
+    const id = await lib.remember("unrelated concurrent write", { who: { agent: "sqlite-test" } });
+
+    // The concurrent write took the live append path, so it is mirrored now;
+    // the batch's own rows wait for its flush.
+    const mid = snapshot(sqlitePath);
+    assert.deepEqual(mid.facts.map(f => f.id), [String(id)],
+                     "only the concurrent write should be in SQLite mid-batch");
+    assert.equal(mid.meta.dirty, "0");
+
+    release();
+    await batch;
+  } finally {
+    release();
+    await lib.shutdown();
+  }
+
+  const snap = snapshot(sqlitePath);
+  assert.equal(snap.facts.length, 3, "batch rows and the concurrent write should all be in SQLite");
+  assert.equal(snap.meta.dirty, "0", "the batch flush should not leave dirty=1");
+  assert.equal(snap.meta.last_jsonl_offset, String(fs.statSync(dataFile).size),
                "meta.last_jsonl_offset must match JSONL size after the batch flush");
 });
 

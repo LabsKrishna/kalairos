@@ -40,6 +40,32 @@ const server = new McpServer(
   { capabilities: { tools: {} } },
 );
 
+// The engine loads on the first tool call, not at boot. Loading it reads the
+// whole store, picks the embedder and starts a worker thread per CPU: about
+// 300MB with the neural model, which every server used to hold from the
+// moment its host started it. Hosts start a server per session, and most
+// sessions never call a memory tool.
+let engine = null; // init()'s promise, shared by every call that arrives while it runs
+
+// Resolves once the engine is loaded. A failed load is not kept: the calls
+// waiting on it get the error, and the next call tries again.
+function ready() {
+  if (engine) return engine;
+  // No embedFn: init() auto-detects (neural ONNX when the model is cached,
+  // built-in bag-of-words otherwise) and logs that choice to stderr, which
+  // keeps stdout clean for JSON-RPC. The built-in BoW is bit-identical to the
+  // copy this file used to carry, so existing stores need no reindexing.
+  engine = dbx.init({
+    dataFile: process.env.KALAIROS_DATA_FILE || path.join(process.cwd(), "data.kalairos"),
+    strictEmbeddings: false,
+  });
+  engine.catch((err) => {
+    engine = null;
+    process.stderr.write(`kalairos-mcp: engine failed to load: ${err.message}\n`);
+  });
+  return engine;
+}
+
 // Who is writing. Every write through this server is an agent's, named by
 // KALAIROS_MCP_AGENT or else by the host in the MCP handshake, so provenance,
 // the audit trail and the contested-write rule can tell one agent from
@@ -62,10 +88,14 @@ const linkSchema = z.object({
 // sent just before it went away still lands and still gets its reply.
 const inflight = new Set();
 
-// server.tool(), with each call held in `inflight` until it settles.
+// server.tool(), with each call waiting for the engine and held in `inflight`
+// until it settles. A failed load is that call's tool error.
 function tool(name, description, schema, handler) {
   server.tool(name, description, schema, (...args) => {
-    const call = handler(...args);
+    const call = ready().then(
+      () => handler(...args),
+      (err) => fail(new Error(`kalairos failed to load: ${err.message}`)),
+    );
     inflight.add(call);
     const done = () => inflight.delete(call);
     call.then(done, done);
@@ -368,6 +398,10 @@ tool(
 // days. Now every sign that the client is gone, or wants the server gone,
 // runs the same shutdown once: stdin ending or closing, a failed write to
 // stdout, the transport closing, SIGTERM or SIGINT.
+//
+// Shutdown never loads the engine. Only a tool call does, and the call waits
+// for the load, so a load still running when the client leaves finishes
+// before the final flush. A server that no call ever used has nothing to flush.
 
 const SHUTDOWN_TIMEOUT_MS = 5_000;
 let shuttingDown = null;
@@ -401,7 +435,7 @@ function shutdown(reason) {
       await nextTurn();                   // requests read along with EOF reach their handlers
       await Promise.allSettled(inflight); // their writes are on disk once they settle
       await nextTurn();                   // their replies are written
-      await dbx.shutdown();               // final flush, worker pool stopped
+      await dbx.shutdown();               // final flush, worker pool stopped (a no-op if never loaded)
       await flushStdout();
     } catch (err) {
       process.stderr.write(`kalairos-mcp: shutdown failed: ${err.message}\n`);
@@ -415,8 +449,6 @@ function shutdown(reason) {
 // ─── Boot ────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const dataFile = process.env.KALAIROS_DATA_FILE || path.join(process.cwd(), "data.kalairos");
-
   const transport = new StdioServerTransport();
   transport.onclose = () => shutdown("transport closed"); // connect() calls this before its own handler
   process.stdin.on("end", () => shutdown("stdin ended"));
@@ -430,16 +462,6 @@ async function main() {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 
-  // No embedFn: init() auto-detects (neural ONNX when the model is cached,
-  // built-in bag-of-words otherwise) and logs that choice to stderr, which
-  // keeps stdout clean for JSON-RPC. The built-in BoW is bit-identical to the
-  // copy this file used to carry, so existing stores need no reindexing.
-  await dbx.init({
-    dataFile,
-    strictEmbeddings: false,
-  });
-
-  if (shuttingDown) return; // told to stop while loading
   await server.connect(transport);
 }
 

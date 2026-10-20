@@ -90,6 +90,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Type is part of a key's identity, so `priorAuth:PA-1001` used to come back
   as `priorauth:PA-1001`.
 
+- **`kalairos-mcp` loads the engine on the first tool call.** The server
+  used to run `init()` before it answered the handshake, so it read the
+  whole store, loaded the embedder and started a worker thread per CPU
+  whether or not its client ever called a tool. Hosts such as Claude Code
+  start a server per session, and most sessions never call a memory tool.
+  Measured on macOS with 10 CPUs and a 30-entity store, an idle server with
+  the neural embedder now holds **35MB instead of 318MB**, runs 7 threads
+  instead of 26, and answers `initialize` in 101ms instead of 275ms. With
+  bag-of-words it holds 35MB instead of 111MB. The first tool call pays for
+  the load instead: 213ms with the neural embedder and 31ms with
+  bag-of-words, against 17ms and 5ms before. Later calls take what they
+  took before. Calls that arrive while the engine loads share that one
+  load. A load that fails, such as an unreadable store, is now that call's
+  tool error and the next call tries again; it used to stop the server at
+  boot.
+
 ### Fixed
 
 - **Importing an `includeHistory` export keeps each entity's text.** The

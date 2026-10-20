@@ -73,6 +73,84 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `until` arrives as `null`. A missing `since` was 0 rather than -Infinity,
   which dropped anything stamped before 1970. Both bounds are now
   open-ended when omitted.
+- **A write acknowledged during a batch is on disk.** While `ingestBatch()`,
+  `extractFacts()` or `importMarkdown()` was running, every write in the
+  process skipped its own fsync, not only the batch's items. A `remember()`
+  from another caller (or `kalairos_remember` over MCP while
+  `kalairos_batch_store` ran) resolved with its id while the row sat in
+  memory until the batch's final flush, so a crash or SIGKILL in that window
+  lost a write the caller had been told was stored. The same held for a
+  delete, for concurrent writes coalesced into one flush, and for a second
+  batch that finished while the first was still running. Only a batch's own
+  items now wait for its single flush; every other write reaches the JSONL
+  file, and the SQLite index when enabled, before it is acknowledged.
+- **`shutdown()` runs queued writes before its final flush.** A write already
+  queued behind the write lock when `shutdown()` started ran only if tearing
+  down the worker pool happened to yield to the event loop first. With a pool
+  that stopped at once, `shutdown()` resolved with the write still queued and
+  a following `init()` dropped it. Queued writes now run first, while the
+  store is open.
+- **A failed flush for coalesced writes rejects them.** Two or more writes
+  that reach the write lock in the same tick share one flush. When that flush
+  failed on the default file store (a full disk, say), the error escaped the
+  write queue as an uncaught exception, none of those writes' promises ever
+  settled, and the queue stayed marked busy, so no later write ran either.
+  Each of those writes now rejects with the persist error, as a lone write's
+  already did, and the queue keeps taking writes. Writes still share a single
+  flush and still settle only after it.
+- **A write that failed to persist no longer reaches disk later.** A write
+  whose persist failed (a full disk, say) rejected, but what it had changed
+  stayed in memory. Reads served it, and the next flush, which rewrites the
+  whole JSONL file from memory, put it on disk along with some later,
+  unrelated write, so a reload brought back a write the caller had been told
+  failed. This held for a lone write and for writes coalesced into one flush.
+  A write that rejects now leaves memory as it found it: every entity it
+  changed, created or removed is restored, including its versions, trail
+  events and the links on its neighbours, before the next write runs. Other
+  writes are untouched, so a batch running at the same time keeps its items.
+- **A failed append no longer leaves bytes in the JSONL file.** Adding a row
+  writes it, then fsyncs it. When either step failed, the write rejected but
+  what had reached the file stayed there. A row cut off partway (a full
+  disk, say) had no newline, so the next successful append joined onto it
+  and a reload skipped the joined line as malformed. The row lost was that
+  next one, which had been acknowledged. A whole row whose fsync failed came
+  back on reload. A short write, where fewer bytes land than were asked for
+  and no error is raised, was not checked at all, so a torn row was
+  acknowledged. A failed append now truncates the file back to its size
+  before the write and rethrows the original error, and a short write keeps
+  writing until the row is out or the disk reports an error.
+- **A full rewrite of the JSONL file can no longer truncate it.** Updates,
+  deletes, batches and `shutdown()` rewrite the whole file: they write a
+  temp file and rename it over the store. That write was one call whose byte
+  count was ignored, so when the disk filled partway, the torn temp file was
+  fsync'd and renamed into place, and every row past the cut was gone on the
+  next start. The rewrite now keeps writing until the whole file is out, or
+  throws the disk's error and leaves the store as it was.
+- **A crash in the middle of an append no longer costs the next row.** A
+  process that dies while adding a row can leave part of it at the end of
+  the file, with no newline. A reload skipped it, but the next append joined
+  onto it, so that row, which was acknowledged, was skipped on the reload
+  after. The same held for a whole last row that never got its newline: it
+  loaded, then the next append took both down. An append now checks the
+  file's last byte and starts on a new line when it is not a newline, with a
+  warning. The partial row stays in the file and loads keep skipping it
+  until the next full rewrite drops it.
+- **A batch op that fails leaves nothing behind.** `ingestBatch()`,
+  `extractFacts()` and `importMarkdown()` wrote their items one at a time and
+  flushed once at the end. When that flush failed, or an item was rejected
+  partway (text over `maxTextLen`, or a workspace the caller may not write),
+  the call rejected, but the items written before it stayed in memory. Reads
+  served them and the next flush put them on disk. Other writes run while a
+  batch waits on each embedding, so one of those could also flush the batch's
+  first items to disk before the batch had finished. A batch op now prepares
+  every item first and then applies them all in one write, with one flush.
+  None of its items can be read, or written to disk by another write, until
+  it resolves. If it rejects, memory and disk are as they were before it.
+  Items still apply in order, so a later item can update an earlier one, and
+  writes made while a batch is being prepared are kept either way. This makes
+  `ingestBatch()` atomic, as its documentation already said. One cost: a
+  batch's items now apply in a single synchronous step, so reads wait for the
+  whole batch rather than for one item at a time.
 - **`kalairos-mcp` exits when its client goes away.** The stdio server had
   no shutdown path: nothing listened for stdin ending, and SIGTERM and
   SIGINT went unhandled, so it ran until its event loop emptied on its own.

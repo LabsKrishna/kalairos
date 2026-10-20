@@ -132,6 +132,7 @@ let store       = null;        // StoreAdapter (FileStore or PgStore)
 let _pool       = null;        // persistent WorkerPool
 let _initialized = false;
 let _skipIO        = false; // true only while a write-lock body runs whose I/O a later flush covers
+let _undo          = null;  // the running lock body's journal (see _touch); null outside one
 
 // Embedding cache — see _embed. A Map is the LRU: insertion order is iteration
 // order, so re-inserting on a hit moves an entry to the back and the oldest is
@@ -222,6 +223,9 @@ function _newId() { return _nextId++; }
 // is in flight. Suppression is decided per write, never for the whole process:
 // a batch holds the open window across its awaits, and an unrelated write that
 // lands inside it is acknowledged to a caller that is not waiting on the batch.
+//
+// A body must _touch(id) each entity before it changes, adds or removes it, so
+// a write that rejects can be taken back out of memory (see Write rollback).
 
 function _withWriteLock(fn, batchedIO = false) {
   const max = CFG.writeQueueMax;
@@ -250,12 +254,15 @@ function _drainWrites() {
         // Skip this write's own I/O when a later flush covers it: the single
         // flush below for a multi-write batch, or its batch op's own flush.
         _skipIO = isMulti || item.batchedIO;
+        const undo = _undo = new Map();
         try {
-          settled.push({ ok: true,  item, value: item.fn() });
+          settled.push({ ok: true,  item, undo, value: item.fn() });
         } catch (err) {
+          _rollback(undo); // it rejects, so nothing it changed may stay
           settled.push({ ok: false, item, error: err });
         } finally {
           _skipIO = false;
+          _undo   = null;
         }
       }
 
@@ -263,10 +270,17 @@ function _drainWrites() {
       // it belongs to a batch op, which flushes when it finishes; anything else
       // must be on disk before its promise settles. A sync store rethrows I/O
       // errors here; none of these writes reached disk, so each one that would
-      // have resolved rejects with that error, as a single write's would.
+      // have resolved rejects with that error, as a single write's would, and
+      // is taken back out of memory. Newest first: each journal holds what its
+      // write saw, which includes the writes before it.
       let flushError = null;
       if (isMulti && batch.some(item => !item.batchedIO)) {
-        try { _persistAll(); } catch (err) { flushError = err; }
+        try { _persistAll(); } catch (err) {
+          flushError = err;
+          for (let i = settled.length - 1; i >= 0; i--) {
+            if (settled[i].ok) _rollback(settled[i].undo);
+          }
+        }
       }
 
       // Settle all promises after the flush so callers receive confirmed IDs.
@@ -278,6 +292,51 @@ function _drainWrites() {
     }
   } finally {
     _draining = false;
+  }
+}
+
+// ─── Write rollback ───────────────────────────────────────────────────────────
+// A write that rejects must leave nothing behind. Its lock body changes the
+// in-memory store before its I/O runs, and _persistAll() rewrites the whole
+// JSONL from memory, so a change left in place after a failed persist would be
+// served by reads and then written to disk by the next, unrelated flush.
+//
+// _drainWrites gives each lock body a journal. The body calls _touch(id)
+// before it changes, adds or removes an entity, which keeps a copy of it as it
+// was (or notes that the id was absent). If the body throws, or the shared
+// flush for its micro-batch fails, _rollback() puts the copies back. All of it
+// is synchronous, so nothing else can have changed those entities in between.
+//
+// Only what the write changed is restored. Reloading from disk would also
+// throw away a batch op's items, which wait in memory for the batch's own
+// flush, and the batch would then report them stored.
+
+const ABSENT = Symbol("absent");
+
+function _touch(id) {
+  if (!_undo || _undo.has(id)) return;
+  const e = store.get(id);
+  _undo.set(id, e ? _copyEntity(e) : ABSENT);
+}
+
+// Deep enough that no in-place change to the live entity reaches the copy:
+// containers are copied, and so is each version, since a write closes validTo
+// on the latest one in place. Vectors are only ever replaced, so are shared.
+function _copyEntity(e) {
+  return {
+    ...e,
+    links:       new Set(e.links),
+    metadata:    e.metadata && { ...e.metadata },
+    tags:        Array.isArray(e.tags) ? [...e.tags] : e.tags,
+    versions:    Array.isArray(e.versions) ? e.versions.map(v => ({ ...v })) : e.versions,
+    trailEvents: Array.isArray(e.trailEvents) ? [...e.trailEvents] : e.trailEvents,
+  };
+}
+
+function _rollback(undo) {
+  for (const [id, before] of undo) {
+    if (before === ABSENT) store.delete(id);
+    else                   store.set(id, before);
   }
 }
 
@@ -334,6 +393,7 @@ function _appendTrailEvent(entity, event) {
   if (!isValidAction(event.action)) {
     throw emitError(Err.validation(`Unknown action "${event.action}". Must be one of: ${Object.values(ACTIONS).join(", ")}`));
   }
+  _touch(entity.id);
   if (!Array.isArray(entity.trailEvents)) entity.trailEvents = [];
   entity.trailEvents.unshift(event);
   // Newest-first, so truncating from the end drops the oldest events — the
@@ -435,8 +495,10 @@ function _serializeEntity(e, { truncateText } = {}) {
 // ─── Shared Graph Unlink ─────────────────────────────────────────────────────
 
 function _unlinkEntity(entity, entityId) {
+  _touch(entityId);
   for (const linkedId of entity.links) {
-    store.get(linkedId)?.links.delete(entityId);
+    const other = store.get(linkedId);
+    if (other) { _touch(linkedId); other.links.delete(entityId); }
   }
   entity.links.clear();
 }
@@ -484,6 +546,7 @@ async function init(overrides = {}) {
 
   CFG            = { ...DEFAULTS, ...overrides };
   _skipIO        = false;  // reset per-write I/O suppression
+  _undo          = null;   // no lock body is running
   _pendingWrites = [];     // drop any queued mutations from previous session
   _draining      = false;  // drain state reset
   // Not merely stale — WRONG. init() may install a different embedFn or a
@@ -668,8 +731,8 @@ function _persistAll() {
   } catch (err) {
     // Sync store path (FileStore). Rethrow so the caller (typically ingest())
     // rejects with the I/O error instead of acknowledging a write that didn't
-    // reach disk. In-memory state is now divergent from disk; the next process
-    // start re-loads from disk, which is the source of truth.
+    // reach disk. Inside a write lock, _drainWrites then takes the failed
+    // writes back out of memory (see _touch), so no later flush writes them.
     emitError(Err.persistFailed(err.message, err));
     console.error(`[kalairos] Persistence failed: ${err.message}`);
     throw err;
@@ -965,9 +1028,11 @@ async function _extractFacts(text, type) {
 // is not the default. Confining at write time makes the isolation hold for
 // every caller. Sibling of the ingest()/consolidate() candidate scans.
 function _relinkEntity(entity) {
+  _touch(entity.id);
   // Remove stale back-links from other entities before clearing own links
   for (const linkedId of entity.links) {
-    store.get(linkedId)?.links.delete(entity.id);
+    const other = store.get(linkedId);
+    if (other) { _touch(linkedId); other.links.delete(entity.id); }
   }
   entity.links.clear();
 
@@ -976,6 +1041,7 @@ function _relinkEntity(entity) {
     if (otherId === entity.id) continue;
     if (_wsOf(other) !== ws) continue;
     if (cosine(entity.vector, other.vector) >= CFG.linkThreshold) {
+      _touch(otherId);
       entity.links.add(otherId);
       other.links.add(entity.id);
     }
@@ -1113,6 +1179,7 @@ async function _ingest(text, { type = "text", timestamp, metadata = {}, tags = [
 
     // ── Update / Consolidation path: merge into existing entity ─────────────
     if (mergeTarget) {
+      _touch(mergeTarget.id);
       const latest = mergeTarget.versions[0];
       const sameContent = latest && latest.text === safeText;
       const sameSource  = latest && (latest.source?.type === src.type)
@@ -1309,6 +1376,7 @@ async function _ingest(text, { type = "text", timestamp, metadata = {}, tags = [
       trailEvents: [],
     };
 
+    _touch(id); // absent: undoing the write removes it
     store.set(id, entity);
     _relinkEntity(entity);
     _appendEntity(entity);
@@ -2060,6 +2128,7 @@ async function remove(id, { deletedBy, allowedWorkspaces, reason, who } = {}) {
     if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No admin access to workspace "${e.workspaceId || "default"}".`));
     if (e.deletedAt) throw emitError(Err.alreadyDeleted(id));
 
+    _touch(numId);
     _unlinkEntity(e, numId);
     const now = Date.now();
     e.deletedAt = now;
@@ -2133,6 +2202,7 @@ async function restore(id, { reason, who, allowedWorkspaces } = {}) {
     if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No admin access to workspace "${e.workspaceId || "default"}".`));
     if (!e.deletedAt) throw emitError(Err.validation(`Entity ${numId} is not deleted; nothing to restore.`));
 
+    _touch(numId);
     const now = Date.now();
     e.deletedAt = null;
     e.deletedBy = null;
@@ -2177,6 +2247,7 @@ async function purge(id, { allowedWorkspaces } = {}) {
     if (!e) throw emitError(Err.notFound(id));
     if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No admin access to workspace "${e.workspaceId || "default"}".`));
 
+    _touch(numId);
     _unlinkEntity(e, numId);
     store.delete(numId);
     _persistAll();
@@ -2257,6 +2328,8 @@ async function consolidate({ threshold, dryRun = false, type, allowedWorkspaces 
         });
 
         if (!dryRun) {
+          _touch(keeper.id);
+          _touch(dup.id);
           // Merge tags and metadata from duplicate into keeper
           keeper.tags = Array.from(new Set([...(keeper.tags || []), ...(dup.tags || [])]));
           keeper.metadata = { ...dup.metadata, ...keeper.metadata };
@@ -2659,6 +2732,7 @@ async function annotate(id, { trustScore, verified, notes, memoryType, classific
     if (!_isAlive(e)) throw emitError(Err.alreadyDeleted(id));
     if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No access to workspace "${e.workspaceId || "default"}".`));
 
+    _touch(numId);
     const diff = {};
     if (Number.isFinite(trustScore) && e.trustScore !== Math.max(0, Math.min(1, trustScore))) {
       diff.trustScore = { from: e.trustScore, to: Math.max(0, Math.min(1, trustScore)) };

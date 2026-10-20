@@ -58,11 +58,26 @@ const linkSchema = z.object({
   one: z.boolean().optional().describe("true when this thing has at most one link of this rel at a time (a claim is under one policy): pointing it elsewhere replaces the link instead of adding another"),
 });
 
+// Tool calls still running. Shutdown lets them finish, so a write the client
+// sent just before it went away still lands and still gets its reply.
+const inflight = new Set();
+
+// server.tool(), with each call held in `inflight` until it settles.
+function tool(name, description, schema, handler) {
+  server.tool(name, description, schema, (...args) => {
+    const call = handler(...args);
+    inflight.add(call);
+    const done = () => inflight.delete(call);
+    call.then(done, done);
+    return call;
+  });
+}
+
 // ─── Tools ───────────────────────────────────────────────────────────────────
 // Tools covering the full agent memory lifecycle.
 
 // 1. kalairos_remember — store or update a memory
-server.tool(
+tool(
   "kalairos_remember",
   "Store a memory. If similar content already exists, it is updated in-place (version history preserved). With a key, the key decides instead: the write lands on the record with that type and key, however it is worded. Returns the stable entity ID.",
   {
@@ -87,7 +102,7 @@ server.tool(
 );
 
 // 2. kalairos_recall — semantic search
-server.tool(
+tool(
   "kalairos_recall",
   "Search memories by semantic similarity. Returns ranked results with scores, provenance, and version info. Two independent time axes: asOf answers \"what did we BELIEVE on date X\" (ingest time) and validAt answers \"what was actually TRUE on date X\" (event time). They give different answers for any fact recorded with a backdated effectiveAt — use validAt when the question is about the world, asOf when it is about the record. Supports token-budgeted packing via maxTokens.",
   {
@@ -126,7 +141,7 @@ server.tool(
 );
 
 // 3. kalairos_get — fetch a single entity
-server.tool(
+tool(
   "kalairos_get",
   "Retrieve a specific memory by its stable ID. Returns full entity including metadata, tags, provenance, and version count.",
   {
@@ -141,7 +156,7 @@ server.tool(
 );
 
 // 4. kalairos_history — version trail
-server.tool(
+tool(
   "kalairos_history",
   "Get the full version history for a memory. Shows how it changed over time, including diffs, contradiction flags, and provenance per version.",
   {
@@ -156,7 +171,7 @@ server.tool(
 );
 
 // 5. kalairos_delete — soft-delete
-server.tool(
+tool(
   "kalairos_delete",
   "Soft-delete a memory. The entity is marked as deleted but retained for audit purposes. Use kalairos_recall to verify it no longer appears in results.",
   {
@@ -172,7 +187,7 @@ server.tool(
 );
 
 // 6. kalairos_status — database overview
-server.tool(
+tool(
   "kalairos_status",
   "Get an overview of the database: total entities, breakdowns by type/memoryType/workspace, and recent version activity.",
   {},
@@ -185,7 +200,7 @@ server.tool(
 );
 
 // 7. kalairos_list — paginated listing
-server.tool(
+tool(
   "kalairos_list",
   "List stored memories with pagination and optional filters. Returns entity summaries sorted by most recently updated.",
   {
@@ -207,7 +222,7 @@ server.tool(
 );
 
 // 8. kalairos_batch_store — store many at once
-server.tool(
+tool(
   "kalairos_batch_store",
   "Store multiple memories in a single call. Deduplication and version detection apply to each item, and an item with a key lands on the record holding that key, as in kalairos_remember. Returns array of entity IDs.",
   {
@@ -236,7 +251,7 @@ server.tool(
 );
 
 // 9. kalairos_extract_facts — fact extraction
-server.tool(
+tool(
   "kalairos_extract_facts",
   "Extract discrete facts from raw text (e.g. meeting notes, paragraphs) and store each as a separate memory. Requires factExtractFn to be configured.",
   {
@@ -254,7 +269,7 @@ server.tool(
 );
 
 // 10. kalairos_graph — relationship graph
-server.tool(
+tool(
   "kalairos_graph",
   "Get the knowledge graph of relationships between memories. Returns nodes, edges, and breakdowns by type/workspace.",
   {},
@@ -267,7 +282,7 @@ server.tool(
 );
 
 // 11. kalairos_consolidate — deduplication
-server.tool(
+tool(
   "kalairos_consolidate",
   "Merge duplicate or near-duplicate memories. Returns counts of consolidated, removed, and preserved entities.",
   {
@@ -284,7 +299,7 @@ server.tool(
 );
 
 // 13. kalairos_startup_summary — progressive context loading
-server.tool(
+tool(
   "kalairos_startup_summary",
   "Get the most critical memories in minimal tokens for agent boot. Ranks by importance, recency, connectivity, and update frequency — no search query needed. Call once at startup instead of scanning all memories.",
   {
@@ -310,7 +325,7 @@ server.tool(
 );
 
 // 14. kalairos_export — markdown export
-server.tool(
+tool(
   "kalairos_export",
   "Export all memories as structured Markdown. Useful for backup, inspection, or sharing.",
   {
@@ -329,7 +344,7 @@ server.tool(
 );
 
 // 15. kalairos_describe — one keyed thing and its links, on both clocks
-server.tool(
+tool(
   "kalairos_describe",
   "Describe one keyed thing by its address (\"type:key\"): its text, fields, version, trust and whether it is contested, what it links to (links) and what links to it (linkedFrom), each with the thing at the other end. validAt picks what was true in the world at that moment; asOf limits the answer to what had been recorded by then. Unlike kalairos_recall, the two combine: validAt + asOf answers \"what was true at X, as known at Y\". Returns null when the workspace has no such thing, or it was not yet recorded at asOf or not yet true at validAt.",
   {
@@ -346,10 +361,74 @@ server.tool(
   },
 );
 
+// ─── Shutdown ────────────────────────────────────────────────────────────────
+// A stdio server should live exactly as long as its client. This one used to
+// run until its event loop emptied on its own, and on 1.9.0 the loop never
+// did: idle worker threads held it open, so servers outlived their clients by
+// days. Now every sign that the client is gone, or wants the server gone,
+// runs the same shutdown once: stdin ending or closing, a failed write to
+// stdout, the transport closing, SIGTERM or SIGINT.
+
+const SHUTDOWN_TIMEOUT_MS = 5_000;
+let shuttingDown = null;
+
+const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+// Resolves once everything written to stdout has been handed to the OS, so
+// exiting does not cut off the last reply.
+function flushStdout() {
+  return new Promise((resolve) => {
+    if (process.stdout.writableLength === 0) return resolve();
+    process.stdout.write("", () => resolve());
+  });
+}
+
+function shutdown(reason) {
+  if (shuttingDown) return shuttingDown;
+  process.stderr.write(`kalairos-mcp: ${reason}, shutting down\n`);
+
+  // Whatever happens below, the process must not outlive this.
+  setTimeout(() => {
+    process.stderr.write(`kalairos-mcp: shutdown took over ${SHUTDOWN_TIMEOUT_MS}ms, exiting\n`);
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS).unref();
+
+  process.stdin.pause(); // take no new requests
+
+  shuttingDown = (async () => {
+    let code = 0;
+    try {
+      await nextTurn();                   // requests read along with EOF reach their handlers
+      await Promise.allSettled(inflight); // their writes are on disk once they settle
+      await nextTurn();                   // their replies are written
+      await dbx.shutdown();               // final flush, worker pool stopped
+      await flushStdout();
+    } catch (err) {
+      process.stderr.write(`kalairos-mcp: shutdown failed: ${err.message}\n`);
+      code = 1;
+    }
+    process.exit(code);
+  })();
+  return shuttingDown;
+}
+
 // ─── Boot ────────────────────────────────────────────────────────────────────
 
 async function main() {
   const dataFile = process.env.KALAIROS_DATA_FILE || path.join(process.cwd(), "data.kalairos");
+
+  const transport = new StdioServerTransport();
+  transport.onclose = () => shutdown("transport closed"); // connect() calls this before its own handler
+  process.stdin.on("end", () => shutdown("stdin ended"));
+  process.stdin.on("close", () => shutdown("stdin closed"));
+  // Writes to a client that has gone fail with EPIPE, and an unhandled stream
+  // error kills the process on the spot, mid-write. A failed reply means the
+  // client is gone; a failed log line (the engine logs as it writes) has
+  // nowhere else to go.
+  process.stdout.on("error", (err) => shutdown(`stdout ${err.code || "failed"}`));
+  process.stderr.on("error", () => {});
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 
   // No embedFn: init() auto-detects (neural ONNX when the model is cached,
   // built-in bag-of-words otherwise) and logs that choice to stderr, which
@@ -360,7 +439,7 @@ async function main() {
     strictEmbeddings: false,
   });
 
-  const transport = new StdioServerTransport();
+  if (shuttingDown) return; // told to stop while loading
   await server.connect(transport);
 }
 

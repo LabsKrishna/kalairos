@@ -211,6 +211,8 @@ function startServer(extraEnv = {}) {
     assert.deepStrictEqual(second.nonProtocol, [], `stdout carried non-protocol output:\n${second.nonProtocol.join("\n")}`);
     console.log("  [ok] stdout carried only JSON-RPC messages");
   } finally {
+    // Each server flushes its store into `dir` as it shuts down, and stop()
+    // waits for the exit, so the directory is only removed once both are gone.
     await stop();
     if (second) await second.stop();
     fs.rmSync(dir, { recursive: true, force: true });

@@ -90,6 +90,33 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   changed, created or removed is restored, including its versions, trail
   events and the links on its neighbours, before the next write runs. Other
   writes are untouched, so a batch running at the same time keeps its items.
+- **A failed append no longer leaves bytes in the JSONL file.** Adding a row
+  writes it, then fsyncs it. When either step failed, the write rejected but
+  what had reached the file stayed there. A row cut off partway (a full
+  disk, say) had no newline, so the next successful append joined onto it
+  and a reload skipped the joined line as malformed. The row lost was that
+  next one, which had been acknowledged. A whole row whose fsync failed came
+  back on reload. A short write, where fewer bytes land than were asked for
+  and no error is raised, was not checked at all, so a torn row was
+  acknowledged. A failed append now truncates the file back to its size
+  before the write and rethrows the original error, and a short write keeps
+  writing until the row is out or the disk reports an error.
+- **A full rewrite of the JSONL file can no longer truncate it.** Updates,
+  deletes, batches and `shutdown()` rewrite the whole file: they write a
+  temp file and rename it over the store. That write was one call whose byte
+  count was ignored, so when the disk filled partway, the torn temp file was
+  fsync'd and renamed into place, and every row past the cut was gone on the
+  next start. The rewrite now keeps writing until the whole file is out, or
+  throws the disk's error and leaves the store as it was.
+- **A crash in the middle of an append no longer costs the next row.** A
+  process that dies while adding a row can leave part of it at the end of
+  the file, with no newline. A reload skipped it, but the next append joined
+  onto it, so that row, which was acknowledged, was skipped on the reload
+  after. The same held for a whole last row that never got its newline: it
+  loaded, then the next append took both down. An append now checks the
+  file's last byte and starts on a new line when it is not a newline, with a
+  warning. The partial row stays in the file and loads keep skipping it
+  until the next full rewrite drops it.
 - **A batch op that fails leaves nothing behind.** `ingestBatch()`,
   `extractFacts()` and `importMarkdown()` wrote their items one at a time and
   flushed once at the end. When that flush failed, or an item was rejected

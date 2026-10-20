@@ -131,7 +131,8 @@ let CFG         = { ...DEFAULTS };
 let store       = null;        // StoreAdapter (FileStore or PgStore)
 let _pool       = null;        // persistent WorkerPool
 let _initialized = false;
-let _skipIO        = 0;    // ref-counted; > 0 suppresses per-item I/O during batch ops
+let _skipIO        = false; // true only while a write-lock body runs whose I/O a later flush covers
+let _undo          = null;  // the running lock body's journal (see _touch); null outside one
 
 // Embedding cache — see _embed. A Map is the LRU: insertion order is iteration
 // order, so re-inserting on a hit moves an entry to the back and the oldest is
@@ -203,9 +204,9 @@ function _newId() { return _nextId++; }
 //
 //  1. Coalescing: _drainWrites() uses setImmediate so writes that arrive while
 //     embeddings are in flight accumulate before the drain runs. When ≥ 2 writes
-//     are pending, _skipIO is bumped for the batch and _persistAll() is called
-//     once at the end instead of once per write. Under sustained load (100s–1000s
-//     of concurrent ingests) this collapses N file-syncs into 1 per event-loop
+//     are pending, per-write I/O is skipped and _persistAll() is called once at
+//     the end instead of once per write. Under sustained load (100s–1000s of
+//     concurrent ingests) this collapses N file-syncs into 1 per event-loop
 //     tick, the dominant throughput bottleneck.
 //
 //  2. Backpressure: if _pendingWrites already holds writeQueueMax entries, new
@@ -215,6 +216,14 @@ function _newId() { return _nextId++; }
 //
 // All fn bodies must be synchronous (no await inside the lock). This keeps the
 // critical section fast and avoids nested lock acquisition.
+//
+// A batch op is one write like any other (see _ingestAll). I/O suppression is
+// decided per write by _drainWrites and never held across an await, so every
+// write reaches disk before its promise settles, even while a batch op is
+// being prepared.
+//
+// A body must _touch(id) each entity before it changes, adds or removes it, so
+// a write that rejects can be taken back out of memory (see Write rollback).
 
 function _withWriteLock(fn) {
   const max = CFG.writeQueueMax;
@@ -232,39 +241,98 @@ function _withWriteLock(fn) {
 }
 
 function _drainWrites() {
-  // Loop: after each batch, check if new items arrived while we were settling.
-  while (_pendingWrites.length > 0) {
-    const batch   = _pendingWrites.splice(0); // grab everything pending right now
-    const isMulti = batch.length > 1;
+  try {
+    // Loop: after each batch, check if new items arrived while we were settling.
+    while (_pendingWrites.length > 0) {
+      const batch   = _pendingWrites.splice(0); // grab everything pending right now
+      const isMulti = batch.length > 1;
 
-    // Suppress per-item I/O for multi-write batches; one flush covers them all.
-    if (isMulti) _skipIO++;
+      const settled = [];
+      for (const item of batch) {
+        // Skip this write's own I/O when the single flush below covers it.
+        _skipIO = isMulti;
+        const undo = _undo = new Map();
+        try {
+          settled.push({ ok: true,  item, undo, value: item.fn() });
+        } catch (err) {
+          _rollback(undo); // it rejects, so nothing it changed may stay
+          settled.push({ ok: false, item, error: err });
+        } finally {
+          _skipIO = false;
+          _undo   = null;
+        }
+      }
 
-    const settled = [];
-    for (const item of batch) {
-      try {
-        settled.push({ ok: true,  resolve: item.resolve, value: item.fn() });
-      } catch (err) {
-        settled.push({ ok: false, reject:  item.reject,  error: err });
+      // The single flush for the micro-batch. A sync store rethrows I/O errors
+      // here; none of these writes reached disk, so each one that would have
+      // resolved rejects with that error, as a single write's would, and is
+      // taken back out of memory. Newest first: each journal holds what its
+      // write saw, which includes the writes before it.
+      let flushError = null;
+      if (isMulti) {
+        try { _persistAll(); } catch (err) {
+          flushError = err;
+          for (let i = settled.length - 1; i >= 0; i--) {
+            if (settled[i].ok) _rollback(settled[i].undo);
+          }
+        }
+      }
+
+      // Settle all promises after the flush so callers receive confirmed IDs.
+      for (const s of settled) {
+        if (!s.ok)           s.item.reject(s.error);
+        else if (flushError) s.item.reject(flushError);
+        else                 s.item.resolve(s.value);
       }
     }
-
-    if (isMulti) {
-      _skipIO--;
-      // _persistAll() honours the outer _skipIO counter: if we are nested inside
-      // an ingestBatch/_extractFacts call (skipIO > 0), this is a no-op — the
-      // caller's own _persistAll() will flush at the end of its loop. Otherwise
-      // this is the single flush for the entire micro-batch.
-      _persistAll();
-    }
-
-    // Settle all promises after the flush so callers receive confirmed IDs.
-    for (const s of settled) {
-      if (s.ok) s.resolve(s.value);
-      else      s.reject(s.error);
-    }
+  } finally {
+    _draining = false;
   }
-  _draining = false;
+}
+
+// ─── Write rollback ───────────────────────────────────────────────────────────
+// A write that rejects must leave nothing behind. Its lock body changes the
+// in-memory store before its I/O runs, and _persistAll() rewrites the whole
+// JSONL from memory, so a change left in place after a failed persist would be
+// served by reads and then written to disk by the next, unrelated flush.
+//
+// _drainWrites gives each lock body a journal. The body calls _touch(id)
+// before it changes, adds or removes an entity, which keeps a copy of it as it
+// was (or notes that the id was absent). If the body throws, or the shared
+// flush for its micro-batch fails, _rollback() puts the copies back. All of it
+// is synchronous, so nothing else can have changed those entities in between.
+//
+// Only what the write changed is restored. Reloading from disk would also
+// throw away the other writes in the same drain, which wait in memory for its
+// shared flush, and they would then be acknowledged without being stored.
+
+const ABSENT = Symbol("absent");
+
+function _touch(id) {
+  if (!_undo || _undo.has(id)) return;
+  const e = store.get(id);
+  _undo.set(id, e ? _copyEntity(e) : ABSENT);
+}
+
+// Deep enough that no in-place change to the live entity reaches the copy:
+// containers are copied, and so is each version, since a write closes validTo
+// on the latest one in place. Vectors are only ever replaced, so are shared.
+function _copyEntity(e) {
+  return {
+    ...e,
+    links:       new Set(e.links),
+    metadata:    e.metadata && { ...e.metadata },
+    tags:        Array.isArray(e.tags) ? [...e.tags] : e.tags,
+    versions:    Array.isArray(e.versions) ? e.versions.map(v => ({ ...v })) : e.versions,
+    trailEvents: Array.isArray(e.trailEvents) ? [...e.trailEvents] : e.trailEvents,
+  };
+}
+
+function _rollback(undo) {
+  for (const [id, before] of undo) {
+    if (before === ABSENT) store.delete(id);
+    else                   store.set(id, before);
+  }
 }
 
 // Canonicalizes provenance input. Accepts a string shorthand ("user", "agent", ...)
@@ -320,6 +388,7 @@ function _appendTrailEvent(entity, event) {
   if (!isValidAction(event.action)) {
     throw emitError(Err.validation(`Unknown action "${event.action}". Must be one of: ${Object.values(ACTIONS).join(", ")}`));
   }
+  _touch(entity.id);
   if (!Array.isArray(entity.trailEvents)) entity.trailEvents = [];
   entity.trailEvents.unshift(event);
   // Newest-first, so truncating from the end drops the oldest events — the
@@ -421,8 +490,10 @@ function _serializeEntity(e, { truncateText } = {}) {
 // ─── Shared Graph Unlink ─────────────────────────────────────────────────────
 
 function _unlinkEntity(entity, entityId) {
+  _touch(entityId);
   for (const linkedId of entity.links) {
-    store.get(linkedId)?.links.delete(entityId);
+    const other = store.get(linkedId);
+    if (other) { _touch(linkedId); other.links.delete(entityId); }
   }
   entity.links.clear();
 }
@@ -469,7 +540,8 @@ async function init(overrides = {}) {
   if (_pool) { await _pool.stop(); _pool = null; }
 
   CFG            = { ...DEFAULTS, ...overrides };
-  _skipIO        = 0;      // reset batch-suppress counter
+  _skipIO        = false;  // reset per-write I/O suppression
+  _undo          = null;   // no lock body is running
   _pendingWrites = [];     // drop any queued mutations from previous session
   _draining      = false;  // drain state reset
   // Not merely stale — WRONG. init() may install a different embedFn or a
@@ -636,7 +708,7 @@ function _serializeForIO(entity) {
 }
 
 function _persistAll() {
-  if (_skipIO > 0) return;
+  if (_skipIO) return;
 
   const rows = Array.from(store.values()).map(_serializeForIO);
   try {
@@ -654,8 +726,8 @@ function _persistAll() {
   } catch (err) {
     // Sync store path (FileStore). Rethrow so the caller (typically ingest())
     // rejects with the I/O error instead of acknowledging a write that didn't
-    // reach disk. In-memory state is now divergent from disk; the next process
-    // start re-loads from disk, which is the source of truth.
+    // reach disk. Inside a write lock, _drainWrites then takes the failed
+    // writes back out of memory (see _touch), so no later flush writes them.
     emitError(Err.persistFailed(err.message, err));
     console.error(`[kalairos] Persistence failed: ${err.message}`);
     throw err;
@@ -676,24 +748,8 @@ function _persistAll() {
   }
 }
 
-// Run a batch of ingests as a single I/O transaction: suppress per-item
-// persistence via the _skipIO counter, always restore it (even on throw),
-// then flush once with _persistAll(). On error, the counter is restored but
-// the flush is skipped — matching the hand-rolled try/finally this replaces.
-async function _withBatchedIO(fn) {
-  _skipIO++;
-  let result;
-  try {
-    result = await fn();
-  } finally {
-    _skipIO--;
-  }
-  _persistAll();
-  return result;
-}
-
 function _appendEntity(entity) {
-  if (_skipIO > 0) return;
+  if (_skipIO) return;
   const row = _serializeForIO(entity);
   try {
     const result = store.appendEntity(row, CFG);
@@ -956,9 +1012,11 @@ async function _extractFacts(text, type) {
 // is not the default. Confining at write time makes the isolation hold for
 // every caller. Sibling of the ingest()/consolidate() candidate scans.
 function _relinkEntity(entity) {
+  _touch(entity.id);
   // Remove stale back-links from other entities before clearing own links
   for (const linkedId of entity.links) {
-    store.get(linkedId)?.links.delete(entity.id);
+    const other = store.get(linkedId);
+    if (other) { _touch(linkedId); other.links.delete(entity.id); }
   }
   entity.links.clear();
 
@@ -967,6 +1025,7 @@ function _relinkEntity(entity) {
     if (otherId === entity.id) continue;
     if (_wsOf(other) !== ws) continue;
     if (cosine(entity.vector, other.vector) >= CFG.linkThreshold) {
+      _touch(otherId);
       entity.links.add(otherId);
       other.links.add(entity.id);
     }
@@ -1014,7 +1073,14 @@ function _pruneCrossWorkspaceLinks() {
  * @param {{ type?, timestamp?, metadata?, tags?, source?, classification? }} opts
  * @returns {number} stable entity ID (never changes across updates)
  */
-async function ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false, who, why, effectiveAt } = {}) {
+async function ingest(text, opts) {
+  return _withWriteLock(await _prepareIngest(text, opts));
+}
+
+// Phase 1 of an ingest: validate, embed and enrich, outside the write lock.
+// Resolves with phase 2, the synchronous lock body that applies the write and
+// returns the entity id. Nothing before that body reads or changes the store.
+async function _prepareIngest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false, who, why, effectiveAt } = {}) {
   _assertInit();
 
   const ts       = timestamp || Date.now();
@@ -1063,7 +1129,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
   // ── Phase 2: critical section (serialised via write lock) ─────────────────
   // All store reads, mutations, graph relinking, and persistence happen here.
   // The body is synchronous so the lock is held for the minimum possible time.
-  return _withWriteLock(() => {
+  return () => {
     // ── Find closest existing entity of the same type ───────────────────────
     // Two tiers: versionThreshold for direct updates, consolidationThreshold for
     // near-duplicate detection so the same fact expressed differently merges
@@ -1097,6 +1163,7 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
 
     // ── Update / Consolidation path: merge into existing entity ─────────────
     if (mergeTarget) {
+      _touch(mergeTarget.id);
       const latest = mergeTarget.versions[0];
       const sameContent = latest && latest.text === safeText;
       const sameSource  = latest && (latest.source?.type === src.type)
@@ -1293,12 +1360,13 @@ async function ingest(text, { type = "text", timestamp, metadata = {}, tags = []
       trailEvents: [],
     };
 
+    _touch(id); // absent: undoing the write removes it
     store.set(id, entity);
     _relinkEntity(entity);
     _appendEntity(entity);
     console.error(`[kalairos] Created entity ${id} [${type}]`);
     return id;
-  });
+  };
 }
 
 /**
@@ -1340,8 +1408,38 @@ async function remember(text, opts = {}) {
 
 // ─── Batch Ingest ─────────────────────────────────────────────────────────────
 
+// Ingest [text, opts] entries as one write, all or nothing. Every entry is
+// prepared first (embedded, enriched, checked), one at a time as single
+// writes are, and none is applied until all are. Then a single lock body
+// applies them in order, so each item sees the ones before it, and flushes
+// once.
+//
+// Until that body runs, nothing of the batch is in the store: no read serves
+// an item, and no other write's flush can write one. Other writes run while
+// the batch is being prepared and are kept whatever the batch does. If an
+// entry fails to prepare, nothing is applied. If applying an item throws, or
+// the flush fails, _drainWrites rolls back the body's one journal, which holds
+// every entity as it was before the batch's first item.
+async function _ingestAll(entries) {
+  const writes = [];
+  for (const [text, opts] of entries) writes.push(await _prepareIngest(text, opts));
+  return _withWriteLock(() => {
+    // Each item's own I/O is skipped. The flush below covers them all, or the
+    // drain's shared flush does when this write is coalesced with others.
+    const skip = _skipIO;
+    _skipIO = true;
+    let ids;
+    try { ids = writes.map(apply => apply()); }
+    finally { _skipIO = skip; }
+    _persistAll();
+    return ids;
+  });
+}
+
 /**
- * Ingest multiple items atomically — persists once at the end instead of after each item.
+ * Ingest multiple items atomically: every item is stored, or the call rejects
+ * and none is. The items are applied together, in order, and persisted with
+ * one flush. Until the call resolves, none of them can be read.
  * @param {Array<{ text: string, type?, metadata?, tags?, timestamp?, source?, classification? }>} items
  * @returns {number[]} array of entity IDs in the same order as input
  */
@@ -1351,21 +1449,18 @@ async function ingestBatch(items, { allowedWorkspaces } = {}) {
     throw emitError(Err.validation("items must be a non-empty array"));
   }
 
-  return _withBatchedIO(async () => {
-    const ids = [];
-    for (const item of items) {
-      const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore } = item || {};
-      ids.push(await ingest(text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, allowedWorkspaces }));
-    }
-    return ids;
-  });
+  return _ingestAll(items.map(item => {
+    const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore } = item || {};
+    return [text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, allowedWorkspaces }];
+  }));
 }
 
 // ─── Fact Extraction + Ingest ────────────────────────────────────────────────
 
 /**
  * Extract discrete facts from raw text and ingest each as a separate entity.
- * Requires factExtractFn to be configured via init().
+ * Requires factExtractFn to be configured via init(). The facts are stored
+ * atomically, as by ingestBatch().
  *
  * @param {string} text — raw text (meeting notes, paragraphs, etc.)
  * @param {{ type?, timestamp?, metadata?, tags?, source?, classification?, retention?, memoryType?, workspaceId?, useLLM? }} opts
@@ -1381,18 +1476,12 @@ async function extractFacts(text, opts = {}) {
   const facts = await _extractFacts(safeText, opts.type || "text");
   if (!facts.length) return { facts: [], ids: [] };
 
-  // Ingest each fact as its own entity, batched for single persist
-  const ids = await _withBatchedIO(async () => {
-    const out = [];
-    for (const fact of facts) {
-      out.push(await ingest(fact, {
-        ...opts,
-        metadata: { ...(opts.metadata || {}), extractedFrom: safeText.slice(0, 200) },
-        allowedWorkspaces: opts.allowedWorkspaces,
-      }));
-    }
-    return out;
-  });
+  // Ingest each fact as its own entity, all in one write
+  const ids = await _ingestAll(facts.map(fact => [fact, {
+    ...opts,
+    metadata: { ...(opts.metadata || {}), extractedFrom: safeText.slice(0, 200) },
+    allowedWorkspaces: opts.allowedWorkspaces,
+  }]));
 
   console.error(`[kalairos] Extracted ${facts.length} facts from raw text`);
   return { facts, ids };
@@ -2044,6 +2133,7 @@ async function remove(id, { deletedBy, allowedWorkspaces, reason, who } = {}) {
     if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No admin access to workspace "${e.workspaceId || "default"}".`));
     if (e.deletedAt) throw emitError(Err.alreadyDeleted(id));
 
+    _touch(numId);
     _unlinkEntity(e, numId);
     const now = Date.now();
     e.deletedAt = now;
@@ -2117,6 +2207,7 @@ async function restore(id, { reason, who, allowedWorkspaces } = {}) {
     if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No admin access to workspace "${e.workspaceId || "default"}".`));
     if (!e.deletedAt) throw emitError(Err.validation(`Entity ${numId} is not deleted; nothing to restore.`));
 
+    _touch(numId);
     const now = Date.now();
     e.deletedAt = null;
     e.deletedBy = null;
@@ -2161,6 +2252,7 @@ async function purge(id, { allowedWorkspaces } = {}) {
     if (!e) throw emitError(Err.notFound(id));
     if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No admin access to workspace "${e.workspaceId || "default"}".`));
 
+    _touch(numId);
     _unlinkEntity(e, numId);
     store.delete(numId);
     _persistAll();
@@ -2241,6 +2333,8 @@ async function consolidate({ threshold, dryRun = false, type, allowedWorkspaces 
         });
 
         if (!dryRun) {
+          _touch(keeper.id);
+          _touch(dup.id);
           // Merge tags and metadata from duplicate into keeper
           keeper.tags = Array.from(new Set([...(keeper.tags || []), ...(dup.tags || [])]));
           keeper.metadata = { ...dup.metadata, ...keeper.metadata };
@@ -2500,6 +2594,7 @@ async function exportMarkdown({ filter, includeHistory = false, allowedWorkspace
  *
  * Also supports simple format: any line starting with "- " or "* " is treated
  * as a separate fact, making it easy for agents to just write bullet lists.
+ * The facts are stored atomically, as by ingestBatch().
  *
  * @param {string} mdText — markdown string
  * @param {{ source?, classification?, memoryType?, workspaceId?, tags? }} defaults
@@ -2511,18 +2606,11 @@ async function importMarkdown(mdText, defaults = {}) {
   if (mode === "empty") return { imported: 0, ids: [] };
 
   const allowedWorkspaces = defaults.allowedWorkspaces;
-  const ids = await _withBatchedIO(async () => {
-    const out = [];
-    for (const fact of facts) {
-      // Structured sections carry their own type; bullet facts inherit it
-      // from the caller's defaults.
-      const opts = fact.type
-        ? { ...defaults, type: fact.type, allowedWorkspaces }
-        : { ...defaults, allowedWorkspaces };
-      out.push(await ingest(fact.text, opts));
-    }
-    return out;
-  });
+  // One write for the whole file, as ingestBatch() does. Structured sections
+  // carry their own type; bullet facts inherit it from the caller's defaults.
+  const ids = await _ingestAll(facts.map(fact => [fact.text, fact.type
+    ? { ...defaults, type: fact.type, allowedWorkspaces }
+    : { ...defaults, allowedWorkspaces }]));
   console.error(`[kalairos] Imported ${ids.length} entities from ${mode} markdown`);
   return { imported: ids.length, ids };
 }
@@ -2643,6 +2731,7 @@ async function annotate(id, { trustScore, verified, notes, memoryType, classific
     if (!_isAlive(e)) throw emitError(Err.alreadyDeleted(id));
     if (!_wsAllowed(e, allowedWorkspaces)) throw emitError(Err.forbidden(`No access to workspace "${e.workspaceId || "default"}".`));
 
+    _touch(numId);
     const diff = {};
     if (Number.isFinite(trustScore) && e.trustScore !== Math.max(0, Math.min(1, trustScore))) {
       diff.trustScore = { from: e.trustScore, to: Math.max(0, Math.min(1, trustScore)) };
@@ -3041,6 +3130,10 @@ async function listCheckpoints({ workspace } = {}) {
  */
 async function shutdown() {
   if (!_initialized) return; // safe to call even if init() was never called
+  // Run writes already queued behind the lock now, while the store is open,
+  // rather than counting on something below to yield to the drain's
+  // setImmediate. A stale setImmediate later finds the queue empty.
+  _drainWrites();
   _persistAll(); // final flush to backing store
   _embedCache.clear();
   if (_pool) { await _pool.stop(); _pool = null; }

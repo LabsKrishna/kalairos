@@ -359,6 +359,43 @@ async function seedClaim() {
     await assert.rejects(lib.describe("D-101"), /address/);
   });
 
+  // A thing and its links are one write: if it fails, none of it stays in
+  // memory, and no later flush puts any of it on disk.
+  await test("a linked write that fails leaves neither the thing nor its links", async () => {
+    const { FileStore } = require("../store/file-store");
+    const realPersistAll = FileStore.prototype.persistAll;
+    const dir  = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-keys-"));
+    const file = path.join(dir, "data.kalairos");
+    try {
+      await fresh({ dataFile: file });
+      await lib.ingest("Ironbark policy IB-114: six weeks of conservative therapy.", {
+        type: "policy", key: "IB-114", fields: { therapyWeeks: 6 }, source: LIBRARY,
+      });
+      FileStore.prototype.persistAll = () => {
+        throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      };
+      await assert.rejects(lib.ingest("Claim for lumbar microdiscectomy at L5-S1.", {
+        type: "claim", key: "D-102", links: [{ rel: "under", to: "policy:IB-114", one: true }],
+        source: CLEARINGHOUSE,
+      }), /ENOSPC/);
+      FileStore.prototype.persistAll = realPersistAll;
+
+      // The keys a reload would find: right now (a crash here), and after
+      // shutdown's final flush rewrites the file from memory.
+      const keysOnDisk = () => [...new Set(fs.readFileSync(file, "utf8").split("\n").filter(Boolean)
+        .map(l => JSON.parse(l).key))];
+      assert.deepEqual(keysOnDisk(), ["IB-114"], "the rejected write is on disk");
+      assert.equal(await lib.describe("claim:D-102"), null, "the rejected thing is still served");
+      assert.deepEqual((await lib.describe("policy:IB-114")).linkedFrom, [], "the rejected link is still served");
+      await lib.shutdown();
+      assert.deepEqual(keysOnDisk(), ["IB-114"], "a later flush wrote the rejected write");
+    } finally {
+      FileStore.prototype.persistAll = realPersistAll;
+      await lib.shutdown().catch(() => {});
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   await test("keys, fields and links survive a restart", async () => {
     const dir  = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-keys-"));
     const file = path.join(dir, "data.kalairos");

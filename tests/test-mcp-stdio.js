@@ -173,6 +173,9 @@ function startServer(extraEnv = {}) {
     const heldUntil = Date.now();
     second = startServer({ KALAIROS_MCP_AGENT: "intake-bot" });
     await second.handshake("other-host");
+    // The engine loads on a server's first tool call, whichever tool that is.
+    const firstCall = await second.tool("kalairos_describe", { address: "policy:IB-114" });
+    assert.deepStrictEqual(firstCall.fields, { therapyWeeks: 12 }, "describe as a server's first call reads the store");
     await second.tool("kalairos_remember", {
       text: "IB-114 now asks for four weeks.",
       type: "policy", key: "IB-114", fields: { therapyWeeks: 4 }, effectiveAt: "2026-07-01",

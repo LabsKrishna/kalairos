@@ -117,6 +117,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   file's last byte and starts on a new line when it is not a newline, with a
   warning. The partial row stays in the file and loads keep skipping it
   until the next full rewrite drops it.
+- **A batch op that fails leaves nothing behind.** `ingestBatch()`,
+  `extractFacts()` and `importMarkdown()` wrote their items one at a time and
+  flushed once at the end. When that flush failed, or an item was rejected
+  partway (text over `maxTextLen`, or a workspace the caller may not write),
+  the call rejected, but the items written before it stayed in memory. Reads
+  served them and the next flush put them on disk. Other writes run while a
+  batch waits on each embedding, so one of those could also flush the batch's
+  first items to disk before the batch had finished. A batch op now prepares
+  every item first and then applies them all in one write, with one flush.
+  None of its items can be read, or written to disk by another write, until
+  it resolves. If it rejects, memory and disk are as they were before it.
+  Items still apply in order, so a later item can update an earlier one, and
+  writes made while a batch is being prepared are kept either way. This makes
+  `ingestBatch()` atomic, as its documentation already said. One cost: a
+  batch's items now apply in a single synchronous step, so reads wait for the
+  whole batch rather than for one item at a time.
 
 ### Known issues
 
@@ -125,12 +141,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before this release, carry no record of the value they replaced, so a
   `queryAt` replay from before them reports the newer base. Every other
   change is reconstructed exactly.
-- **A batch whose own flush fails keeps its items in memory.** When the
-  single flush at the end of `ingestBatch()`, `extractFacts()` or
-  `importMarkdown()` fails, the call rejects, but the items it wrote stay in
-  memory and the next flush writes them. Other writes run between a batch's
-  items and can change the same entities, so undoing the batch is not yet
-  safe.
 
 ## [1.9.1] — 2026-10-13
 

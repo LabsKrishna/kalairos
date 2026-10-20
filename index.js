@@ -217,23 +217,21 @@ function _newId() { return _nextId++; }
 // All fn bodies must be synchronous (no await inside the lock). This keeps the
 // critical section fast and avoids nested lock acquisition.
 //
-// batchedIO marks a write made by a batch op (see _withBatchedIO), whose own
-// flush when it finishes covers the write, so the body may skip its I/O. Every
-// other write reaches disk before its promise settles, even while a batch op
-// is in flight. Suppression is decided per write, never for the whole process:
-// a batch holds the open window across its awaits, and an unrelated write that
-// lands inside it is acknowledged to a caller that is not waiting on the batch.
+// A batch op is one write like any other (see _ingestAll). I/O suppression is
+// decided per write by _drainWrites and never held across an await, so every
+// write reaches disk before its promise settles, even while a batch op is
+// being prepared.
 //
 // A body must _touch(id) each entity before it changes, adds or removes it, so
 // a write that rejects can be taken back out of memory (see Write rollback).
 
-function _withWriteLock(fn, batchedIO = false) {
+function _withWriteLock(fn) {
   const max = CFG.writeQueueMax;
   if (_pendingWrites.length >= max) {
     return Promise.reject(emitError(Err.writeQueueFull(_pendingWrites.length, max)));
   }
   return new Promise((resolve, reject) => {
-    _pendingWrites.push({ fn, batchedIO, resolve, reject });
+    _pendingWrites.push({ fn, resolve, reject });
     if (!_draining) {
       _draining = true;
       // Defer so writes that arrive in the same tick can accumulate first.
@@ -251,9 +249,8 @@ function _drainWrites() {
 
       const settled = [];
       for (const item of batch) {
-        // Skip this write's own I/O when a later flush covers it: the single
-        // flush below for a multi-write batch, or its batch op's own flush.
-        _skipIO = isMulti || item.batchedIO;
+        // Skip this write's own I/O when the single flush below covers it.
+        _skipIO = isMulti;
         const undo = _undo = new Map();
         try {
           settled.push({ ok: true,  item, undo, value: item.fn() });
@@ -266,15 +263,13 @@ function _drainWrites() {
         }
       }
 
-      // The single flush for the micro-batch. Skipped only when every write in
-      // it belongs to a batch op, which flushes when it finishes; anything else
-      // must be on disk before its promise settles. A sync store rethrows I/O
-      // errors here; none of these writes reached disk, so each one that would
-      // have resolved rejects with that error, as a single write's would, and
-      // is taken back out of memory. Newest first: each journal holds what its
+      // The single flush for the micro-batch. A sync store rethrows I/O errors
+      // here; none of these writes reached disk, so each one that would have
+      // resolved rejects with that error, as a single write's would, and is
+      // taken back out of memory. Newest first: each journal holds what its
       // write saw, which includes the writes before it.
       let flushError = null;
-      if (isMulti && batch.some(item => !item.batchedIO)) {
+      if (isMulti) {
         try { _persistAll(); } catch (err) {
           flushError = err;
           for (let i = settled.length - 1; i >= 0; i--) {
@@ -308,8 +303,8 @@ function _drainWrites() {
 // is synchronous, so nothing else can have changed those entities in between.
 //
 // Only what the write changed is restored. Reloading from disk would also
-// throw away a batch op's items, which wait in memory for the batch's own
-// flush, and the batch would then report them stored.
+// throw away the other writes in the same drain, which wait in memory for its
+// shared flush, and they would then be acknowledged without being stored.
 
 const ABSENT = Symbol("absent");
 
@@ -753,17 +748,6 @@ function _persistAll() {
   }
 }
 
-// Run a batch of ingests as a single I/O transaction: the body ingests each
-// item with _ingest(text, opts, true), which skips that write's own I/O, then
-// this flushes once with _persistAll(). On error the flush is skipped. Only
-// the batch's own writes are deferred; a concurrent write from any other
-// caller persists as usual.
-async function _withBatchedIO(fn) {
-  const result = await fn();
-  _persistAll();
-  return result;
-}
-
 function _appendEntity(entity) {
   if (_skipIO) return;
   const row = _serializeForIO(entity);
@@ -1090,13 +1074,13 @@ function _pruneCrossWorkspaceLinks() {
  * @returns {number} stable entity ID (never changes across updates)
  */
 async function ingest(text, opts) {
-  return _ingest(text, opts, false);
+  return _withWriteLock(await _prepareIngest(text, opts));
 }
 
-// The body of ingest(). batchedIO is true only from inside _withBatchedIO,
-// whose flush covers the write; see _withWriteLock. Kept off the public
-// signature so no caller can ask for an acknowledgement before fsync.
-async function _ingest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false, who, why, effectiveAt } = {}, batchedIO = false) {
+// Phase 1 of an ingest: validate, embed and enrich, outside the write lock.
+// Resolves with phase 2, the synchronous lock body that applies the write and
+// returns the entity id. Nothing before that body reads or changes the store.
+async function _prepareIngest(text, { type = "text", timestamp, metadata = {}, tags = [], source, classification, retention, memoryType, workspaceId, useLLM = false, importance, trustScore, allowedWorkspaces, forceNew = false, who, why, effectiveAt } = {}) {
   _assertInit();
 
   const ts       = timestamp || Date.now();
@@ -1145,7 +1129,7 @@ async function _ingest(text, { type = "text", timestamp, metadata = {}, tags = [
   // ── Phase 2: critical section (serialised via write lock) ─────────────────
   // All store reads, mutations, graph relinking, and persistence happen here.
   // The body is synchronous so the lock is held for the minimum possible time.
-  return _withWriteLock(() => {
+  return () => {
     // ── Find closest existing entity of the same type ───────────────────────
     // Two tiers: versionThreshold for direct updates, consolidationThreshold for
     // near-duplicate detection so the same fact expressed differently merges
@@ -1382,7 +1366,7 @@ async function _ingest(text, { type = "text", timestamp, metadata = {}, tags = [
     _appendEntity(entity);
     console.error(`[kalairos] Created entity ${id} [${type}]`);
     return id;
-  }, batchedIO);
+  };
 }
 
 /**
@@ -1424,8 +1408,38 @@ async function remember(text, opts = {}) {
 
 // ─── Batch Ingest ─────────────────────────────────────────────────────────────
 
+// Ingest [text, opts] entries as one write, all or nothing. Every entry is
+// prepared first (embedded, enriched, checked), one at a time as single
+// writes are, and none is applied until all are. Then a single lock body
+// applies them in order, so each item sees the ones before it, and flushes
+// once.
+//
+// Until that body runs, nothing of the batch is in the store: no read serves
+// an item, and no other write's flush can write one. Other writes run while
+// the batch is being prepared and are kept whatever the batch does. If an
+// entry fails to prepare, nothing is applied. If applying an item throws, or
+// the flush fails, _drainWrites rolls back the body's one journal, which holds
+// every entity as it was before the batch's first item.
+async function _ingestAll(entries) {
+  const writes = [];
+  for (const [text, opts] of entries) writes.push(await _prepareIngest(text, opts));
+  return _withWriteLock(() => {
+    // Each item's own I/O is skipped. The flush below covers them all, or the
+    // drain's shared flush does when this write is coalesced with others.
+    const skip = _skipIO;
+    _skipIO = true;
+    let ids;
+    try { ids = writes.map(apply => apply()); }
+    finally { _skipIO = skip; }
+    _persistAll();
+    return ids;
+  });
+}
+
 /**
- * Ingest multiple items atomically — persists once at the end instead of after each item.
+ * Ingest multiple items atomically: every item is stored, or the call rejects
+ * and none is. The items are applied together, in order, and persisted with
+ * one flush. Until the call resolves, none of them can be read.
  * @param {Array<{ text: string, type?, metadata?, tags?, timestamp?, source?, classification? }>} items
  * @returns {number[]} array of entity IDs in the same order as input
  */
@@ -1435,21 +1449,18 @@ async function ingestBatch(items, { allowedWorkspaces } = {}) {
     throw emitError(Err.validation("items must be a non-empty array"));
   }
 
-  return _withBatchedIO(async () => {
-    const ids = [];
-    for (const item of items) {
-      const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore } = item || {};
-      ids.push(await _ingest(text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, allowedWorkspaces }, true));
-    }
-    return ids;
-  });
+  return _ingestAll(items.map(item => {
+    const { text, type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore } = item || {};
+    return [text, { type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, trustScore, allowedWorkspaces }];
+  }));
 }
 
 // ─── Fact Extraction + Ingest ────────────────────────────────────────────────
 
 /**
  * Extract discrete facts from raw text and ingest each as a separate entity.
- * Requires factExtractFn to be configured via init().
+ * Requires factExtractFn to be configured via init(). The facts are stored
+ * atomically, as by ingestBatch().
  *
  * @param {string} text — raw text (meeting notes, paragraphs, etc.)
  * @param {{ type?, timestamp?, metadata?, tags?, source?, classification?, retention?, memoryType?, workspaceId?, useLLM? }} opts
@@ -1465,18 +1476,12 @@ async function extractFacts(text, opts = {}) {
   const facts = await _extractFacts(safeText, opts.type || "text");
   if (!facts.length) return { facts: [], ids: [] };
 
-  // Ingest each fact as its own entity, batched for single persist
-  const ids = await _withBatchedIO(async () => {
-    const out = [];
-    for (const fact of facts) {
-      out.push(await _ingest(fact, {
-        ...opts,
-        metadata: { ...(opts.metadata || {}), extractedFrom: safeText.slice(0, 200) },
-        allowedWorkspaces: opts.allowedWorkspaces,
-      }, true));
-    }
-    return out;
-  });
+  // Ingest each fact as its own entity, all in one write
+  const ids = await _ingestAll(facts.map(fact => [fact, {
+    ...opts,
+    metadata: { ...(opts.metadata || {}), extractedFrom: safeText.slice(0, 200) },
+    allowedWorkspaces: opts.allowedWorkspaces,
+  }]));
 
   console.error(`[kalairos] Extracted ${facts.length} facts from raw text`);
   return { facts, ids };
@@ -2589,6 +2594,7 @@ async function exportMarkdown({ filter, includeHistory = false, allowedWorkspace
  *
  * Also supports simple format: any line starting with "- " or "* " is treated
  * as a separate fact, making it easy for agents to just write bullet lists.
+ * The facts are stored atomically, as by ingestBatch().
  *
  * @param {string} mdText — markdown string
  * @param {{ source?, classification?, memoryType?, workspaceId?, tags? }} defaults
@@ -2600,18 +2606,11 @@ async function importMarkdown(mdText, defaults = {}) {
   if (mode === "empty") return { imported: 0, ids: [] };
 
   const allowedWorkspaces = defaults.allowedWorkspaces;
-  const ids = await _withBatchedIO(async () => {
-    const out = [];
-    for (const fact of facts) {
-      // Structured sections carry their own type; bullet facts inherit it
-      // from the caller's defaults.
-      const opts = fact.type
-        ? { ...defaults, type: fact.type, allowedWorkspaces }
-        : { ...defaults, allowedWorkspaces };
-      out.push(await _ingest(fact.text, opts, true));
-    }
-    return out;
-  });
+  // One write for the whole file, as ingestBatch() does. Structured sections
+  // carry their own type; bullet facts inherit it from the caller's defaults.
+  const ids = await _ingestAll(facts.map(fact => [fact.text, fact.type
+    ? { ...defaults, type: fact.type, allowedWorkspaces }
+    : { ...defaults, allowedWorkspaces }]));
   console.error(`[kalairos] Imported ${ids.length} entities from ${mode} markdown`);
   return { imported: ids.length, ids };
 }

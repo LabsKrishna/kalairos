@@ -101,6 +101,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   acknowledged. A failed append now truncates the file back to its size
   before the write and rethrows the original error, and a short write keeps
   writing until the row is out or the disk reports an error.
+- **A full rewrite of the JSONL file can no longer truncate it.** Updates,
+  deletes, batches and `shutdown()` rewrite the whole file: they write a
+  temp file and rename it over the store. That write was one call whose byte
+  count was ignored, so when the disk filled partway, the torn temp file was
+  fsync'd and renamed into place, and every row past the cut was gone on the
+  next start. The rewrite now keeps writing until the whole file is out, or
+  throws the disk's error and leaves the store as it was.
+- **A crash in the middle of an append no longer costs the next row.** A
+  process that dies while adding a row can leave part of it at the end of
+  the file, with no newline. A reload skipped it, but the next append joined
+  onto it, so that row, which was acknowledged, was skipped on the reload
+  after. The same held for a whole last row that never got its newline: it
+  loaded, then the next append took both down. An append now checks the
+  file's last byte and starts on a new line when it is not a newline, with a
+  warning. The partial row stays in the file and loads keep skipping it
+  until the next full rewrite drops it.
 
 ### Known issues
 
@@ -115,11 +131,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   memory and the next flush writes them. Other writes run between a batch's
   items and can change the same entities, so undoing the batch is not yet
   safe.
-- **A crash in the middle of an append can still cost the next row.** A
-  failed append is undone, but a process that dies mid-write cannot undo
-  anything. The reload skips the partial row, and the next append joins
-  onto it, so that row is skipped on the reload after, unless a full
-  rewrite of the file happens first.
 
 ## [1.9.1] — 2026-10-13
 

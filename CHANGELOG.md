@@ -55,6 +55,23 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `until` arrives as `null`. A missing `since` was 0 rather than -Infinity,
   which dropped anything stamped before 1970. Both bounds are now
   open-ended when omitted.
+- **A write acknowledged during a batch is on disk.** While `ingestBatch()`,
+  `extractFacts()` or `importMarkdown()` was running, every write in the
+  process skipped its own fsync, not only the batch's items. A `remember()`
+  from another caller (or `kalairos_remember` over MCP while
+  `kalairos_batch_store` ran) resolved with its id while the row sat in
+  memory until the batch's final flush, so a crash or SIGKILL in that window
+  lost a write the caller had been told was stored. The same held for a
+  delete, for concurrent writes coalesced into one flush, and for a second
+  batch that finished while the first was still running. Only a batch's own
+  items now wait for its single flush; every other write reaches the JSONL
+  file, and the SQLite index when enabled, before it is acknowledged.
+- **`shutdown()` runs queued writes before its final flush.** A write already
+  queued behind the write lock when `shutdown()` started ran only if tearing
+  down the worker pool happened to yield to the event loop first. With a pool
+  that stopped at once, `shutdown()` resolved with the write still queued and
+  a following `init()` dropped it. Queued writes now run first, while the
+  store is open.
 
 ### Known issues
 

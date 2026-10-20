@@ -206,11 +206,14 @@ async function withServer(fn, { preload = "" } = {}) {
     });
   });
 
-  // A failed final flush must not report success.
+  // A failed final flush must not report success. The engine loads on the
+  // first tool call, so these two cases make one: a server that never loaded
+  // it has no flush to fail or stall.
   await test("exits 1 when the final flush fails", async () => {
     const preload = `require(${JSON.stringify(ENGINE)}).shutdown = async () => { throw new Error("disk full"); };`;
     await withServer(async (server) => {
       await server.handshake();
+      await server.call("kalairos_status", {});
       server.child.stdin.end();
       const { code } = await server.exit();
       assert.equal(code, 1, tail(server.stderr()));
@@ -223,6 +226,7 @@ async function withServer(fn, { preload = "" } = {}) {
     const preload = `require(${JSON.stringify(ENGINE)}).shutdown = () => new Promise(() => {});`;
     await withServer(async (server) => {
       await server.handshake();
+      await server.call("kalairos_status", {});
       server.child.stdin.end();
       const { code } = await server.exit(SHUTDOWN_TIMEOUT_MS + EXIT_WITHIN_MS);
       assert.equal(code, 1, tail(server.stderr()));

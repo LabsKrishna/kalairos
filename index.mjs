@@ -18,6 +18,7 @@ export const {
   queryAt,
   queryValidAt,
   queryRange,
+  describe,
   get,
   getMany,
   remove,

@@ -171,10 +171,11 @@ const clone  = (o) => JSON.parse(JSON.stringify(o));
     assert.equal(summary.cases, 26);
   });
 
-  await test("a revision that lands on the wrong record is reported, not scored", async () => {
-    // Same key, unrelated text: nothing is similar enough to merge into, so
-    // the engine creates a second record. The harness must flag that instead
-    // of letting a broken fixture pass as a time-travel result.
+  await test("a reworded revision lands on its record; a wrong landing is still reported", async () => {
+    // Same key, unrelated text. Identity comes from the key, so the revision
+    // lands on its own record however it is worded. If the engine ever put it
+    // on another record, the harness must flag that instead of letting it
+    // pass as a time-travel result.
     const t = Date.parse("2026-05-01T09:00:00Z");
     const broken = {
       id: "PA-9999", policy: "MP-114", requestAt: t, decisionAt: t + F.DAY, reviewAt: t + 30 * F.DAY,
@@ -186,13 +187,24 @@ const clone  = (o) => JSON.parse(JSON.stringify(o));
       ],
     };
     const unmuteLocal = R.muteEngineLog();
+    const realIngest  = lib.ingest;
     try {
+      await R.initEngine();
+      const keyed = await R.load([broken]);
+      assert.deepEqual(keyed.identityMisses, [], "the key holds identity, not the wording");
+
+      // Simulate an engine that forks the revision onto another record.
+      lib.ingest = async (text, opts) => {
+        const id = await realIngest(text, opts);
+        return text === broken.writes[1].text ? `${id}-elsewhere` : id;
+      };
       await R.initEngine();
       const { identityMisses } = await R.load([broken]);
       assert.equal(identityMisses.length, 1, "the forked revision is caught");
       assert.equal(identityMisses[0].key, "imaging");
       assert.notEqual(identityMisses[0].got, identityMisses[0].expected);
     } finally {
+      lib.ingest = realIngest;
       await lib.shutdown().catch(() => {});
       unmuteLocal();
     }

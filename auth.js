@@ -15,7 +15,7 @@ const crypto = require("crypto");
 const ROLES = Object.freeze({ read: 1, write: 2, admin: 3, owner: 4 });
 
 const PERMISSIONS = Object.freeze({
-  read:  1,   // query, get, getMany, list, history, graph, traverse, status, export
+  read:  1,   // query, describe, get, getMany, list, history, graph, traverse, status, export
   write: 2,   // ingest, remember, batch, timeseries, file, extractFacts, import, consolidate
   admin: 3,   // remove, purge
   owner: 4,   // grant/revoke workspace access

@@ -129,6 +129,14 @@ class MemoryScope {
   }
 
   /**
+   * Everything about one keyed thing ("type:key"), read on both clocks, in
+   * this scope's workspace unless `opts.workspaceId` names another.
+   */
+  async describe(address, opts = {}) {
+    return this._engine.describe(address, { ...opts, workspaceId: opts.workspaceId || this.workspaceId || undefined });
+  }
+
+  /**
    * Full version history and provenance trail for an entity.
    */
   async getHistory(id) {

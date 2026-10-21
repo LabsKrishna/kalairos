@@ -54,7 +54,7 @@ async function runFixture(fx) {
   // Capture timestamp between ground_truth and poison for asOf recovery.
   const truthIds = [];
   for (const g of fx.ground_truth) {
-    truthIds.push(await kalairos.ingest(g.text, { source: g.source }));
+    truthIds.push(await kalairos.ingest(g.text, { source: g.source, type: g.type, key: g.key, fields: g.fields }));
   }
   const truthSnapshot = Date.now();
   // Small delay so asOf < poison timestamps
@@ -62,7 +62,7 @@ async function runFixture(fx) {
 
   const poisonIds = [];
   for (const p of fx.poison) {
-    poisonIds.push(await kalairos.ingest(p.text, { source: p.source, trustScore: p.trustScore }));
+    poisonIds.push(await kalairos.ingest(p.text, { source: p.source, trustScore: p.trustScore, type: p.type, key: p.key, fields: p.fields }));
   }
 
   // ── Defense signal 1 + 2: contradiction flag + trust breakdown ─────────────
@@ -159,7 +159,7 @@ async function runFixture(fx) {
   console.log("  Claim under test: poisoned writes are detected, penalised, and");
   console.log("  recoverable — not silently overwritten.");
   console.log("  Attacks: indirect injection · source spoofing · repetition ·");
-  console.log("           drip-poison · trust override");
+  console.log("           drip-poison · trust override · key overwrite");
   console.log("");
 
   const reports = [];

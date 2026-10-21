@@ -33,9 +33,10 @@ async function test(name, fn) {
   }
 }
 
+const freePort = require("./free-port");
+
 const ROOT = path.join(__dirname, "..");
-const PORT = 3400 + (process.pid % 150);
-const BASE = `http://127.0.0.1:${PORT}`;
+let PORT, BASE; // a port the OS hands out, set before the server starts
 
 // Shared scenario: the backdated-raise case from the engine-level test.
 // Salary known Jan 1. On Mar 1 we learn of a raise effective Feb 1.
@@ -196,6 +197,8 @@ function includesMatch(payload, re) {
 
 (async function run() {
   console.log("\n── bitemporal axes over REST and MCP ────────────────────────\n");
+  PORT = await freePort();
+  BASE = `http://127.0.0.1:${PORT}`;
 
   // 1. REST: the divergence survives the wire.
   await test("REST: asOf and validAt disagree across the network", async () => {

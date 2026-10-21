@@ -77,6 +77,12 @@ function connect(baseUrl = "http://localhost:3000", { token } = {}) {
     queryAt:          (text, timestamp, opts = {})    => post("/query", { text, asOf: timestamp, ...opts }),
     queryValidAt:     (text, timestamp, opts = {})    => post("/query", { text, validAt: timestamp, ...opts }),
     queryRange:       (text, since, until, opts = {}) => post("/query", { text, since, until, ...opts }),
+    describe:         (address, opts = {})            => {
+      const params = new URLSearchParams(
+        Object.entries({ ...opts, address }).filter(([, v]) => v != null).map(([k, v]) => [k, String(v)])
+      );
+      return get(`/describe?${params}`);
+    },
     get:              (id)                            => get(`/entity/${id}`),
     getMany:          (ids)                           => post("/entities/batch", { ids }),
     remove:           (id)                            => del(`/entity/${id}`),

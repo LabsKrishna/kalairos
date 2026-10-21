@@ -9,10 +9,11 @@
 // reversals, corrections, policy revisions), it asks the same questions
 // again and compares.
 //
-// Cases live in their own workspace so a revision can only merge within its
-// own case. Cross-case identity is a separate open problem (stable keys);
-// this harness measures time, not identity, and fails loudly if identity
-// goes wrong rather than letting it skew a time metric.
+// Every record is written with its key, so a revision lands on its own record
+// by identity, never by how it is worded. Cases live in their own workspace,
+// which scopes each replay query to one case. The harness measures time, not
+// identity, and fails loudly if identity goes wrong rather than letting it
+// skew a time metric.
 "use strict";
 
 const lib = require("../..");
@@ -48,11 +49,6 @@ async function initEngine() {
     // here; a relevance miss must never be able to pass as a time-travel hit.
     minFinalScore:    0,
     minSemanticScore: 0,
-    // Revisions of the same record (a reversed determination, a corrected
-    // report) must merge; first writes use forceNew, so these thresholds only
-    // govern revisions. The identity check below proves each one landed.
-    versionThreshold:       0.70,
-    consolidationThreshold: 0.65,
   });
 }
 
@@ -122,7 +118,7 @@ async function load(cases) {
       why:         w.why,
       tags:        w.tags || (it.c ? [`case:${it.c.id}`] : []),
       workspaceId: ws,
-      forceNew:    first,
+      key:         w.key,
     });
     if (first) entityIds.set(k, id);
     else if (entityIds.get(k) !== id) {

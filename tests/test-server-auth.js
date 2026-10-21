@@ -13,9 +13,10 @@ const os     = require("os");
 const path   = require("path");
 const { spawn } = require("child_process");
 
-const dir  = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-auth-"));
-const PORT = 30000 + Math.floor(Math.random() * 20000);
-const BASE = `http://127.0.0.1:${PORT}`;
+const freePort = require("./free-port");
+
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kalairos-auth-"));
+let PORT, BASE; // a port the OS hands out, set before the server starts
 
 async function call(method, route, { token, body } = {}) {
   const headers = { "Content-Type": "application/json" };
@@ -37,6 +38,8 @@ async function waitForServer(child) {
 
 (async () => {
   console.log("\n=== server auth routes ===\n");
+  PORT = await freePort();
+  BASE = `http://127.0.0.1:${PORT}`;
 
   const child = spawn(process.execPath, [path.join(__dirname, "..", "server.js")], {
     env: {

@@ -167,6 +167,31 @@ flowchart LR
 
 Versions are **linear per entity** — each new version supersedes the previous; there is no branching. The "fork" effect happens *across* entities: when a `remember()` falls below the similarity threshold, it creates a new entity instead of a new version. Linearity is what keeps `queryAt(t)` well-defined: there is always one unambiguous answer to *"what did we believe about entity X at time T."*
 
+### Things with keys
+
+When a record has a real identifier (a claim number, a policy number), pass it as `key`. A keyed write lands on the thing with that `type` and `key` in its workspace however it is worded, and two keys never merge. `fields` holds the facts code reads off it, versioned with the text and compared exactly. `links` points it at other things by address (`"type:key"`), and each link is a fact with its own history. `describe(address, { validAt, asOf })` returns the thing and what it links to, read on both clocks: what was true at `validAt`, as known at `asOf`. A change to a key by anyone except the source that last set it, or a more trusted one, is marked `contested`: it lands flagged and with lower trust, and the earlier version stays readable with `asOf`.
+
+```js
+const library = { type: 'file', actor: 'payer policy library' };
+await kalairos.ingest('Policy IB-114: 6 weeks of therapy before surgery', {
+  type: 'policy', key: 'IB-114', fields: { therapyWeeks: 6 }, effectiveAt: '2026-01-01', source: library,
+});
+await kalairos.ingest('Policy IB-114: 12 weeks of therapy before surgery', {
+  type: 'policy', key: 'IB-114', fields: { therapyWeeks: 12 }, effectiveAt: '2026-06-01', source: library,
+});
+await kalairos.ingest('Claim for lumbar microdiscectomy, L5-S1', {
+  type: 'claim', key: 'D-101', fields: { billed: 14200 }, effectiveAt: '2026-05-12',
+  links: [{ rel: 'under', to: 'policy:IB-114', one: true }],
+  source: { type: 'tool', actor: 'clearinghouse' },
+});
+
+// The policy in force on the date of service, and on the day it was denied
+const onDos    = await kalairos.describe('claim:D-101', { validAt: '2026-05-12' });
+const atDenial = await kalairos.describe('claim:D-101', { validAt: '2026-07-20' });
+console.log(onDos.links[0].thing.fields);     // → { therapyWeeks: 6 }
+console.log(atDenial.links[0].thing.fields);  // → { therapyWeeks: 12 }
+```
+
 ---
 
 ## Every change leaves a breadcrumb. Important moments become checkpoints.
@@ -461,7 +486,7 @@ await kalairos.ingestFile(filePath, opts?)
 await kalairos.ingestTimeSeries(label, points, opts?)
 ```
 
-Options: `{ type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, importance, forceNew }`.
+Options: `{ type, timestamp, metadata, tags, source, classification, retention, memoryType, workspaceId, useLLM, importance, forceNew, key, fields, links }`.
 
 ### Read
 
@@ -469,6 +494,7 @@ Options: `{ type, timestamp, metadata, tags, source, classification, retention, 
 await kalairos.query(text, { limit?, maxTokens?, filter? })
 await kalairos.queryAt(text, timestamp, { limit?, maxTokens?, filter? })
 await kalairos.queryRange(text, since, until, { limit?, maxTokens?, filter? })
+await kalairos.describe(address, { asOf?, validAt?, workspaceId? })
 await kalairos.get(id)
 await kalairos.getMany(ids)
 await kalairos.getHistory(id)
@@ -549,6 +575,22 @@ await io.ingestFile("./notes.md");
 const trail = await history.trail({ entity: id });
 ```
 
+### MCP and HTTP
+
+```text
+kalairos_remember     { text, type?, key?, fields?, links?, effectiveAt?, workspaceId?, ... }
+kalairos_batch_store  { items: [{ text, type?, key?, fields?, links?, effectiveAt?, ... }] }
+kalairos_describe     { address, asOf?, validAt?, workspaceId? }
+
+POST /ingest, /remember   { text, type?, key?, fields?, links?, ... }
+POST /ingest/batch        { items: [{ text, type?, key?, fields?, links?, ... }] }
+GET  /describe?address=claim:D-101&validAt=2026-05-12&asOf=2026-07-20
+```
+
+`kalairos_remember`, `kalairos_batch_store` and the HTTP write routes take `key`, `fields` and `links` as `remember()` does. `kalairos_describe`, `GET /describe` and the remote client's `describe(address, { asOf?, validAt?, workspaceId? })` return what `describe()` returns, with times in Unix ms or ISO-8601. Unlike `kalairos_recall` and `POST /query`, they take `asOf` and `validAt` together.
+
+Every MCP write is an agent's: `{ type: "agent", actor }`, where the actor is `KALAIROS_MCP_AGENT` or else the host's name from the MCP handshake. So when one agent changes a key another agent set, the write is marked `contested`.
+
 ---
 
 ## Configuration
@@ -570,6 +612,7 @@ const trail = await history.trail({ entity: id });
 | `KALAIROS_PORT`                  | `3000`  | HTTP server port                           |
 | `KALAIROS_HOST`                  | `127.0.0.1` | HTTP server bind address (`0.0.0.0` for remote access) |
 | `KALAIROS_DATA_FILE`             | `./data.kalairos` | Data file for `init()`, the server, the MCP server and the CLI |
+| `KALAIROS_MCP_AGENT`             | the host's name | The agent the MCP server attributes every write to (default: the name the host gives in the MCP handshake, e.g. `claude-code`) |
 | `KALAIROS_MODEL_DIR`             | `~/.kalairos` | Where the neural embedder is downloaded and loaded from |
 | `KALAIROS_INDEX_SQLITE`          | unset   | `1` enables the SQLite index (needs the optional `better-sqlite3`) |
 
@@ -589,7 +632,7 @@ const trail = await history.trail({ entity: id });
 npx kalairos          # starts on 127.0.0.1:3000
 ```
 
-Core endpoints mirror the flat API (`/remember`, `/query`, `/history/:id`, etc.). See `server.js` for the full route list.
+Core endpoints mirror the flat API (`/remember`, `/query`, `/describe`, `/history/:id`, etc.). See `server.js` for the full route list.
 
 The server listens on loopback only. To serve other machines, set `KALAIROS_HOST=0.0.0.0` and turn on auth: create an owner with `POST /auth/principals` (`{ "id": "ops", "name": "Ops", "workspaces": { "default": "owner" } }`, which returns its token once), then `POST /auth/enable`. From then on every route, including the `/auth/*` routes, needs `Authorization: Bearer <token>`. Auth settings live in memory, so repeat this after a restart.
 
@@ -605,6 +648,8 @@ npx kalairos import memory.md                           # ingest back
 ```
 
 Checkpoint it into git, share it across agents, hand-edit it when debugging.
+
+A keyed thing exports with `Key` and `Fields` lines, and an import lands it on the same `type` and `key` with its fields. Links are keyed records of type `link`, so they come back as links that `describe()` reads. Only the current version travels, written at the time of the import, so `asOf` and `validAt` reads of imported things start there. An import writes every section to the one workspace it is given (`workspaceId`, or `default`), so the same key exported from two workspaces lands on one thing.
 
 ---
 

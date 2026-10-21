@@ -611,6 +611,8 @@ Every MCP write is an agent's: `{ type: "agent", actor }`, where the actor is `K
 | `KALAIROS_MAX_WORKERS`           | `auto`  | Worker threads (default: cgroup CPU quota) |
 | `KALAIROS_PORT`                  | `3000`  | HTTP server port                           |
 | `KALAIROS_HOST`                  | `127.0.0.1` | HTTP server bind address (`0.0.0.0` for remote access) |
+| `KALAIROS_REQUIRE_AUTH`          | unset   | `1`: the HTTP server refuses to start unless auth is on with an owner, and refuses `POST /auth/disable` |
+| `KALAIROS_ADMIN_TOKEN`           | unset   | On a store with no principals, the HTTP server creates owner `admin` with this token (32+ characters) and enables auth |
 | `KALAIROS_DATA_FILE`             | `./data.kalairos` | Data file for `init()`, the server, the MCP server and the CLI |
 | `KALAIROS_MCP_AGENT`             | the host's name | The agent the MCP server attributes every write to (default: the name the host gives in the MCP handshake, e.g. `claude-code`) |
 | `KALAIROS_MODEL_DIR`             | `~/.kalairos` | Where the neural embedder is downloaded and loaded from |
@@ -634,7 +636,11 @@ npx kalairos          # starts on 127.0.0.1:3000
 
 Core endpoints mirror the flat API (`/remember`, `/query`, `/describe`, `/history/:id`, etc.). See `server.js` for the full route list.
 
-The server listens on loopback only. To serve other machines, set `KALAIROS_HOST=0.0.0.0` and turn on auth: create an owner with `POST /auth/principals` (`{ "id": "ops", "name": "Ops", "workspaces": { "default": "owner" } }`, which returns its token once), then `POST /auth/enable`. From then on every route, including the `/auth/*` routes, needs `Authorization: Bearer <token>`. Auth settings live in memory, so repeat this after a restart.
+The server listens on loopback only. To serve other machines, set `KALAIROS_HOST=0.0.0.0` and turn on auth: create an owner with `POST /auth/principals` (`{ "id": "ops", "name": "Ops", "workspaces": { "default": "owner" } }`, which returns its token once), then `POST /auth/enable`. From then on every route, including the `/auth/*` routes, needs `Authorization: Bearer <token>`.
+
+Auth state (principals, token hashes, whether auth is on, and the newest 1,000 audit entries) is saved next to the data file as `<data file>.auth`, so a restart keeps it. Each auth change is saved before the server answers; a change whose save fails returns an error and changes nothing. Audit entries for data writes are saved with the next auth change and when the server stops, so a crash can lose the ones recorded since. While auth is on, the server won't remove or demote the last owner.
+
+To lock a server down, set `KALAIROS_REQUIRE_AUTH=1`: it refuses to start unless auth is on with at least one owner, and refuses `POST /auth/disable`. To come up locked with no manual step, as a container does, also set `KALAIROS_ADMIN_TOKEN` to a secret of at least 32 characters (for example `openssl rand -hex 32`). On a store with no principals, the server creates an owner named `admin` with that token, owning `default` and every workspace already in the store, and enables auth. Once any principal exists the variable is ignored, so changing it later changes nothing. If every owner token is lost, stop the server and delete `<data file>.auth`; it then starts with auth off and no principals, or bootstraps again from `KALAIROS_ADMIN_TOKEN`.
 
 ---
 

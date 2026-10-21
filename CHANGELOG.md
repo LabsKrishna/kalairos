@@ -8,6 +8,25 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Lock-down for the HTTP server.** `KALAIROS_REQUIRE_AUTH=1` makes the
+  server refuse to start unless auth is on with at least one owner, and
+  makes `POST /auth/disable` return 403. Any value other than `1`, `0` or
+  empty stops the boot instead of reading as off. `KALAIROS_ADMIN_TOKEN`
+  bootstraps the first owner, so a container can come up locked with no
+  manual step: on a store with no principals, the server creates `admin`,
+  an owner of `default` and of every workspace already in the store, with
+  that token, and enables auth. The token must be at least 32 characters
+  with no whitespace, and is never logged or saved in plaintext. Once any
+  principal exists the variable is ignored. `GET /auth/status` now reports
+  `required`.
+- **Auth state through the store.** A store with `loadAuth(config)` and
+  `saveAuth(state, config)` keeps auth state itself, in place of
+  `<data file>.auth`. `loadAuth` returns (or resolves to) what `saveAuth`
+  was last given, or null. `saveAuth` must be synchronous, like
+  `persistAll`: return once the state is durable, throw if it can't be. A
+  `saveAuth` that returns a promise fails the change. `state` is plain JSON
+  with token hashes only. `kalairos.auth.transaction(fn)` makes several auth
+  changes one save, undone together if anything in it throws.
 - **Prior-authorization replay benchmark** (`npm run bench:prior-auth`,
   CI-gated). Replays synthetic prior-authorization decisions after late
   records, reversals, corrections and policy revisions have landed, and
@@ -73,6 +92,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The last owner can't be removed or demoted while auth is on.**
+  `DELETE /auth/principals/:id`, `POST /auth/revoke` and `POST /auth/grant`
+  return 400 when they would leave no principal with the owner role. A
+  restart used to undo that lock-out by switching auth off; now that auth
+  state survives a restart, nothing would.
+- **With a data file, `init()` loads the saved auth state**, replacing any
+  auth state set up in memory before it, and `kalairos.auth` changes are
+  saved as they are made. With `dataFile: ":memory:"` auth stays in memory,
+  as before.
+- **The Docker build context leaves out `data.kalairos.*`** (auth state,
+  checkpoints, the SQLite index) as it already left out `data.kalairos`, so
+  an image built from a working checkout carries none of its auth state.
 - **The prior-auth replay writes every record with its key.** It no longer
   needs `forceNew` on first writes or lowered version and consolidation
   thresholds. Identity misses stay at 0, and every metric matches the run
@@ -108,6 +139,20 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Auth survives a restart.** Principals, token hashes, whether auth was on
+  and the auth audit log lived only in memory, so a restarted server came
+  back with auth off and served every memory to anyone who could reach the
+  port. The Docker image listens on all interfaces, so that was the network.
+  Auth state is now saved to `<data file>.auth` (mode 0600), replaced the
+  way the data file is: tmp file, fsync, rename, fsync the directory.
+  `init()` loads it, and an unreadable one stops `init()` rather than
+  starting with auth off. Each auth change is saved with its audit entry
+  before the response; a change whose save fails returns 500
+  `ERR_PERSIST_FAILED` and leaves memory and disk as they were. The saved
+  audit log is the in-memory one, bounded the same way (newest 1,000
+  entries). Audit entries for data writes are saved with the next auth
+  change and at shutdown, so a crash can lose the ones recorded since. A
+  server that never set auth up writes no file.
 - **Importing an `includeHistory` export keeps each entity's text.** The
   numbered version-history lines were read as part of the text, so
   `kalairos export --include-history` followed by `kalairos import`, the

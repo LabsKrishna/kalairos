@@ -28,12 +28,14 @@ const { StringDecoder } = require("string_decoder");
 // the store itself.
 const READ_CHUNK_BYTES = 1 << 20; // 1MB
 
-function _writeFileSyncDurable(file, data) {
+function _writeFileSyncDurable(file, data, mode = 0o666) {
   // Open + write + fsync + close, then fsync the parent directory so the
   // dirent for `file` is durable too. Required for crash-consistent renames.
   // A short write here would leave a torn tmp file that then gets renamed
   // over the store, so it goes through _writeAll like an append does.
-  const fd = fs.openSync(file, "w");
+  // `mode` applies only when this creates the file (0o666 is openSync's own
+  // default, before the umask).
+  const fd = fs.openSync(file, "w", mode);
   try {
     _writeAll(fd, Buffer.from(data, "utf8"), 0);
     fs.fsyncSync(fd);
@@ -120,6 +122,17 @@ function _fsyncDir(dir) {
   } finally {
     if (fd !== undefined) try { fs.closeSync(fd); } catch {}
   }
+}
+
+// Replace `file` with `data` the way persistAll replaces the store: write
+// `<file>.tmp`, fsync it, rename it over `file`, fsync the directory. A crash
+// leaves the old file or the new one, never part of either. Throws on any I/O
+// failure. `mode` applies to the file when this creates it.
+function replaceFileDurable(file, data, mode) {
+  const tmp = file + ".tmp";
+  _writeFileSyncDurable(tmp, data, mode);
+  fs.renameSync(tmp, file); // atomic on POSIX — no corrupt reads on crash
+  _fsyncDir(path.dirname(file));
 }
 
 class FileStore {
@@ -222,11 +235,8 @@ class FileStore {
     const file = config.dataFile;
     if (!file || file === ":memory:") return;
 
-    const tmp = file + ".tmp";
     const data = rows.map(r => JSON.stringify(r)).join("\n") + "\n";
-    _writeFileSyncDurable(tmp, data);
-    fs.renameSync(tmp, file); // atomic on POSIX — no corrupt reads on crash
-    _fsyncDir(path.dirname(file));
+    replaceFileDurable(file, data);
   }
 
   // ── Append one entity ──────────────────────────────────────────────────────
@@ -240,4 +250,4 @@ class FileStore {
   shutdown() {}
 }
 
-module.exports = { FileStore };
+module.exports = { FileStore, replaceFileDurable };

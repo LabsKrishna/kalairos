@@ -5,6 +5,8 @@ node_modules/
 *.log
 data.kalairos
 data.kalairos.tmp
+data.kalairos.auth
+data.kalairos.auth.tmp
 data.dbx
 data.dbx.tmp
 CLAUDE.md

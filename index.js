@@ -658,6 +658,8 @@ function _isVisibleNode(entity, allowedWorkspaces) {
 async function init(overrides = {}) {
   _initialized = false; // mark as uninitialized while we set up
   resetSignals();
+  // Auth changes stop saving to the previous store; _loadAuth attaches this one's.
+  _auth.setPersistence(null);
 
   // Tear down existing worker pool before creating a new one
   if (_pool) { await _pool.stop(); _pool = null; }
@@ -708,6 +710,7 @@ async function init(overrides = {}) {
   store = new FileStore();
   await _loadStore();
   _loadCheckpoints();
+  await _loadAuth();
 
   // Optional SQLite hybrid index (KAL-108). Off by default; the flag flips
   // ON only after KAL-110 fuzz testing passes. When ON, we run the §6.2
@@ -3472,6 +3475,84 @@ async function listCheckpoints({ workspace } = {}) {
   return filtered.map(cp => ({ ...cp }));
 }
 
+// ─── Auth state ───────────────────────────────────────────────────────────────
+// The AuthStore (auth.js) holds principals, hashed tokens, the on/off switch
+// and the audit log. A restart used to forget all of it, so a server whose
+// owner had switched auth on came back with it off, serving every memory to
+// anyone who could reach the port. It is now kept with the store:
+//
+//   * A store with loadAuth(config) and saveAuth(state, config) keeps it
+//     itself. loadAuth returns (or resolves to) the state saveAuth was last
+//     given, or null if it was never given one. saveAuth must be synchronous,
+//     like persistAll: return once the state is durable, throw if it can't
+//     be. Every auth change waits on it and is undone if it throws.
+//   * Any other store keeps it in <dataFile>.auth, a JSON file replaced the
+//     way persistAll replaces the data file: tmp file, fsync, rename, fsync
+//     the directory. Mode 0600: it names principals and holds token hashes.
+//   * With no data file (":memory:") it stays in memory, as it always has.
+//
+// init() replaces whatever auth state was in memory with the saved state, or
+// with none (auth off, no principals) when nothing was saved yet.
+
+function _authFile() {
+  const data = CFG.dataFile;
+  if (!data || data === ":memory:") return null;
+  return data + ".auth";
+}
+
+function _readAuthFile(file) {
+  // A tmp left by a crash mid-save never became the state; the file did.
+  try { fs.unlinkSync(file + ".tmp"); }
+  catch (err) { if (err.code !== "ENOENT") console.warn(`[kalairos] auth: could not remove ${path.basename(file)}.tmp: ${err.message}`); }
+  let text;
+  try { text = fs.readFileSync(file, "utf8"); }
+  catch (err) { if (err.code === "ENOENT") return null; throw err; }
+  try { return JSON.parse(text); }
+  catch (err) {
+    // Starting without it would start with auth off: refuse instead.
+    throw new Error(`[kalairos] ${file} holds the auth state and is not valid JSON (${err.message}). Restore it from a backup; deleting it starts the server with auth off and no principals.`);
+  }
+}
+
+async function _loadAuth() {
+  const s = store, cfg = CFG;
+  let state, save, from;
+  if (typeof s.loadAuth === "function" && typeof s.saveAuth === "function") {
+    state = await s.loadAuth(cfg);
+    save  = (st) => s.saveAuth(st, cfg);
+    from  = "the store";
+  } else {
+    const file = _authFile();
+    if (!file) return; // ":memory:": auth stays in memory, as it always has
+    const { replaceFileDurable } = require("./store/file-store");
+    state = _readAuthFile(file);
+    save  = (st) => replaceFileDurable(file, JSON.stringify(st) + "\n", 0o600);
+    from  = file;
+  }
+  _auth.reset();
+  try {
+    _auth.load(state);
+  } catch (err) {
+    throw new Error(`[kalairos] Can't load the auth state saved in ${from}: ${err.message}`);
+  }
+  // A save that fails after the rename (the directory fsync) can leave the new
+  // state on disk while memory keeps the old; persistAll has the same edge.
+  _auth.setPersistence((st) => {
+    let result;
+    try {
+      result = save(st);
+    } catch (err) {
+      console.error(`[kalairos] Saving auth state failed: ${err.message}`);
+      throw emitError(Err.persistFailed(err.message, err));
+    }
+    // Not durable yet when this returns, so the change can't be acknowledged.
+    if (result && typeof result.then === "function") {
+      Promise.resolve(result).catch(() => {});
+      throw emitError(Err.persistFailed("store.saveAuth returned a promise; it must save synchronously"));
+    }
+  });
+}
+
 // ─── Shutdown ─────────────────────────────────────────────────────────────────
 
 /**
@@ -3483,6 +3564,10 @@ async function shutdown() {
   // rather than counting on something below to yield to the drain's
   // setImmediate. A stale setImmediate later finds the queue empty.
   _drainWrites();
+  // Audit entries the data routes recorded since the last auth change. A
+  // failed save is already logged and signalled; it must not stop the flush.
+  try { _auth.flush(); } catch {}
+  _auth.setPersistence(null);
   _persistAll(); // final flush to backing store
   _embedCache.clear();
   if (_pool) { await _pool.stop(); _pool = null; }

@@ -545,6 +545,57 @@ app.post("/agent/:agentId/annotate", _resolveAgent, _requireAuth("write"), _wrap
 
 const _requireOwner = _requireAuth("owner");
 
+// ─── Lock-down ───────────────────────────────────────────────────────────────
+// KALAIROS_REQUIRE_AUTH=1: the server refuses to start unless auth is on with
+// at least one owner, and refuses POST /auth/disable. A value other than 1, 0
+// or empty stops the boot rather than being read as off.
+//
+// KALAIROS_ADMIN_TOKEN bootstraps the first owner, so a container can come up
+// locked with no manual step. When no principal exists, the server creates
+// "admin", an owner of default and of every workspace already in the store,
+// with that token, and switches auth on. That is saved like any auth change,
+// so it happens once: while any principal exists the variable is ignored.
+// The token is never logged.
+
+const _REQUIRE_AUTH = process.env.KALAIROS_REQUIRE_AUTH === "1";
+
+async function _bootstrapAdmin() {
+  const token = process.env.KALAIROS_ADMIN_TOKEN;
+  if (!token) return;
+  if (auth.listPrincipals().length > 0) {
+    console.log("[kalairos] KALAIROS_ADMIN_TOKEN not used: principals already exist");
+    return;
+  }
+  if (!/^\S{32,}$/.test(token)) {
+    throw new Error("KALAIROS_ADMIN_TOKEN must be at least 32 characters with no whitespace, for example the output of `openssl rand -hex 32`");
+  }
+  const workspaces = { default: "owner" };
+  for (const ws of Object.keys((await lib.getStatus()).byWorkspace)) workspaces[ws] = "owner";
+  auth.transaction(() => {
+    auth.addPrincipal({ id: "admin", name: "Admin", workspaces, token });
+    auth.enable();
+    auth.audit("principal_created", { detail: "admin (Admin), from KALAIROS_ADMIN_TOKEN" });
+    auth.audit("auth_enabled", { detail: "from KALAIROS_ADMIN_TOKEN" });
+  });
+  console.log(`[kalairos] Created owner "admin" from KALAIROS_ADMIN_TOKEN (workspaces: ${Object.keys(workspaces).join(", ")}) and enabled auth`);
+}
+
+// Runs after init() has loaded the saved auth state, before the port opens.
+async function _lockDown() {
+  const required = process.env.KALAIROS_REQUIRE_AUTH;
+  if (required !== undefined && !["", "0", "1"].includes(required)) {
+    throw new Error(`KALAIROS_REQUIRE_AUTH must be 1 or 0, not "${required}"`);
+  }
+  await _bootstrapAdmin();
+  if (_REQUIRE_AUTH && !(auth.enabled && _hasOwner())) {
+    throw new Error(
+      `KALAIROS_REQUIRE_AUTH=1 needs auth on with at least one owner, and auth is ${auth.enabled ? "on with no owner" : "off"}. ` +
+      "On a store with no principals, set KALAIROS_ADMIN_TOKEN to create an owner and enable auth. " +
+      "Otherwise start once without KALAIROS_REQUIRE_AUTH, on loopback, and set auth up with POST /auth/principals and POST /auth/enable."
+    );
+  }
+}
+
 // Owner check for a set of workspaces. `req.allowedWorkspaces` is null when
 // auth is disabled, which means unrestricted.
 function _assertOwns(req, workspaceIds) {
@@ -563,34 +614,60 @@ function _allKnownWorkspaces() {
   return [...all];
 }
 
-// AuthStore throws plain Errors for bad input; surface those as 400, not 500.
-function _authCall(fn) {
-  try { return fn(); }
-  catch (err) { throw { code: Codes.VALIDATION, message: err.message }; }
+function _hasOwner() {
+  return auth.listPrincipals().some(p => Object.values(p.workspaces).includes("owner"));
+}
+
+// While auth is on, the last owner can't go. With none left nobody could
+// manage auth again, and auth state now survives a restart, so restarting no
+// longer lets anyone back in.
+function _assertOwnerRemains() {
+  if (auth.enabled && !_hasOwner()) {
+    throw { code: Codes.VALIDATION, message: "That would leave no principal with the owner role while auth is on, so nobody could manage auth again. Make another principal an owner first." };
+  }
+}
+
+// Every auth change runs as one transaction with its audit entry: saved
+// before the response, and undone entirely if anything in it throws or the
+// save fails. A 200 means a restart keeps the change; an error means nothing
+// changed. AuthStore throws plain Errors for bad input; surface those as 400.
+// Typed errors (a failed save, a refusal) keep their own status.
+function _authChange(fn) {
+  try { return auth.transaction(fn); }
+  catch (err) {
+    if (err?.code) throw err;
+    throw { code: Codes.VALIDATION, message: err.message };
+  }
 }
 
 app.post("/auth/enable", _requireOwner, _wrap(async (req) => {
   // Enabling with no owner would lock every caller out of these routes, with
-  // no way back short of a restart.
-  const hasOwner = auth.listPrincipals().some(p => Object.values(p.workspaces).includes("owner"));
-  if (!hasOwner) {
+  // no way back but deleting the saved auth state.
+  if (!_hasOwner()) {
     throw { code: Codes.VALIDATION, message: "Create a principal with the owner role before enabling auth (POST /auth/principals)" };
   }
-  auth.enable();
-  auth.audit("auth_enabled", { principal: req.principal });
+  _authChange(() => {
+    auth.enable();
+    auth.audit("auth_enabled", { principal: req.principal });
+  });
   return { success: true, enabled: true };
 }));
 
 app.post("/auth/disable", _requireOwner, _wrap(async (req) => {
+  if (_REQUIRE_AUTH) {
+    throw { code: Codes.FORBIDDEN, message: "Auth is required on this server (KALAIROS_REQUIRE_AUTH=1) and can't be disabled" };
+  }
   // Disabling opens every workspace, so it takes an owner of all of them.
   _assertOwns(req, _allKnownWorkspaces());
-  auth.disable();
-  auth.audit("auth_disabled", { principal: req.principal });
+  _authChange(() => {
+    auth.disable();
+    auth.audit("auth_disabled", { principal: req.principal });
+  });
   return { success: true, enabled: false };
 }));
 
 app.get("/auth/status", _wrap(async () => {
-  return { enabled: auth.enabled, principals: auth.listPrincipals().length };
+  return { enabled: auth.enabled, required: _REQUIRE_AUTH, principals: auth.listPrincipals().length };
 }));
 
 app.post("/auth/principals", _requireOwner, _wrap(async (req) => {
@@ -600,16 +677,22 @@ app.post("/auth/principals", _requireOwner, _wrap(async (req) => {
   // kept working. Changing roles goes through /auth/grant and /auth/revoke.
   if (auth.getPrincipal(id)) throw { code: Codes.VALIDATION, message: `Principal ${id} already exists` };
   _assertOwns(req, Object.keys(workspaces));
-  const result = _authCall(() => auth.addPrincipal({ id, name, workspaces, token }));
-  auth.audit("principal_created", { principal: req.principal, detail: `${id} (${name})` });
+  const result = _authChange(() => {
+    const created = auth.addPrincipal({ id, name, workspaces, token });
+    auth.audit("principal_created", { principal: req.principal, detail: `${id} (${name})` });
+    return created;
+  });
   return { success: true, principal: result };
 }));
 
 app.delete("/auth/principals/:id", _requireOwner, _wrap(async (req) => {
   const target = auth.getPrincipal(req.params.id);
   if (target) _assertOwns(req, Object.keys(target.workspaces));
-  auth.removePrincipal(req.params.id);
-  auth.audit("principal_removed", { principal: req.principal, detail: req.params.id });
+  _authChange(() => {
+    auth.removePrincipal(req.params.id);
+    _assertOwnerRemains();
+    auth.audit("principal_removed", { principal: req.principal, detail: req.params.id });
+  });
   return { success: true };
 }));
 
@@ -624,8 +707,11 @@ app.post("/auth/grant", _requireOwner, _wrap(async (req) => {
   const { principalId, workspaceId, role } = req.body || {};
   if (!principalId || !workspaceId || !role) throw { code: Codes.VALIDATION, message: "principalId, workspaceId, and role are required" };
   _assertOwns(req, [workspaceId]);
-  _authCall(() => auth.grant(principalId, workspaceId, role));
-  auth.audit("grant", { principal: req.principal, workspaceId, detail: `${principalId}=${role}` });
+  _authChange(() => {
+    auth.grant(principalId, workspaceId, role);
+    _assertOwnerRemains();
+    auth.audit("grant", { principal: req.principal, workspaceId, detail: `${principalId}=${role}` });
+  });
   return { success: true };
 }));
 
@@ -633,8 +719,11 @@ app.post("/auth/revoke", _requireOwner, _wrap(async (req) => {
   const { principalId, workspaceId } = req.body || {};
   if (!principalId || !workspaceId) throw { code: Codes.VALIDATION, message: "principalId and workspaceId are required" };
   _assertOwns(req, [workspaceId]);
-  auth.revoke(principalId, workspaceId);
-  auth.audit("revoke", { principal: req.principal, workspaceId, detail: principalId });
+  _authChange(() => {
+    auth.revoke(principalId, workspaceId);
+    _assertOwnerRemains();
+    auth.audit("revoke", { principal: req.principal, workspaceId, detail: principalId });
+  });
   return { success: true };
 }));
 
@@ -654,7 +743,14 @@ app.get("/auth/audit", _requireOwner, _wrap(async (req) => {
 // bare `npm start` instead of failing with ERR_EMBEDDING_FAILED. Callers who
 // want a specific embedder still pass embedFn — this is only the default.
 
-lib.init({ strictEmbeddings: false }).then(() => {
+lib.init({ strictEmbeddings: false }).then(async () => {
+  try {
+    await _lockDown();
+  } catch (err) {
+    console.error(`[kalairos] Not starting: ${err.message}`);
+    process.exit(1);
+  }
+
   const PORT = Number(process.env.KALAIROS_PORT) || 3000;
   // Loopback by default. Auth is off until someone enables it, so listening on
   // every interface handed the whole store to anyone on the network. Set
@@ -674,6 +770,9 @@ lib.init({ strictEmbeddings: false }).then(() => {
       console.log("  (loopback only; set KALAIROS_HOST=0.0.0.0 to accept remote connections)");
     } else if (!auth.enabled) {
       console.log("  WARNING: listening beyond loopback with auth disabled. Anyone who can reach this port can read and delete every memory.");
+    }
+    if (auth.enabled) {
+      console.log(`  auth on, ${auth.listPrincipals().length} principal(s)${_REQUIRE_AUTH ? "; required (KALAIROS_REQUIRE_AUTH=1)" : ""}`);
     }
     console.log("Endpoints:");
     console.log("  POST   /ingest                  { text, type?, metadata?, tags?, timestamp?, source?, classification?, retention?, memoryType?, workspaceId?, useLLM?, key?, fields?, links? }");
@@ -699,9 +798,10 @@ lib.init({ strictEmbeddings: false }).then(() => {
     console.log("  POST   /import/markdown           { markdown, source?, classification?, ... }");
     console.log("Auth management:");
     console.log("  (open while auth is off; once on, every route below except /auth/status needs an owner token)");
+    console.log("  (saved with the data file, so a restart keeps it)");
     console.log("  POST   /auth/enable               Enable token-based auth (needs an owner principal first)");
-    console.log("  POST   /auth/disable              Disable auth (needs owner on every workspace)");
-    console.log("  GET    /auth/status               { enabled, principals }");
+    console.log("  POST   /auth/disable              Disable auth (needs owner on every workspace; refused with KALAIROS_REQUIRE_AUTH=1)");
+    console.log("  GET    /auth/status               { enabled, required, principals }");
     console.log("  POST   /auth/principals           { id, name, workspaces?, token? } → create principal + token");
     console.log("  DELETE /auth/principals/:id        Remove principal");
     console.log("  GET    /auth/principals            List principals in workspaces you own");

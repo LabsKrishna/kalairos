@@ -138,7 +138,11 @@ async function waitForServer(child) {
     console.error(stderr.split("\n").slice(-15).join("\n"));
     throw err;
   } finally {
-    child.kill();
+    // kill() only sends the signal. On SIGTERM the server flushes the store,
+    // so removing the directory before it exits races that flush (ENOTEMPTY).
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise(resolve => { child.once("exit", resolve); child.kill(); });
+    }
     fs.rmSync(dir, { recursive: true, force: true });
   }
 
